@@ -1,0 +1,45 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install XcodeGen
+      run: brew install xcodegen
+
+    - name: Generate Xcode Project
+      run: xcodegen generate
+
+    - name: Build App (Unsigned)
+      run: |
+        xcodebuild -project KeychainManager.xcodeproj \
+          -scheme KeychainManager \
+          -sdk iphoneos \
+          -configuration Release \
+          -derivedDataPath build \
+          CODE_SIGNING_ALLOWED=NO \
+          CODE_SIGNING_REQUIRED=NO \
+          CODE_SIGN_IDENTITY="" \
+          CODE_SIGNING_ENTITLEMENTS=""
+
+    - name: Package into IPA
+      run: |
+        mkdir Payload
+        # 将编译出的 .app 复制到 Payload 文件夹
+        cp -r build/Build/Products/Release-iphoneos/KeychainManager.app Payload/
+        # 压缩为 .ipa
+        zip -r KeychainManager_Unsigned.ipa Payload
+
+    - name: Upload IPA
+      uses: actions/upload-artifact@v4
+      with:
+        name: KeychainManager_Unsigned_IPA
+        path: KeychainManager_Unsigned.ipa
