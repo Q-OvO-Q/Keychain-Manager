@@ -56,7 +56,7 @@ struct ContentView: View {
                 }
                 .listStyle(.plain)
             }
-            .navigationTitle("Keychain Master")
+            .navigationTitle("Keychain Manager")
             .toolbar {
                 Button(action: { showingAddSheet = true }) {
                     Image(systemName: "plus")
