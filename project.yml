@@ -1,0 +1,21 @@
+name: KeychainManager
+options:
+  bundleIdPrefix: com.cdn
+targets:
+  KeychainManager:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources: [Source]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.cdn.keychainmanager
+        CURRENT_PROJECT_VERSION: 1
+        MARKETING_VERSION: 1.0
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        AD_HOC_CODE_SIGNING_ALLOWED: NO
+    info:
+      path: Source/Info.plist
+      properties:
+        UILaunchScreen: {}
