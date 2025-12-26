@@ -28,8 +28,7 @@ jobs:
           CODE_SIGNING_ALLOWED=NO \
           CODE_SIGNING_REQUIRED=NO \
           CODE_SIGN_IDENTITY="" \
-          CODE_SIGNING_ENTITLEMENTS="" \
-          IPHONEOS_DEPLOYMENT_TARGET=15.0
+          CODE_SIGNING_ENTITLEMENTS=""
 
     - name: Package into IPA
       run: |
