@@ -385,13 +385,15 @@ struct ContentView: View {
     }
     
     func deleteItems(at offsets: IndexSet) {
+        var successfulDeletes: [Int] = []
+        
         for index in offsets {
             let item = items[index]
             // 删除时必须精准匹配所有主键
             var query: [String: Any] = [
                 kSecClass as String: item.itemClass,
                 kSecAttrAccount as String: item.account,
-                kSecAttrAccessGroup as String: targetGroup
+                kSecAttrAccessGroup as String: item.accessGroup
             ]
             
             if item.itemClass == kSecClassInternetPassword {
@@ -400,11 +402,18 @@ struct ContentView: View {
                 query[kSecAttrService as String] = item.title
             }
             
-            SecItemDelete(query as CFDictionary)
-            // 清除关联的标签，避免孤立标签留在UI中
-            TagManager.shared.setTag("", for: item.uniqueKey)
+            let status = SecItemDelete(query as CFDictionary)
+            if status == errSecSuccess {
+                // 清除关联的标签，避免孤立标签留在UI中
+                TagManager.shared.setTag("", for: item.uniqueKey)
+                successfulDeletes.append(index)
+            } else {
+                print("删除失败: \(status) for item: \(item.title)")
+            }
         }
-        items.remove(atOffsets: offsets)
+        
+        // 只删除成功的items
+        items.remove(atOffsets: IndexSet(successfulDeletes))
     }
     
     // MARK: - 批量操作方法
@@ -439,11 +448,13 @@ struct ContentView: View {
     
     func batchDelete() {
         let selectedKeyItems = items.filter { selectedItems.contains($0.id) }
+        var successfulDeletes: Set<UUID> = []
+        
         for item in selectedKeyItems {
             var query: [String: Any] = [
                 kSecClass as String: item.itemClass,
                 kSecAttrAccount as String: item.account,
-                kSecAttrAccessGroup as String: targetGroup
+                kSecAttrAccessGroup as String: item.accessGroup
             ]
             
             if item.itemClass == kSecClassInternetPassword {
@@ -452,11 +463,17 @@ struct ContentView: View {
                 query[kSecAttrService as String] = item.title
             }
             
-            SecItemDelete(query as CFDictionary)
-            // 清除关联的标签，避免孤立标签留在UI中
-            TagManager.shared.setTag("", for: item.uniqueKey)
+            let status = SecItemDelete(query as CFDictionary)
+            if status == errSecSuccess {
+                // 清除关联的标签，避免孤立标签留在UI中
+                TagManager.shared.setTag("", for: item.uniqueKey)
+                successfulDeletes.insert(item.id)
+            } else {
+                print("批量删除失败: \(status) for item: \(item.title)")
+            }
         }
-        items.removeAll { selectedItems.contains($0.id) }
+        
+        items.removeAll { successfulDeletes.contains($0.id) }
         selectedItems.removeAll()
         isSelectionMode = false
     }
@@ -471,6 +488,8 @@ struct ItemDetailView: View {
     @State private var contentString: String = ""
     @State private var isEditingHex: Bool = false
     @State private var appTag: String = ""
+    @State private var saveMessage: String = ""
+    @State private var showSaveMessage: Bool = false
     @StateObject private var tagManager = TagManager.shared
     @Environment(\.presentationMode) var presentationMode
     
@@ -533,7 +552,7 @@ struct ItemDetailView: View {
                 TextEditor(text: $contentString)
                     .frame(height: 120)
                     .font(.system(.body, design: .monospaced)) // 等宽字体方便看 Hex
-                    .onChange(of: isEditingHex) { newValue in
+                    .onChange(of: isEditingHex) { _, newValue in
                         // 切换模式时转换当前显示的内容
                         if newValue {
                             // 文本 -> Hex
@@ -542,13 +561,25 @@ struct ItemDetailView: View {
                             }
                         } else {
                             // Hex -> 文本
-                            if let data = contentString.hexData, let str = String(data: data, encoding: .utf8) {
-                                contentString = str
+                            if let data = contentString.hexData {
+                                if let str = String(data: data, encoding: .utf8) {
+                                    contentString = str
+                                } else {
+                                    contentString = "数据无法转为 UTF8 文本"
+                                    showMessage("数据无法转为 UTF8 文本", isError: true)
+                                }
                             } else {
-                                contentString = "无法转为 UTF8，请切回 Hex 模式"
+                                contentString = "十六进制格式无效 (长度必须为偶数)"
+                                showMessage("十六进制格式无效", isError: true)
                             }
                         }
                     }
+                
+                if showSaveMessage {
+                    Text(saveMessage)
+                        .font(.caption)
+                        .foregroundColor(saveMessage.contains("成功") ? .green : .red)
+                }
                 
                 Button("保存修改") {
                     saveChanges()
@@ -586,6 +617,14 @@ struct ItemDetailView: View {
         }
     }
     
+    func showMessage(_ message: String, isError: Bool = false) {
+        saveMessage = message
+        showSaveMessage = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            showSaveMessage = false
+        }
+    }
+    
     func saveTag() {
         TagManager.shared.setTag(appTag, for: item.uniqueKey)
         onUpdate()
@@ -596,17 +635,28 @@ struct ItemDetailView: View {
         
         if isEditingHex {
             finalData = contentString.hexData
+            if finalData == nil {
+                showMessage("十六进制格式无效", isError: true)
+                return
+            }
         } else {
             finalData = contentString.data(using: .utf8)
+            if finalData == nil {
+                showMessage("文本数据无效", isError: true)
+                return
+            }
         }
         
-        guard let dataToSave = finalData else { return }
+        guard let dataToSave = finalData else {
+            showMessage("数据无效", isError: true)
+            return
+        }
         
-        // 构造查询主键
+        // 构造查询主键，使用 item.accessGroup 而不是 targetGroup
         var query: [String: Any] = [
             kSecClass as String: item.itemClass,
             kSecAttrAccount as String: item.account,
-            kSecAttrAccessGroup as String: targetGroup
+            kSecAttrAccessGroup as String: item.accessGroup
         ]
         
         if item.itemClass == kSecClassInternetPassword {
@@ -621,10 +671,17 @@ struct ItemDetailView: View {
         
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecSuccess {
+            showMessage("保存成功", isError: false)
             onUpdate()
-            presentationMode.wrappedValue.dismiss()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                presentationMode.wrappedValue.dismiss()
+            }
+        } else if status == errSecItemNotFound {
+            showMessage("保存失败: 项目不存在", isError: true)
+        } else if status == errSecNotAvailable {
+            showMessage("保存失败: 权限不足", isError: true)
         } else {
-            print("保存失败: \(status)")
+            showMessage("保存失败: 错误码 \(status)", isError: true)
         }
     }
 }
@@ -640,6 +697,8 @@ struct AddItemView: View {
     @State private var account = ""
     @State private var dataStr = ""
     @State private var appTag = ""
+    @State private var errorMessage = ""
+    @State private var showError = false
     @StateObject private var tagManager = TagManager.shared
     
     var body: some View {
@@ -689,40 +748,84 @@ struct AddItemView: View {
                 }
             }
             
-            Button("保存") {
-                let data = dataStr.data(using: .utf8)!
-                var query: [String: Any] = [
-                    kSecClass as String: (type == 0 ? kSecClassGenericPassword : kSecClassInternetPassword),
-                    kSecAttrAccount as String: account,
-                    kSecValueData as String: data,
-                    kSecAttrAccessGroup as String: targetGroup
-                ]
-                
-                if type == 0 {
-                    query[kSecAttrService as String] = service
-                } else {
-                    query[kSecAttrServer as String] = service
+            if showError {
+                Section {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundColor(.red)
                 }
-                
-                SecItemAdd(query as CFDictionary, nil)
-                
-                // 保存 Tag
-                if !appTag.isEmpty {
-                    let classDisplay = type == 0 ? "通用" : "网络"
-                    let uniqueKey = KeychainItem.makeUniqueKey(
-                        classDisplay: classDisplay,
-                        title: service,
-                        account: account,
-                        accessGroup: targetGroup
-                    )
-                    TagManager.shared.setTag(appTag, for: uniqueKey)
-                }
-                
-                onSave()
-                pm.wrappedValue.dismiss()
             }
+            
+            Button("保存") {
+                saveItem()
+            }
+            .disabled(service.isEmpty || account.isEmpty)
         }
         .navigationTitle("新增条目")
+    }
+    
+    func saveItem() {
+        // 验证必填字段
+        if service.isEmpty {
+            showErrorMessage("服务名/服务器地址不能为空")
+            return
+        }
+        
+        if account.isEmpty {
+            showErrorMessage("账号不能为空")
+            return
+        }
+        
+        guard let data = dataStr.data(using: .utf8) else {
+            showErrorMessage("数据转换失败")
+            return
+        }
+        
+        var query: [String: Any] = [
+            kSecClass as String: (type == 0 ? kSecClassGenericPassword : kSecClassInternetPassword),
+            kSecAttrAccount as String: account,
+            kSecValueData as String: data,
+            kSecAttrAccessGroup as String: targetGroup
+        ]
+        
+        if type == 0 {
+            query[kSecAttrService as String] = service
+        } else {
+            query[kSecAttrServer as String] = service
+        }
+        
+        let status = SecItemAdd(query as CFDictionary, nil)
+        
+        if status == errSecSuccess {
+            // 保存 Tag
+            if !appTag.isEmpty {
+                let classDisplay = type == 0 ? "通用" : "网络"
+                let uniqueKey = KeychainItem.makeUniqueKey(
+                    classDisplay: classDisplay,
+                    title: service,
+                    account: account,
+                    accessGroup: targetGroup
+                )
+                TagManager.shared.setTag(appTag, for: uniqueKey)
+            }
+            
+            onSave()
+            pm.wrappedValue.dismiss()
+        } else if status == errSecDuplicateItem {
+            showErrorMessage("该项目已存在")
+        } else if status == errSecNotAvailable {
+            showErrorMessage("权限不足或 Keychain 不可用")
+        } else {
+            showErrorMessage("保存失败: 错误码 \(status)")
+        }
+    }
+    
+    func showErrorMessage(_ message: String) {
+        errorMessage = message
+        showError = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            showError = false
+        }
     }
 }
 
