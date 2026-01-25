@@ -565,12 +565,14 @@ struct ItemDetailView: View {
                                 if let str = String(data: data, encoding: .utf8) {
                                     contentString = str
                                 } else {
-                                    contentString = "数据无法转为 UTF8 文本"
-                                    showMessage("数据无法转为 UTF8 文本", isError: true)
+                                    let errorMsg = "数据无法转为 UTF8 文本"
+                                    contentString = errorMsg
+                                    showMessage(errorMsg, isError: true)
                                 }
                             } else {
-                                contentString = "十六进制格式无效 (长度必须为偶数)"
-                                showMessage("十六进制格式无效", isError: true)
+                                let errorMsg = "十六进制格式无效 (长度必须为偶数)"
+                                contentString = errorMsg
+                                showMessage(errorMsg, isError: true)
                             }
                         }
                     }
