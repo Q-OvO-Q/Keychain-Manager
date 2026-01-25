@@ -18,6 +18,64 @@ struct KeychainItem: Identifiable, Hashable {
     
     // 所有原始属性 (用于展示详情)
     let rawAttributes: [String: String]
+    
+    // App 标签
+    var appTag: String {
+        get { TagManager.shared.getTag(for: uniqueKey) }
+        set { TagManager.shared.setTag(newValue, for: uniqueKey) }
+    }
+    
+    // 唯一标识符，用于存储tag
+    var uniqueKey: String {
+        // 使用更安全的分隔符避免冲突
+        let separator = "|||"
+        return "\(itemClassDisplay)\(separator)\(title)\(separator)\(account)\(separator)\(accessGroup)"
+    }
+    
+    // 静态方法用于生成唯一key
+    static func makeUniqueKey(classDisplay: String, title: String, account: String, accessGroup: String) -> String {
+        let separator = "|||"
+        return "\(classDisplay)\(separator)\(title)\(separator)\(account)\(separator)\(accessGroup)"
+    }
+}
+
+// MARK: - Tag管理器
+class TagManager: ObservableObject {
+    static let shared = TagManager()
+    private let userDefaults = UserDefaults.standard
+    private let tagsKey = "KeychainItemTags"
+    
+    @Published var allTags: Set<String> = []
+    
+    init() {
+        loadAllTags()
+    }
+    
+    func getTag(for key: String) -> String {
+        if let tags = userDefaults.dictionary(forKey: tagsKey) as? [String: String] {
+            return tags[key] ?? ""
+        }
+        return ""
+    }
+    
+    func setTag(_ tag: String, for key: String) {
+        var tags = userDefaults.dictionary(forKey: tagsKey) as? [String: String] ?? [:]
+        if tag.isEmpty {
+            tags.removeValue(forKey: key)
+        } else {
+            tags[key] = tag
+        }
+        userDefaults.set(tags, forKey: tagsKey)
+        loadAllTags()
+    }
+    
+    private func loadAllTags() {
+        if let tags = userDefaults.dictionary(forKey: tagsKey) as? [String: String] {
+            allTags = Set(tags.values.filter { !$0.isEmpty })
+        } else {
+            allTags = []
+        }
+    }
 }
 
 // MARK: - 主视图
@@ -25,6 +83,8 @@ struct ContentView: View {
     @AppStorage("targetAccessGroup") private var targetGroup: String = ""
     @State private var items: [KeychainItem] = []
     @State private var statusMessage = "输入 TeamID.* 后点击刷新"
+    @StateObject private var tagManager = TagManager.shared
+    @State private var selectedTagFilter: String = ""
     
     var body: some View {
         NavigationView {
@@ -42,13 +102,44 @@ struct ContentView: View {
                         Button("清空显示") { items.removeAll() }
                             .buttonStyle(.bordered)
                     }
+                    
+                    // Tag 筛选器
+                    if !tagManager.allTags.isEmpty {
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                Button(action: { selectedTagFilter = "" }) {
+                                    Text("全部")
+                                        .font(.caption)
+                                        .padding(.horizontal, 10)
+                                        .padding(.vertical, 5)
+                                        .background(selectedTagFilter.isEmpty ? Color.blue : Color.gray.opacity(0.2))
+                                        .foregroundColor(selectedTagFilter.isEmpty ? .white : .primary)
+                                        .cornerRadius(15)
+                                }
+                                
+                                ForEach(Array(tagManager.allTags).sorted(), id: \.self) { tag in
+                                    Button(action: { selectedTagFilter = tag }) {
+                                        Text(tag)
+                                            .font(.caption)
+                                            .padding(.horizontal, 10)
+                                            .padding(.vertical, 5)
+                                            .background(selectedTagFilter == tag ? Color.blue : Color.gray.opacity(0.2))
+                                            .foregroundColor(selectedTagFilter == tag ? .white : .primary)
+                                            .cornerRadius(15)
+                                    }
+                                }
+                            }
+                            .padding(.horizontal)
+                        }
+                    }
+                    
                     Text(statusMessage).font(.caption).foregroundColor(.gray)
                 }
                 .padding(.top, 10)
                 
                 // 列表区
                 List {
-                    ForEach(items) { item in
+                    ForEach(filteredItems) { item in
                         NavigationLink(destination: ItemDetailView(item: item, targetGroup: targetGroup, onUpdate: fetchItems)) {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -59,6 +150,16 @@ struct ContentView: View {
                                             .padding(3)
                                             .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
                                             .cornerRadius(4)
+                                        
+                                        // App Tag 标签
+                                        if !item.appTag.isEmpty {
+                                            Text(item.appTag)
+                                                .font(.system(size: 10, weight: .bold))
+                                                .padding(3)
+                                                .background(Color.orange.opacity(0.2))
+                                                .foregroundColor(.orange)
+                                                .cornerRadius(4)
+                                        }
                                         
                                         Text(item.title) // Service 或 Server
                                             .font(.headline)
@@ -90,6 +191,15 @@ struct ContentView: View {
                     }
                 }
             }
+        }
+    }
+    
+    // 筛选后的items
+    var filteredItems: [KeychainItem] {
+        if selectedTagFilter.isEmpty {
+            return items
+        } else {
+            return items.filter { $0.appTag == selectedTagFilter }
         }
     }
     
@@ -207,6 +317,8 @@ struct ItemDetailView: View {
     
     @State private var contentString: String = ""
     @State private var isEditingHex: Bool = false
+    @State private var appTag: String = ""
+    @StateObject private var tagManager = TagManager.shared
     @Environment(\.presentationMode) var presentationMode
     
     var body: some View {
@@ -217,6 +329,43 @@ struct ItemDetailView: View {
                 LabeledContent("标识 (Svc/Svr)", value: item.title)
                 LabeledContent("账号 (Account)", value: item.account)
                 LabeledContent("组 (Group)", value: item.accessGroup)
+            }
+            
+            // App Tag 编辑区
+            Section(header: Text("App 标签")) {
+                HStack {
+                    TextField("输入 App 名称", text: $appTag)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                    Button("保存") {
+                        saveTag()
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+                
+                if !tagManager.allTags.isEmpty {
+                    Text("已有标签：")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Array(tagManager.allTags).sorted(), id: \.self) { tag in
+                                Button(action: {
+                                    appTag = tag
+                                    saveTag()
+                                }) {
+                                    Text(tag)
+                                        .font(.caption)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.orange.opacity(0.2))
+                                        .foregroundColor(.orange)
+                                        .cornerRadius(10)
+                                }
+                            }
+                        }
+                    }
+                }
             }
             
             // 数据编辑区
@@ -280,7 +429,13 @@ struct ItemDetailView: View {
                 contentString = item.rawData.hexString
                 isEditingHex = true
             }
+            appTag = item.appTag
         }
+    }
+    
+    func saveTag() {
+        TagManager.shared.setTag(appTag, for: item.uniqueKey)
+        onUpdate()
     }
     
     func saveChanges() {
@@ -331,6 +486,8 @@ struct AddItemView: View {
     @State private var service = ""
     @State private var account = ""
     @State private var dataStr = ""
+    @State private var appTag = ""
+    @StateObject private var tagManager = TagManager.shared
     
     var body: some View {
         Form {
@@ -353,6 +510,32 @@ struct AddItemView: View {
                 TextField("内容", text: $dataStr)
             }
             
+            Section(header: Text("App 标签 (可选)")) {
+                TextField("输入 App 名称", text: $appTag)
+                
+                if !tagManager.allTags.isEmpty {
+                    Text("已有标签：")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(Array(tagManager.allTags).sorted(), id: \.self) { tag in
+                                Button(action: { appTag = tag }) {
+                                    Text(tag)
+                                        .font(.caption)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.orange.opacity(0.2))
+                                        .foregroundColor(.orange)
+                                        .cornerRadius(10)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
             Button("保存") {
                 let data = dataStr.data(using: .utf8)!
                 var query: [String: Any] = [
@@ -369,6 +552,19 @@ struct AddItemView: View {
                 }
                 
                 SecItemAdd(query as CFDictionary, nil)
+                
+                // 保存 Tag
+                if !appTag.isEmpty {
+                    let classDisplay = type == 0 ? "通用" : "网络"
+                    let uniqueKey = KeychainItem.makeUniqueKey(
+                        classDisplay: classDisplay,
+                        title: service,
+                        account: account,
+                        accessGroup: targetGroup
+                    )
+                    TagManager.shared.setTag(appTag, for: uniqueKey)
+                }
+                
                 onSave()
                 pm.wrappedValue.dismiss()
             }
