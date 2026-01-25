@@ -490,6 +490,9 @@ struct ItemDetailView: View {
     @State private var appTag: String = ""
     @State private var saveMessage: String = ""
     @State private var showSaveMessage: Bool = false
+    @State private var isMessageError: Bool = false
+    @State private var messageWorkItem: DispatchWorkItem?
+    @State private var isDismissing: Bool = false
     @StateObject private var tagManager = TagManager.shared
     @Environment(\.presentationMode) var presentationMode
     
@@ -565,14 +568,14 @@ struct ItemDetailView: View {
                                 if let str = String(data: data, encoding: .utf8) {
                                     contentString = str
                                 } else {
-                                    let errorMsg = "数据无法转为 UTF8 文本"
-                                    contentString = errorMsg
-                                    showMessage(errorMsg, isError: true)
+                                    // 转换失败，恢复到Hex模式
+                                    isEditingHex = true
+                                    showMessage("数据无法转为 UTF8 文本", isError: true)
                                 }
                             } else {
-                                let errorMsg = "十六进制格式无效 (长度必须为偶数)"
-                                contentString = errorMsg
-                                showMessage(errorMsg, isError: true)
+                                // 转换失败，恢复到Hex模式
+                                isEditingHex = true
+                                showMessage("十六进制格式无效 (长度必须为偶数)", isError: true)
                             }
                         }
                     }
@@ -580,7 +583,7 @@ struct ItemDetailView: View {
                 if showSaveMessage {
                     Text(saveMessage)
                         .font(.caption)
-                        .foregroundColor(saveMessage.contains("成功") ? .green : .red)
+                        .foregroundColor(isMessageError ? .red : .green)
                 }
                 
                 Button("保存修改") {
@@ -620,11 +623,23 @@ struct ItemDetailView: View {
     }
     
     func showMessage(_ message: String, isError: Bool = false) {
+        // Cancel any pending message hide operation
+        messageWorkItem?.cancel()
+        
         saveMessage = message
         showSaveMessage = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            showSaveMessage = false
+        isMessageError = isError
+        
+        // Create new work item to hide message after delay
+        let workItem = DispatchWorkItem { [weak self = self] in
+            guard let self = self else { return }
+            // Only hide if message hasn't changed
+            if self.saveMessage == message {
+                self.showSaveMessage = false
+            }
         }
+        messageWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: workItem)
     }
     
     func saveTag() {
@@ -638,7 +653,7 @@ struct ItemDetailView: View {
         if isEditingHex {
             finalData = contentString.hexData
             if finalData == nil {
-                showMessage("十六进制格式无效", isError: true)
+                showMessage("十六进制格式无效 (长度必须为偶数)", isError: true)
                 return
             }
         } else {
@@ -649,10 +664,8 @@ struct ItemDetailView: View {
             }
         }
         
-        guard let dataToSave = finalData else {
-            showMessage("数据无效", isError: true)
-            return
-        }
+        // At this point finalData is guaranteed to be non-nil due to early returns above
+        let dataToSave = finalData!
         
         // 构造查询主键，使用 item.accessGroup 而不是 targetGroup
         var query: [String: Any] = [
@@ -675,8 +688,14 @@ struct ItemDetailView: View {
         if status == errSecSuccess {
             showMessage("保存成功", isError: false)
             onUpdate()
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                presentationMode.wrappedValue.dismiss()
+            
+            // Only dismiss if not already dismissing
+            if !isDismissing {
+                isDismissing = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self = self] in
+                    guard let self = self, self.isDismissing else { return }
+                    self.presentationMode.wrappedValue.dismiss()
+                }
             }
         } else if status == errSecItemNotFound {
             showMessage("保存失败: 项目不存在", isError: true)
@@ -701,6 +720,7 @@ struct AddItemView: View {
     @State private var appTag = ""
     @State private var errorMessage = ""
     @State private var showError = false
+    @State private var errorWorkItem: DispatchWorkItem?
     @StateObject private var tagManager = TagManager.shared
     
     var body: some View {
@@ -761,23 +781,11 @@ struct AddItemView: View {
             Button("保存") {
                 saveItem()
             }
-            .disabled(service.isEmpty || account.isEmpty)
         }
         .navigationTitle("新增条目")
     }
     
     func saveItem() {
-        // 验证必填字段
-        if service.isEmpty {
-            showErrorMessage("服务名/服务器地址不能为空")
-            return
-        }
-        
-        if account.isEmpty {
-            showErrorMessage("账号不能为空")
-            return
-        }
-        
         guard let data = dataStr.data(using: .utf8) else {
             showErrorMessage("数据转换失败")
             return
@@ -823,11 +831,22 @@ struct AddItemView: View {
     }
     
     func showErrorMessage(_ message: String) {
+        // Cancel any pending error hide operation
+        errorWorkItem?.cancel()
+        
         errorMessage = message
         showError = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            showError = false
+        
+        // Create new work item to hide error after delay
+        let workItem = DispatchWorkItem { [weak self = self] in
+            guard let self = self else { return }
+            // Only hide if error message hasn't changed
+            if self.errorMessage == message {
+                self.showError = false
+            }
         }
+        errorWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: workItem)
     }
 }
 
