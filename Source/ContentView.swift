@@ -401,6 +401,8 @@ struct ContentView: View {
             }
             
             SecItemDelete(query as CFDictionary)
+            // 清除关联的标签，避免孤立标签留在UI中
+            TagManager.shared.setTag("", for: item.uniqueKey)
         }
         items.remove(atOffsets: offsets)
     }
@@ -451,6 +453,8 @@ struct ContentView: View {
             }
             
             SecItemDelete(query as CFDictionary)
+            // 清除关联的标签，避免孤立标签留在UI中
+            TagManager.shared.setTag("", for: item.uniqueKey)
         }
         items.removeAll { selectedItems.contains($0.id) }
         selectedItems.removeAll()
