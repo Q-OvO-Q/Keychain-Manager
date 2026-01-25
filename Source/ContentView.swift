@@ -86,6 +86,12 @@ struct ContentView: View {
     @StateObject private var tagManager = TagManager.shared
     @State private var selectedTagFilter: String = ""
     
+    // 批量选择相关
+    @State private var isSelectionMode = false
+    @State private var selectedItems: Set<UUID> = []
+    @State private var showBatchTagSheet = false
+    @State private var batchTagValue = ""
+    
     var body: some View {
         NavigationView {
             VStack {
@@ -101,6 +107,60 @@ struct ContentView: View {
                             .buttonStyle(.borderedProminent)
                         Button("清空显示") { items.removeAll() }
                             .buttonStyle(.bordered)
+                        
+                        Button(isSelectionMode ? "取消" : "批量选择") {
+                            isSelectionMode.toggle()
+                            if !isSelectionMode {
+                                selectedItems.removeAll()
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    
+                    // 批量操作按钮
+                    if isSelectionMode {
+                        HStack {
+                            Text("已选择: \(selectedItems.count)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            
+                            Spacer()
+                            
+                            Button("全选") {
+                                selectedItems = Set(filteredItems.map { $0.id })
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(filteredItems.isEmpty)
+                            
+                            Button("全不选") {
+                                selectedItems.removeAll()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(selectedItems.isEmpty)
+                        }
+                        .padding(.horizontal)
+                        
+                        HStack {
+                            Button("批量标签") {
+                                showBatchTagSheet = true
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .disabled(selectedItems.isEmpty)
+                            
+                            Button("批量取消标签") {
+                                batchUntag()
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(selectedItems.isEmpty)
+                            
+                            Button("批量删除") {
+                                batchDelete()
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.red)
+                            .disabled(selectedItems.isEmpty)
+                        }
+                        .padding(.horizontal)
                     }
                     
                     // Tag 筛选器
@@ -140,46 +200,102 @@ struct ContentView: View {
                 // 列表区
                 List {
                     ForEach(filteredItems) { item in
-                        NavigationLink(destination: ItemDetailView(item: item, targetGroup: targetGroup, onUpdate: fetchItems)) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    HStack {
-                                        // 类型标签
-                                        Text(item.itemClassDisplay)
-                                            .font(.system(size: 10, weight: .bold))
-                                            .padding(3)
-                                            .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
-                                            .cornerRadius(4)
-                                        
-                                        // App Tag 标签
-                                        if !item.appTag.isEmpty {
-                                            Text(item.appTag)
+                        HStack(spacing: 10) {
+                            // 选择模式下显示复选框
+                            if isSelectionMode {
+                                Image(systemName: selectedItems.contains(item.id) ? "checkmark.circle.fill" : "circle")
+                                    .foregroundColor(selectedItems.contains(item.id) ? .blue : .gray)
+                                    .onTapGesture {
+                                        toggleSelection(for: item.id)
+                                    }
+                            }
+                            
+                            if isSelectionMode {
+                                // 选择模式下，点击整行来选择
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        HStack {
+                                            // 类型标签
+                                            Text(item.itemClassDisplay)
                                                 .font(.system(size: 10, weight: .bold))
                                                 .padding(3)
-                                                .background(Color.orange.opacity(0.2))
-                                                .foregroundColor(.orange)
+                                                .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
                                                 .cornerRadius(4)
+                                            
+                                            // App Tag 标签
+                                            if !item.appTag.isEmpty {
+                                                Text(item.appTag)
+                                                    .font(.system(size: 10, weight: .bold))
+                                                    .padding(3)
+                                                    .background(Color.orange.opacity(0.2))
+                                                    .foregroundColor(.orange)
+                                                    .cornerRadius(4)
+                                            }
+                                            
+                                            Text(item.title) // Service 或 Server
+                                                .font(.headline)
+                                                .lineLimit(1)
                                         }
                                         
-                                        Text(item.title) // Service 或 Server
-                                            .font(.headline)
-                                            .lineLimit(1)
+                                        Text(item.account.isEmpty ? "无账号" : item.account)
+                                            .font(.subheadline)
+                                            .foregroundColor(.secondary)
                                     }
-                                    
-                                    Text(item.account.isEmpty ? "无账号" : item.account)
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
+                                    Spacer()
+                                    // 右侧显示一小段数据预览
+                                    Text(item.isStringData ? String(data: item.rawData, encoding: .utf8)! : "HEX")
+                                        .font(.caption)
+                                        .foregroundColor(.gray)
+                                        .frame(width: 40)
                                 }
-                                Spacer()
-                                // 右侧显示一小段数据预览
-                                Text(item.isStringData ? String(data: item.rawData, encoding: .utf8)! : "HEX")
-                                    .font(.caption)
-                                    .foregroundColor(.gray)
-                                    .frame(width: 40)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    toggleSelection(for: item.id)
+                                }
+                            } else {
+                                // 非选择模式下，使用原来的NavigationLink
+                                NavigationLink(destination: ItemDetailView(item: item, targetGroup: targetGroup, onUpdate: fetchItems)) {
+                                    HStack {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            HStack {
+                                                // 类型标签
+                                                Text(item.itemClassDisplay)
+                                                    .font(.system(size: 10, weight: .bold))
+                                                    .padding(3)
+                                                    .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
+                                                    .cornerRadius(4)
+                                                
+                                                // App Tag 标签
+                                                if !item.appTag.isEmpty {
+                                                    Text(item.appTag)
+                                                        .font(.system(size: 10, weight: .bold))
+                                                        .padding(3)
+                                                        .background(Color.orange.opacity(0.2))
+                                                        .foregroundColor(.orange)
+                                                        .cornerRadius(4)
+                                                }
+                                                
+                                                Text(item.title) // Service 或 Server
+                                                    .font(.headline)
+                                                    .lineLimit(1)
+                                            }
+                                            
+                                            Text(item.account.isEmpty ? "无账号" : item.account)
+                                                .font(.subheadline)
+                                                .foregroundColor(.secondary)
+                                        }
+                                        Spacer()
+                                        // 右侧显示一小段数据预览
+                                        Text(item.isStringData ? String(data: item.rawData, encoding: .utf8)! : "HEX")
+                                            .font(.caption)
+                                            .foregroundColor(.gray)
+                                            .frame(width: 40)
+                                    }
+                                }
                             }
                         }
                     }
-                    .onDelete(perform: deleteItems)
+                    .onDelete(perform: isSelectionMode ? nil : deleteItems)
                 }
                 .listStyle(.plain)
             }
@@ -190,6 +306,16 @@ struct ContentView: View {
                         Image(systemName: "plus")
                     }
                 }
+            }
+            .sheet(isPresented: $showBatchTagSheet) {
+                BatchTagSheet(
+                    tagManager: tagManager,
+                    batchTagValue: $batchTagValue,
+                    onSave: {
+                        applyBatchTag()
+                        showBatchTagSheet = false
+                    }
+                )
             }
         }
     }
@@ -306,6 +432,58 @@ struct ContentView: View {
             SecItemDelete(query as CFDictionary)
         }
         items.remove(atOffsets: offsets)
+    }
+    
+    // MARK: - 批量操作方法
+    func toggleSelection(for id: UUID) {
+        if selectedItems.contains(id) {
+            selectedItems.remove(id)
+        } else {
+            selectedItems.insert(id)
+        }
+    }
+    
+    func applyBatchTag() {
+        let selectedKeyItems = items.filter { selectedItems.contains($0.id) }
+        for item in selectedKeyItems {
+            TagManager.shared.setTag(batchTagValue, for: item.uniqueKey)
+        }
+        fetchItems()
+        batchTagValue = ""
+        selectedItems.removeAll()
+        isSelectionMode = false
+    }
+    
+    func batchUntag() {
+        let selectedKeyItems = items.filter { selectedItems.contains($0.id) }
+        for item in selectedKeyItems {
+            TagManager.shared.setTag("", for: item.uniqueKey)
+        }
+        fetchItems()
+        selectedItems.removeAll()
+        isSelectionMode = false
+    }
+    
+    func batchDelete() {
+        let selectedKeyItems = items.filter { selectedItems.contains($0.id) }
+        for item in selectedKeyItems {
+            var query: [String: Any] = [
+                kSecClass as String: item.itemClass,
+                kSecAttrAccount as String: item.account,
+                kSecAttrAccessGroup as String: targetGroup
+            ]
+            
+            if item.itemClass == kSecClassInternetPassword {
+                query[kSecAttrServer as String] = item.title
+            } else {
+                query[kSecAttrService as String] = item.title
+            }
+            
+            SecItemDelete(query as CFDictionary)
+        }
+        items.removeAll { selectedItems.contains($0.id) }
+        selectedItems.removeAll()
+        isSelectionMode = false
     }
 }
 
@@ -570,5 +748,61 @@ struct AddItemView: View {
             }
         }
         .navigationTitle("新增条目")
+    }
+}
+
+// MARK: - 批量标签弹窗
+struct BatchTagSheet: View {
+    @ObservedObject var tagManager: TagManager
+    @Binding var batchTagValue: String
+    var onSave: () -> Void
+    @Environment(\.presentationMode) var presentationMode
+    
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(header: Text("批量设置标签")) {
+                    TextField("输入标签名称", text: $batchTagValue)
+                        .textFieldStyle(RoundedBorderTextFieldStyle())
+                }
+                
+                if !tagManager.allTags.isEmpty {
+                    Section(header: Text("选择已有标签")) {
+                        ForEach(Array(tagManager.allTags).sorted(), id: \.self) { tag in
+                            Button(action: {
+                                batchTagValue = tag
+                            }) {
+                                HStack {
+                                    Text(tag)
+                                        .foregroundColor(.primary)
+                                    Spacer()
+                                    if batchTagValue == tag {
+                                        Image(systemName: "checkmark")
+                                            .foregroundColor(.blue)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                Section {
+                    Button("应用标签") {
+                        onSave()
+                    }
+                    .disabled(batchTagValue.isEmpty)
+                    .frame(maxWidth: .infinity)
+                }
+            }
+            .navigationTitle("批量标签")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("取消") {
+                        presentationMode.wrappedValue.dismiss()
+                    }
+                }
+            }
+        }
     }
 }
