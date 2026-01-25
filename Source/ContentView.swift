@@ -27,7 +27,15 @@ struct KeychainItem: Identifiable, Hashable {
     
     // 唯一标识符，用于存储tag
     var uniqueKey: String {
-        "\(itemClassDisplay)_\(title)_\(account)_\(accessGroup)"
+        // 使用更安全的分隔符避免冲突
+        let separator = "|||"
+        return "\(itemClassDisplay)\(separator)\(title)\(separator)\(account)\(separator)\(accessGroup)"
+    }
+    
+    // 静态方法用于生成唯一key
+    static func makeUniqueKey(classDisplay: String, title: String, account: String, accessGroup: String) -> String {
+        let separator = "|||"
+        return "\(classDisplay)\(separator)\(title)\(separator)\(account)\(separator)\(accessGroup)"
     }
 }
 
@@ -548,7 +556,12 @@ struct AddItemView: View {
                 // 保存 Tag
                 if !appTag.isEmpty {
                     let classDisplay = type == 0 ? "通用" : "网络"
-                    let uniqueKey = "\(classDisplay)_\(service)_\(account)_\(targetGroup)"
+                    let uniqueKey = KeychainItem.makeUniqueKey(
+                        classDisplay: classDisplay,
+                        title: service,
+                        account: account,
+                        accessGroup: targetGroup
+                    )
                     TagManager.shared.setTag(appTag, for: uniqueKey)
                 }
                 
