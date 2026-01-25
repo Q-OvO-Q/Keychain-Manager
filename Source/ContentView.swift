@@ -212,85 +212,15 @@ struct ContentView: View {
                             
                             if isSelectionMode {
                                 // 选择模式下，点击整行来选择
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        HStack {
-                                            // 类型标签
-                                            Text(item.itemClassDisplay)
-                                                .font(.system(size: 10, weight: .bold))
-                                                .padding(3)
-                                                .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
-                                                .cornerRadius(4)
-                                            
-                                            // App Tag 标签
-                                            if !item.appTag.isEmpty {
-                                                Text(item.appTag)
-                                                    .font(.system(size: 10, weight: .bold))
-                                                    .padding(3)
-                                                    .background(Color.orange.opacity(0.2))
-                                                    .foregroundColor(.orange)
-                                                    .cornerRadius(4)
-                                            }
-                                            
-                                            Text(item.title) // Service 或 Server
-                                                .font(.headline)
-                                                .lineLimit(1)
-                                        }
-                                        
-                                        Text(item.account.isEmpty ? "无账号" : item.account)
-                                            .font(.subheadline)
-                                            .foregroundColor(.secondary)
+                                itemRowView(for: item)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        toggleSelection(for: item.id)
                                     }
-                                    Spacer()
-                                    // 右侧显示一小段数据预览
-                                    Text(item.isStringData ? String(data: item.rawData, encoding: .utf8)! : "HEX")
-                                        .font(.caption)
-                                        .foregroundColor(.gray)
-                                        .frame(width: 40)
-                                }
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    toggleSelection(for: item.id)
-                                }
                             } else {
                                 // 非选择模式下，使用原来的NavigationLink
                                 NavigationLink(destination: ItemDetailView(item: item, targetGroup: targetGroup, onUpdate: fetchItems)) {
-                                    HStack {
-                                        VStack(alignment: .leading, spacing: 4) {
-                                            HStack {
-                                                // 类型标签
-                                                Text(item.itemClassDisplay)
-                                                    .font(.system(size: 10, weight: .bold))
-                                                    .padding(3)
-                                                    .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
-                                                    .cornerRadius(4)
-                                                
-                                                // App Tag 标签
-                                                if !item.appTag.isEmpty {
-                                                    Text(item.appTag)
-                                                        .font(.system(size: 10, weight: .bold))
-                                                        .padding(3)
-                                                        .background(Color.orange.opacity(0.2))
-                                                        .foregroundColor(.orange)
-                                                        .cornerRadius(4)
-                                                }
-                                                
-                                                Text(item.title) // Service 或 Server
-                                                    .font(.headline)
-                                                    .lineLimit(1)
-                                            }
-                                            
-                                            Text(item.account.isEmpty ? "无账号" : item.account)
-                                                .font(.subheadline)
-                                                .foregroundColor(.secondary)
-                                        }
-                                        Spacer()
-                                        // 右侧显示一小段数据预览
-                                        Text(item.isStringData ? String(data: item.rawData, encoding: .utf8)! : "HEX")
-                                            .font(.caption)
-                                            .foregroundColor(.gray)
-                                            .frame(width: 40)
-                                    }
+                                    itemRowView(for: item)
                                 }
                             }
                         }
@@ -326,6 +256,47 @@ struct ContentView: View {
             return items
         } else {
             return items.filter { $0.appTag == selectedTagFilter }
+        }
+    }
+    
+    // MARK: - Helper Views
+    @ViewBuilder
+    func itemRowView(for item: KeychainItem) -> some View {
+        HStack {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    // 类型标签
+                    Text(item.itemClassDisplay)
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(3)
+                        .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
+                        .cornerRadius(4)
+                    
+                    // App Tag 标签
+                    if !item.appTag.isEmpty {
+                        Text(item.appTag)
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(3)
+                            .background(Color.orange.opacity(0.2))
+                            .foregroundColor(.orange)
+                            .cornerRadius(4)
+                    }
+                    
+                    Text(item.title) // Service 或 Server
+                        .font(.headline)
+                        .lineLimit(1)
+                }
+                
+                Text(item.account.isEmpty ? "无账号" : item.account)
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            // 右侧显示一小段数据预览
+            Text(item.isStringData ? (String(data: item.rawData, encoding: .utf8) ?? "无效数据") : "HEX")
+                .font(.caption)
+                .foregroundColor(.gray)
+                .frame(width: 40)
         }
     }
     
