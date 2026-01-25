@@ -631,7 +631,7 @@ struct ItemDetailView: View {
         isMessageError = isError
         
         // Create new work item to hide message after delay
-        let workItem = DispatchWorkItem { [weak self = self] in
+        let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             // Only hide if message hasn't changed
             if self.saveMessage == message {
@@ -692,7 +692,7 @@ struct ItemDetailView: View {
             // Only dismiss if not already dismissing
             if !isDismissing {
                 isDismissing = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self = self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
                     guard let self = self, self.isDismissing else { return }
                     self.presentationMode.wrappedValue.dismiss()
                 }
@@ -838,7 +838,7 @@ struct AddItemView: View {
         showError = true
         
         // Create new work item to hide error after delay
-        let workItem = DispatchWorkItem { [weak self = self] in
+        let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             // Only hide if error message hasn't changed
             if self.errorMessage == message {
