@@ -79,10 +79,12 @@ class TagManager: ObservableObject {
 }
 
 // MARK: - 主视图
+private let untaggedFilterKey = "__untagged__"
+
 struct ContentView: View {
     @AppStorage("targetAccessGroup") private var targetGroup: String = ""
     @State private var items: [KeychainItem] = []
-    @State private var statusMessage = "输入 TeamID.* 后点击刷新"
+    @State private var statusMessage = "正在检测可用的 Keychain Access Groups..."
     @StateObject private var tagManager = TagManager.shared
     @State private var selectedTagFilter: String = ""
     
@@ -92,23 +94,34 @@ struct ContentView: View {
     @State private var showBatchTagSheet = false
     @State private var batchTagValue = ""
     
+    // 描述文件相关
+    @State private var detectedGroups: [String] = []
+    @State private var showManualInput = false
+    
     var body: some View {
         NavigationView {
-            VStack {
-                // 顶部输入区
+            VStack(spacing: 0) {
+                // 顶部区域
                 VStack(spacing: 8) {
-                    TextField("Access Group (例如 ZYVN.com.test 或 ZYVN.*)", text: $targetGroup)
-                        .textFieldStyle(RoundedBorderTextFieldStyle())
-                        .autocapitalization(.none)
-                        .padding(.horizontal)
+                    // Access Group 选择区
+                    if !detectedGroups.isEmpty && !showManualInput {
+                        accessGroupSection()
+                    } else {
+                        manualInputSection()
+                    }
                     
+                    // 操作按钮
                     HStack {
                         Button("刷新列表") { fetchItems() }
                             .buttonStyle(.borderedProminent)
-                        Button("清空显示") { items.removeAll() }
-                            .buttonStyle(.bordered)
                         
-                        Button(isSelectionMode ? "取消" : "批量选择") {
+                        Button("清空显示") {
+                            items.removeAll()
+                            selectedItems.removeAll()
+                        }
+                        .buttonStyle(.bordered)
+                        
+                        Button(isSelectionMode ? "退出选择" : "批量选择") {
                             isSelectionMode.toggle()
                             if !isSelectionMode {
                                 selectedItems.removeAll()
@@ -119,79 +132,56 @@ struct ContentView: View {
                     
                     // 批量操作按钮
                     if isSelectionMode {
-                        HStack {
-                            Text("已选择: \(selectedItems.count)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            
-                            Spacer()
-                            
-                            Button("全选") {
-                                selectedItems = Set(filteredItems.map { $0.id })
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(filteredItems.isEmpty)
-                            
-                            Button("全不选") {
-                                selectedItems.removeAll()
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(selectedItems.isEmpty)
-                        }
-                        .padding(.horizontal)
-                        
-                        HStack {
-                            Button("批量标签") {
-                                showBatchTagSheet = true
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .disabled(selectedItems.isEmpty)
-                            
-                            Button("批量取消标签") {
-                                batchUntag()
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(selectedItems.isEmpty)
-                            
-                            Button("批量删除") {
-                                batchDelete()
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(.red)
-                            .disabled(selectedItems.isEmpty)
-                        }
-                        .padding(.horizontal)
-                    }
-                    
-                    // Tag 筛选器
-                    if !tagManager.allTags.isEmpty {
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                Button(action: { selectedTagFilter = "" }) {
-                                    Text("全部")
-                                        .font(.caption)
-                                        .padding(.horizontal, 10)
-                                        .padding(.vertical, 5)
-                                        .background(selectedTagFilter.isEmpty ? Color.blue : Color.gray.opacity(0.2))
-                                        .foregroundColor(selectedTagFilter.isEmpty ? .white : .primary)
-                                        .cornerRadius(15)
-                                }
+                        VStack(spacing: 6) {
+                            HStack {
+                                Text("已选择 \(selectedItems.count) 项")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
                                 
-                                ForEach(Array(tagManager.allTags).sorted(), id: \.self) { tag in
-                                    Button(action: { selectedTagFilter = tag }) {
-                                        Text(tag)
-                                            .font(.caption)
-                                            .padding(.horizontal, 10)
-                                            .padding(.vertical, 5)
-                                            .background(selectedTagFilter == tag ? Color.blue : Color.gray.opacity(0.2))
-                                            .foregroundColor(selectedTagFilter == tag ? .white : .primary)
-                                            .cornerRadius(15)
-                                    }
+                                Spacer()
+                                
+                                Button("全选") {
+                                    selectedItems = Set(filteredItems.map { $0.id })
                                 }
+                                .font(.caption)
+                                .buttonStyle(.bordered)
+                                .disabled(filteredItems.isEmpty)
+                                
+                                Button("全不选") {
+                                    selectedItems.removeAll()
+                                }
+                                .font(.caption)
+                                .buttonStyle(.bordered)
+                                .disabled(selectedItems.isEmpty)
+                            }
+                            .padding(.horizontal)
+                            
+                            HStack {
+                                Button("批量标签") {
+                                    showBatchTagSheet = true
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .disabled(selectedItems.isEmpty)
+                                
+                                Button("批量取消标签") {
+                                    batchUntag()
+                                }
+                                .buttonStyle(.bordered)
+                                .disabled(selectedItems.isEmpty)
+                                
+                                Button("批量删除") {
+                                    batchDelete()
+                                }
+                                .buttonStyle(.bordered)
+                                .tint(.red)
+                                .disabled(selectedItems.isEmpty)
                             }
                             .padding(.horizontal)
                         }
                     }
+                    
+                    // Tag 筛选器
+                    tagFilterSection()
                     
                     Text(statusMessage).font(.caption).foregroundColor(.gray)
                 }
@@ -201,7 +191,6 @@ struct ContentView: View {
                 List {
                     ForEach(filteredItems) { item in
                         HStack(spacing: 10) {
-                            // 选择模式下显示复选框
                             if isSelectionMode {
                                 Image(systemName: selectedItems.contains(item.id) ? "checkmark.circle.fill" : "circle")
                                     .foregroundColor(selectedItems.contains(item.id) ? .blue : .gray)
@@ -211,15 +200,13 @@ struct ContentView: View {
                             }
                             
                             if isSelectionMode {
-                                // 选择模式下，点击整行来选择
                                 itemRowView(for: item)
                                     .contentShape(Rectangle())
                                     .onTapGesture {
                                         toggleSelection(for: item.id)
                                     }
                             } else {
-                                // 非选择模式下，使用原来的NavigationLink
-                                NavigationLink(destination: ItemDetailView(item: item, targetGroup: targetGroup, onUpdate: fetchItems)) {
+                                NavigationLink(destination: ItemDetailView(item: item, onUpdate: fetchItems)) {
                                     itemRowView(for: item)
                                 }
                             }
@@ -247,6 +234,9 @@ struct ContentView: View {
                     }
                 )
             }
+            .onAppear {
+                loadProvisioningProfile()
+            }
         }
     }
     
@@ -254,49 +244,216 @@ struct ContentView: View {
     var filteredItems: [KeychainItem] {
         if selectedTagFilter.isEmpty {
             return items
+        } else if selectedTagFilter == untaggedFilterKey {
+            return items.filter { $0.appTag.isEmpty }
         } else {
             return items.filter { $0.appTag == selectedTagFilter }
         }
     }
     
+    // 各标签的 item 数量统计
+    var tagCounts: [String: Int] {
+        var counts: [String: Int] = [:]
+        for item in items {
+            let tag = item.appTag
+            if tag.isEmpty {
+                counts[untaggedFilterKey] = (counts[untaggedFilterKey] ?? 0) + 1
+            } else {
+                counts[tag] = (counts[tag] ?? 0) + 1
+            }
+        }
+        return counts
+    }
+    
     // MARK: - Helper Views
+    
+    /// 自动检测到的 Access Group 选择区
     @ViewBuilder
-    func itemRowView(for item: KeychainItem) -> some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
+    func accessGroupSection() -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Label("Keychain Access Groups", systemImage: "key.fill")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button(action: { showManualInput = true }) {
+                    Label("手动输入", systemImage: "keyboard")
+                        .font(.caption)
+                }
+            }
+            .padding(.horizontal)
+            
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(detectedGroups, id: \.self) { group in
+                        Button(action: {
+                            targetGroup = group
+                            fetchItems()
+                        }) {
+                            Text(group)
+                                .font(.caption)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(targetGroup == group ? Color.accentColor : Color.gray.opacity(0.2))
+                                .foregroundColor(targetGroup == group ? .white : .primary)
+                                .cornerRadius(15)
+                        }
+                    }
+                }
+                .padding(.horizontal)
+            }
+        }
+    }
+    
+    /// 手动输入 Access Group
+    @ViewBuilder
+    func manualInputSection() -> some View {
+        VStack(spacing: 4) {
+            if !detectedGroups.isEmpty {
                 HStack {
-                    // 类型标签
-                    Text(item.itemClassDisplay)
-                        .font(.system(size: 10, weight: .bold))
-                        .padding(3)
-                        .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
-                        .cornerRadius(4)
-                    
-                    // App Tag 标签
-                    if !item.appTag.isEmpty {
-                        Text(item.appTag)
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(3)
-                            .background(Color.orange.opacity(0.2))
-                            .foregroundColor(.orange)
-                            .cornerRadius(4)
+                    Text("手动输入 Access Group")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button("返回自动检测") {
+                        showManualInput = false
+                    }
+                    .font(.caption)
+                }
+                .padding(.horizontal)
+            }
+            
+            TextField("Access Group (例如 TEAMID.* 或 TEAMID.com.app)", text: $targetGroup)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autocapitalization(.none)
+                .padding(.horizontal)
+        }
+    }
+    
+    /// Tag 筛选区
+    @ViewBuilder
+    func tagFilterSection() -> some View {
+        if !items.isEmpty && (!tagManager.allTags.isEmpty || tagCounts[untaggedFilterKey] != nil) {
+            let counts = tagCounts
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    // 全部
+                    filterChip(
+                        label: "全部",
+                        count: items.count,
+                        isSelected: selectedTagFilter.isEmpty
+                    ) {
+                        selectedTagFilter = ""
+                        selectedItems.removeAll()
                     }
                     
-                    Text(item.title) // Service 或 Server
-                        .font(.headline)
-                        .lineLimit(1)
+                    // 各标签
+                    ForEach(Array(tagManager.allTags).sorted(), id: \.self) { tag in
+                        if let count = counts[tag] {
+                            filterChip(
+                                label: tag,
+                                count: count,
+                                isSelected: selectedTagFilter == tag
+                            ) {
+                                selectedTagFilter = tag
+                                selectedItems.removeAll()
+                            }
+                        }
+                    }
+                    
+                    // 未标记
+                    if let untaggedCount = counts[untaggedFilterKey], untaggedCount > 0 {
+                        filterChip(
+                            label: "未标记",
+                            count: untaggedCount,
+                            isSelected: selectedTagFilter == untaggedFilterKey
+                        ) {
+                            selectedTagFilter = untaggedFilterKey
+                            selectedItems.removeAll()
+                        }
+                    }
+                }
+                .padding(.horizontal)
+            }
+        }
+    }
+    
+    /// 筛选 Chip
+    @ViewBuilder
+    func filterChip(label: String, count: Int, isSelected: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text("\(label)(\(count))")
+                .font(.caption)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(isSelected ? Color.blue : Color.gray.opacity(0.2))
+                .foregroundColor(isSelected ? .white : .primary)
+                .cornerRadius(15)
+        }
+    }
+    
+    @ViewBuilder
+    func itemRowView(for item: KeychainItem) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 4) {
+                // 类型标签
+                Text(item.itemClassDisplay)
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(3)
+                    .background(item.itemClassDisplay == "网络" ? Color.green.opacity(0.2) : Color.blue.opacity(0.2))
+                    .cornerRadius(4)
+                
+                // App Tag 标签
+                if !item.appTag.isEmpty {
+                    Text(item.appTag)
+                        .font(.system(size: 10, weight: .bold))
+                        .padding(3)
+                        .background(Color.orange.opacity(0.2))
+                        .foregroundColor(.orange)
+                        .cornerRadius(4)
                 }
                 
-                Text(item.account.isEmpty ? "无账号" : item.account)
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
+                Spacer()
+                
+                // 数据预览
+                Text(dataPreview(for: item))
+                    .font(.caption2)
+                    .foregroundColor(.gray)
+                    .lineLimit(1)
             }
-            Spacer()
-            // 右侧显示一小段数据预览
-            Text(item.isStringData ? (String(data: item.rawData, encoding: .utf8) ?? "无效数据") : "HEX")
-                .font(.caption)
-                .foregroundColor(.gray)
-                .frame(width: 40)
+            
+            // 标题 (Service / Server)
+            Text(item.title)
+                .font(.subheadline)
+                .fontWeight(.medium)
+                .lineLimit(1)
+            
+            // 底部行：账号 + Access Group
+            HStack {
+                Text(item.account.isEmpty ? "无账号" : item.account)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                
+                Spacer()
+                
+                Text(item.accessGroup)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+    
+    /// 数据预览文本
+    func dataPreview(for item: KeychainItem) -> String {
+        if item.isStringData {
+            let str = String(data: item.rawData, encoding: .utf8) ?? ""
+            if str.isEmpty { return "空" }
+            return str.count > 16 ? String(str.prefix(16)) + "…" : str
+        } else {
+            return "HEX:\(item.rawData.count)B"
         }
     }
     
@@ -332,6 +489,8 @@ struct ContentView: View {
         DispatchQueue.main.async {
             self.items = newItems
             self.statusMessage = "找到 \(newItems.count) 条数据"
+            // 清除可能失效的选择 (刷新后 UUID 已变化)
+            self.selectedItems.removeAll()
         }
     }
     
@@ -385,13 +544,13 @@ struct ContentView: View {
     }
     
     func deleteItems(at offsets: IndexSet) {
-        for index in offsets {
-            let item = items[index]
-            // 删除时必须精准匹配所有主键
+        // offsets 对应 filteredItems 的索引，而非 items
+        let itemsToDelete = offsets.map { filteredItems[$0] }
+        for item in itemsToDelete {
             var query: [String: Any] = [
                 kSecClass as String: item.itemClass,
                 kSecAttrAccount as String: item.account,
-                kSecAttrAccessGroup as String: targetGroup
+                kSecAttrAccessGroup as String: item.accessGroup
             ]
             
             if item.itemClass == kSecClassInternetPassword {
@@ -401,10 +560,10 @@ struct ContentView: View {
             }
             
             SecItemDelete(query as CFDictionary)
-            // 清除关联的标签，避免孤立标签留在UI中
             TagManager.shared.setTag("", for: item.uniqueKey)
         }
-        items.remove(atOffsets: offsets)
+        let idsToDelete = Set(itemsToDelete.map { $0.id })
+        items.removeAll { idsToDelete.contains($0.id) }
     }
     
     // MARK: - 批量操作方法
@@ -423,8 +582,6 @@ struct ContentView: View {
         }
         fetchItems()
         batchTagValue = ""
-        selectedItems.removeAll()
-        isSelectionMode = false
     }
     
     func batchUntag() {
@@ -433,8 +590,6 @@ struct ContentView: View {
             TagManager.shared.setTag("", for: item.uniqueKey)
         }
         fetchItems()
-        selectedItems.removeAll()
-        isSelectionMode = false
     }
     
     func batchDelete() {
@@ -443,7 +598,7 @@ struct ContentView: View {
             var query: [String: Any] = [
                 kSecClass as String: item.itemClass,
                 kSecAttrAccount as String: item.account,
-                kSecAttrAccessGroup as String: targetGroup
+                kSecAttrAccessGroup as String: item.accessGroup
             ]
             
             if item.itemClass == kSecClassInternetPassword {
@@ -453,19 +608,70 @@ struct ContentView: View {
             }
             
             SecItemDelete(query as CFDictionary)
-            // 清除关联的标签，避免孤立标签留在UI中
             TagManager.shared.setTag("", for: item.uniqueKey)
         }
         items.removeAll { selectedItems.contains($0.id) }
         selectedItems.removeAll()
         isSelectionMode = false
     }
+    
+    // MARK: - 描述文件解析
+    func loadProvisioningProfile() {
+        // 将描述文件解析和钥匙串枚举移到后台队列，避免阻塞主线程渲染
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let profile = ProvisioningProfileParser.parse() {
+                var groups: [String] = []
+                
+                // 添加通配符选项 (TeamID.*)
+                if let wildcard = profile.wildcardGroup {
+                    groups.append(wildcard)
+                }
+                
+                // 添加具体的 keychain access groups
+                for group in profile.keychainAccessGroups {
+                    if !groups.contains(group) {
+                        groups.append(group)
+                    }
+                }
+                
+                // 计算将要使用的 targetGroup
+                var selectedGroup = self.targetGroup
+                if selectedGroup.isEmpty, let first = groups.first {
+                    selectedGroup = first
+                }
+                
+                // 在主线程更新 UI 状态
+                DispatchQueue.main.async {
+                    self.detectedGroups = groups
+                    if self.targetGroup.isEmpty, !selectedGroup.isEmpty {
+                        self.targetGroup = selectedGroup
+                    }
+                }
+                
+                // 在后台线程执行耗时的钥匙串查询
+                if !selectedGroup.isEmpty {
+                    self.fetchItems()
+                }
+                
+                // 根据查询结果更新状态提示
+                if self.items.isEmpty && !groups.isEmpty {
+                    DispatchQueue.main.async {
+                        self.statusMessage = "已从描述文件检测到 \(groups.count) 个 Access Group，点击选择后刷新"
+                    }
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.showManualInput = true
+                    self.statusMessage = "未检测到描述文件，请手动输入 Access Group"
+                }
+            }
+        }
+    }
 }
 
 // MARK: - 详情与修改页 (支持 Hex)
 struct ItemDetailView: View {
     let item: KeychainItem
-    let targetGroup: String
     var onUpdate: () -> Void
     
     @State private var contentString: String = ""
@@ -533,7 +739,7 @@ struct ItemDetailView: View {
                 TextEditor(text: $contentString)
                     .frame(height: 120)
                     .font(.system(.body, design: .monospaced)) // 等宽字体方便看 Hex
-                    .onChange(of: isEditingHex) { newValue in
+                    .onChange(of: isEditingHex) { _, newValue in
                         // 切换模式时转换当前显示的内容
                         if newValue {
                             // 文本 -> Hex
@@ -606,7 +812,7 @@ struct ItemDetailView: View {
         var query: [String: Any] = [
             kSecClass as String: item.itemClass,
             kSecAttrAccount as String: item.account,
-            kSecAttrAccessGroup as String: targetGroup
+            kSecAttrAccessGroup as String: item.accessGroup
         ]
         
         if item.itemClass == kSecClassInternetPassword {
@@ -690,7 +896,7 @@ struct AddItemView: View {
             }
             
             Button("保存") {
-                let data = dataStr.data(using: .utf8)!
+                guard let data = dataStr.data(using: .utf8) else { return }
                 var query: [String: Any] = [
                     kSecClass as String: (type == 0 ? kSecClassGenericPassword : kSecClassInternetPassword),
                     kSecAttrAccount as String: account,
