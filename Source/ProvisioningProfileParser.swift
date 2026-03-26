@@ -17,7 +17,7 @@ struct ProvisioningProfile {
     }
     
     /// 汇总所有可用的 Keychain Access Group
-    /// 包含: 通配符、keychain-access-groups、application-identifier、application-groups
+    /// 包含: 通配符、keychain-access-groups、application-identifier
     var allAccessGroups: [String] {
         var groups: [String] = []
         
@@ -36,13 +36,6 @@ struct ProvisioningProfile {
         // 3. application-identifier 本身也是隐式的 Keychain Access Group
         if !applicationIdentifier.isEmpty && !groups.contains(applicationIdentifier) {
             groups.append(applicationIdentifier)
-        }
-        
-        // 4. application-groups (App Group 也可作为 Keychain 共享组)
-        for group in applicationGroups {
-            if !groups.contains(group) {
-                groups.append(group)
-            }
         }
         
         return groups

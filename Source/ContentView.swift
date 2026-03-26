@@ -94,10 +94,18 @@ class TagManager: ObservableObject {
     }
     
     private func loadAllTags() {
+        let newTags: Set<String>
         if let tags = userDefaults.dictionary(forKey: tagsKey) as? [String: String] {
-            allTags = Set(tags.values.filter { !$0.isEmpty })
+            newTags = Set(tags.values.filter { !$0.isEmpty })
         } else {
-            allTags = []
+            newTags = []
+        }
+        if Thread.isMainThread {
+            allTags = newTags
+        } else {
+            DispatchQueue.main.async {
+                self.allTags = newTags
+            }
         }
     }
 }
@@ -485,7 +493,12 @@ struct ContentView: View {
     
     /// 若当前标签筛选已无匹配项，自动重置为"全部"
     private func resetTagFilterIfNeeded(for itemList: [KeychainItem]) {
-        if !selectedTagFilter.isEmpty && selectedTagFilter != untaggedFilterKey {
+        guard !selectedTagFilter.isEmpty else { return }
+        if selectedTagFilter == untaggedFilterKey {
+            if !itemList.contains(where: { $0.appTag.isEmpty }) {
+                selectedTagFilter = ""
+            }
+        } else {
             if !itemList.contains(where: { $0.appTag == selectedTagFilter }) {
                 selectedTagFilter = ""
             }
@@ -522,7 +535,8 @@ struct ContentView: View {
         
         // 清理孤立标签 (属于当前加载的 Access Group 但已无对应条目)
         let existingKeys = Set(newItems.map { $0.uniqueKey })
-        let accessGroups = Set(newItems.map { $0.accessGroup })
+        let derivedAccessGroups = Set(newItems.map { $0.accessGroup })
+        let accessGroups: Set<String> = derivedAccessGroups.isEmpty ? Set([targetGroup]) : derivedAccessGroups
         TagManager.shared.cleanupOrphanedTags(existingItemKeys: existingKeys, inAccessGroups: accessGroups)
         
         DispatchQueue.main.async {
