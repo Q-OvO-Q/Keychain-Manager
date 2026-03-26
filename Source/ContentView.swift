@@ -76,6 +76,7 @@ class TagManager: ObservableObject {
         let originalCount = tags.count
         
         tags = tags.filter { key, _ in
+            // uniqueKey 格式: classDisplay|||title|||account|||accessGroup
             let components = key.components(separatedBy: "|||")
             guard components.count >= 4 else { return true }
             let keyGroup = components[components.count - 1]
@@ -481,6 +482,16 @@ struct ContentView: View {
     }
     
     // MARK: - 查询逻辑 (核心优化)
+    
+    /// 若当前标签筛选已无匹配项，自动重置为"全部"
+    private func resetTagFilterIfNeeded(for itemList: [KeychainItem]) {
+        if !selectedTagFilter.isEmpty && selectedTagFilter != untaggedFilterKey {
+            if !itemList.contains(where: { $0.appTag == selectedTagFilter }) {
+                selectedTagFilter = ""
+            }
+        }
+    }
+    
     func fetchItems() {
         if targetGroup.isEmpty {
             statusMessage = "请输入目标 Group"
@@ -519,12 +530,7 @@ struct ContentView: View {
             self.statusMessage = "找到 \(newItems.count) 条数据"
             // 清除可能失效的选择 (刷新后 UUID 已变化)
             self.selectedItems.removeAll()
-            // 若当前标签筛选已无匹配项，重置为"全部"
-            if !self.selectedTagFilter.isEmpty && self.selectedTagFilter != untaggedFilterKey {
-                if !newItems.contains(where: { $0.appTag == self.selectedTagFilter }) {
-                    self.selectedTagFilter = ""
-                }
-            }
+            self.resetTagFilterIfNeeded(for: newItems)
         }
     }
     
@@ -598,12 +604,7 @@ struct ContentView: View {
         }
         let idsToDelete = Set(itemsToDelete.map { $0.id })
         items.removeAll { idsToDelete.contains($0.id) }
-        // 若当前标签筛选已无匹配项，重置为"全部"
-        if !selectedTagFilter.isEmpty && selectedTagFilter != untaggedFilterKey {
-            if !items.contains(where: { $0.appTag == selectedTagFilter }) {
-                selectedTagFilter = ""
-            }
-        }
+        resetTagFilterIfNeeded(for: items)
     }
     
     // MARK: - 批量操作方法
@@ -653,12 +654,7 @@ struct ContentView: View {
         items.removeAll { selectedItems.contains($0.id) }
         selectedItems.removeAll()
         isSelectionMode = false
-        // 若当前标签筛选已无匹配项，重置为"全部"
-        if !selectedTagFilter.isEmpty && selectedTagFilter != untaggedFilterKey {
-            if !items.contains(where: { $0.appTag == selectedTagFilter }) {
-                selectedTagFilter = ""
-            }
-        }
+        resetTagFilterIfNeeded(for: items)
     }
     
     // MARK: - 描述文件解析
