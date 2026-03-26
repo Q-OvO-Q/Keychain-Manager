@@ -69,6 +69,29 @@ class TagManager: ObservableObject {
         loadAllTags()
     }
     
+    /// 清理孤立标签：移除属于指定 Access Group 但不再有对应 Keychain 条目的标签
+    func cleanupOrphanedTags(existingItemKeys: Set<String>, inAccessGroups groups: Set<String>) {
+        guard !groups.isEmpty else { return }
+        var tags = userDefaults.dictionary(forKey: tagsKey) as? [String: String] ?? [:]
+        let originalCount = tags.count
+        
+        tags = tags.filter { key, _ in
+            let components = key.components(separatedBy: "|||")
+            guard components.count >= 4 else { return true }
+            let keyGroup = components[components.count - 1]
+            // 仅清理属于已加载 Access Group 的条目
+            if groups.contains(keyGroup) {
+                return existingItemKeys.contains(key)
+            }
+            return true
+        }
+        
+        if tags.count != originalCount {
+            userDefaults.set(tags, forKey: tagsKey)
+            loadAllTags()
+        }
+    }
+    
     private func loadAllTags() {
         if let tags = userDefaults.dictionary(forKey: tagsKey) as? [String: String] {
             allTags = Set(tags.values.filter { !$0.isEmpty })
@@ -486,11 +509,22 @@ struct ContentView: View {
             }
         }
         
+        // 清理孤立标签 (属于当前加载的 Access Group 但已无对应条目)
+        let existingKeys = Set(newItems.map { $0.uniqueKey })
+        let accessGroups = Set(newItems.map { $0.accessGroup })
+        TagManager.shared.cleanupOrphanedTags(existingItemKeys: existingKeys, inAccessGroups: accessGroups)
+        
         DispatchQueue.main.async {
             self.items = newItems
             self.statusMessage = "找到 \(newItems.count) 条数据"
             // 清除可能失效的选择 (刷新后 UUID 已变化)
             self.selectedItems.removeAll()
+            // 若当前标签筛选已无匹配项，重置为"全部"
+            if !self.selectedTagFilter.isEmpty && self.selectedTagFilter != untaggedFilterKey {
+                if !newItems.contains(where: { $0.appTag == self.selectedTagFilter }) {
+                    self.selectedTagFilter = ""
+                }
+            }
         }
     }
     
@@ -564,6 +598,12 @@ struct ContentView: View {
         }
         let idsToDelete = Set(itemsToDelete.map { $0.id })
         items.removeAll { idsToDelete.contains($0.id) }
+        // 若当前标签筛选已无匹配项，重置为"全部"
+        if !selectedTagFilter.isEmpty && selectedTagFilter != untaggedFilterKey {
+            if !items.contains(where: { $0.appTag == selectedTagFilter }) {
+                selectedTagFilter = ""
+            }
+        }
     }
     
     // MARK: - 批量操作方法
@@ -613,6 +653,12 @@ struct ContentView: View {
         items.removeAll { selectedItems.contains($0.id) }
         selectedItems.removeAll()
         isSelectionMode = false
+        // 若当前标签筛选已无匹配项，重置为"全部"
+        if !selectedTagFilter.isEmpty && selectedTagFilter != untaggedFilterKey {
+            if !items.contains(where: { $0.appTag == selectedTagFilter }) {
+                selectedTagFilter = ""
+            }
+        }
     }
     
     // MARK: - 描述文件解析
@@ -620,19 +666,9 @@ struct ContentView: View {
         // 将描述文件解析和钥匙串枚举移到后台队列，避免阻塞主线程渲染
         DispatchQueue.global(qos: .userInitiated).async {
             if let profile = ProvisioningProfileParser.parse() {
-                var groups: [String] = []
-                
-                // 添加通配符选项 (TeamID.*)
-                if let wildcard = profile.wildcardGroup {
-                    groups.append(wildcard)
-                }
-                
-                // 添加具体的 keychain access groups
-                for group in profile.keychainAccessGroups {
-                    if !groups.contains(group) {
-                        groups.append(group)
-                    }
-                }
+                // 使用 allAccessGroups 汇总所有可用的 Keychain Access Group
+                // 包含: 通配符、keychain-access-groups、application-identifier、application-groups
+                let groups = profile.allAccessGroups
                 
                 // 计算将要使用的 targetGroup
                 var selectedGroup = self.targetGroup
