@@ -333,7 +333,7 @@ struct ContentView: View {
     /// Tag 筛选区
     @ViewBuilder
     func tagFilterSection() -> some View {
-        if !items.isEmpty && !tagManager.allTags.isEmpty {
+        if !items.isEmpty && (!tagManager.allTags.isEmpty || tagCounts[untaggedFilterKey] != nil) {
             let counts = tagCounts
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
@@ -617,39 +617,54 @@ struct ContentView: View {
     
     // MARK: - 描述文件解析
     func loadProvisioningProfile() {
-        if let profile = ProvisioningProfileParser.parse() {
-            var groups: [String] = []
-            
-            // 添加通配符选项 (TeamID.*)
-            if let wildcard = profile.wildcardGroup {
-                groups.append(wildcard)
-            }
-            
-            // 添加具体的 keychain access groups
-            for group in profile.keychainAccessGroups {
-                if !groups.contains(group) {
-                    groups.append(group)
+        // 将描述文件解析和钥匙串枚举移到后台队列，避免阻塞主线程渲染
+        DispatchQueue.global(qos: .userInitiated).async {
+            if let profile = ProvisioningProfileParser.parse() {
+                var groups: [String] = []
+                
+                // 添加通配符选项 (TeamID.*)
+                if let wildcard = profile.wildcardGroup {
+                    groups.append(wildcard)
+                }
+                
+                // 添加具体的 keychain access groups
+                for group in profile.keychainAccessGroups {
+                    if !groups.contains(group) {
+                        groups.append(group)
+                    }
+                }
+                
+                // 计算将要使用的 targetGroup
+                var selectedGroup = self.targetGroup
+                if selectedGroup.isEmpty, let first = groups.first {
+                    selectedGroup = first
+                }
+                
+                // 在主线程更新 UI 状态
+                DispatchQueue.main.async {
+                    self.detectedGroups = groups
+                    if self.targetGroup.isEmpty, !selectedGroup.isEmpty {
+                        self.targetGroup = selectedGroup
+                    }
+                }
+                
+                // 在后台线程执行耗时的钥匙串查询
+                if !selectedGroup.isEmpty {
+                    self.fetchItems()
+                }
+                
+                // 根据查询结果更新状态提示
+                if self.items.isEmpty && !groups.isEmpty {
+                    DispatchQueue.main.async {
+                        self.statusMessage = "已从描述文件检测到 \(groups.count) 个 Access Group，点击选择后刷新"
+                    }
+                }
+            } else {
+                DispatchQueue.main.async {
+                    self.showManualInput = true
+                    self.statusMessage = "未检测到描述文件，请手动输入 Access Group"
                 }
             }
-            
-            detectedGroups = groups
-            
-            // 如果用户没有设置过 group，自动选择第一个
-            if targetGroup.isEmpty, let first = groups.first {
-                targetGroup = first
-            }
-            
-            // 自动刷新
-            if !targetGroup.isEmpty {
-                fetchItems()
-            }
-            
-            if items.isEmpty && !groups.isEmpty {
-                statusMessage = "已从描述文件检测到 \(groups.count) 个 Access Group，点击选择后刷新"
-            }
-        } else {
-            showManualInput = true
-            statusMessage = "未检测到描述文件，请手动输入 Access Group"
         }
     }
 }

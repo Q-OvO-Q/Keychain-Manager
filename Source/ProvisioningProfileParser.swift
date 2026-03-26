@@ -51,8 +51,14 @@ enum ProvisioningProfileParser {
         // 其中包含一段 XML plist，通过标记定位并提取
         guard let startMarker = "<?xml".data(using: .utf8),
               let endMarker = "</plist>".data(using: .utf8),
-              let startRange = data.range(of: startMarker),
-              let endRange = data.range(of: endMarker) else {
+              let startRange = data.range(of: startMarker) else {
+            return nil
+        }
+        
+        // 仅在 XML 起始标记之后搜索结束标记，避免生成无效范围
+        guard let endRange = data.range(of: endMarker,
+                                        options: [],
+                                        in: startRange.lowerBound..<data.endIndex) else {
             return nil
         }
         
