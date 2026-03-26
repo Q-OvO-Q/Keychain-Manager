@@ -9,7 +9,8 @@ struct ProvisioningProfile {
     
     /// 通过 TeamID 前缀生成通配符 Group (例如 "TEAMID.*")
     var wildcardGroup: String? {
-        let prefix = appIdentifierPrefix.first ?? teamIdentifier
+        // 查找第一个非空前缀
+        let prefix = appIdentifierPrefix.first(where: { !$0.isEmpty }) ?? teamIdentifier
         guard !prefix.isEmpty else { return nil }
         return "\(prefix).*"
     }

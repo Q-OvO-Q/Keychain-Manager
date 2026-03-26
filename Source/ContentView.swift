@@ -79,6 +79,8 @@ class TagManager: ObservableObject {
 }
 
 // MARK: - 主视图
+private let untaggedFilterKey = "__untagged__"
+
 struct ContentView: View {
     @AppStorage("targetAccessGroup") private var targetGroup: String = ""
     @State private var items: [KeychainItem] = []
@@ -242,7 +244,7 @@ struct ContentView: View {
     var filteredItems: [KeychainItem] {
         if selectedTagFilter.isEmpty {
             return items
-        } else if selectedTagFilter == "__untagged__" {
+        } else if selectedTagFilter == untaggedFilterKey {
             return items.filter { $0.appTag.isEmpty }
         } else {
             return items.filter { $0.appTag == selectedTagFilter }
@@ -255,7 +257,7 @@ struct ContentView: View {
         for item in items {
             let tag = item.appTag
             if tag.isEmpty {
-                counts["__untagged__"] = (counts["__untagged__"] ?? 0) + 1
+                counts[untaggedFilterKey] = (counts[untaggedFilterKey] ?? 0) + 1
             } else {
                 counts[tag] = (counts[tag] ?? 0) + 1
             }
@@ -360,13 +362,13 @@ struct ContentView: View {
                     }
                     
                     // 未标记
-                    if let untaggedCount = counts["__untagged__"], untaggedCount > 0 {
+                    if let untaggedCount = counts[untaggedFilterKey], untaggedCount > 0 {
                         filterChip(
                             label: "未标记",
                             count: untaggedCount,
-                            isSelected: selectedTagFilter == "__untagged__"
+                            isSelected: selectedTagFilter == untaggedFilterKey
                         ) {
-                            selectedTagFilter = "__untagged__"
+                            selectedTagFilter = untaggedFilterKey
                             selectedItems.removeAll()
                         }
                     }
