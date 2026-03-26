@@ -6,6 +6,7 @@ struct ProvisioningProfile {
     let applicationIdentifier: String
     let teamIdentifier: String
     let appIdentifierPrefix: [String]
+    let applicationGroups: [String]
     
     /// 通过 TeamID 前缀生成通配符 Group (例如 "TEAMID.*")
     var wildcardGroup: String? {
@@ -13,6 +14,31 @@ struct ProvisioningProfile {
         let prefix = appIdentifierPrefix.first(where: { !$0.isEmpty }) ?? teamIdentifier
         guard !prefix.isEmpty else { return nil }
         return "\(prefix).*"
+    }
+    
+    /// 汇总所有可用的 Keychain Access Group
+    /// 包含: 通配符、keychain-access-groups、application-identifier
+    var allAccessGroups: [String] {
+        var groups: [String] = []
+        
+        // 1. 通配符 (TeamID.*)
+        if let wildcard = wildcardGroup {
+            groups.append(wildcard)
+        }
+        
+        // 2. 显式的 keychain-access-groups
+        for group in keychainAccessGroups {
+            if !groups.contains(group) {
+                groups.append(group)
+            }
+        }
+        
+        // 3. application-identifier 本身也是隐式的 Keychain Access Group
+        if !applicationIdentifier.isEmpty && !groups.contains(applicationIdentifier) {
+            groups.append(applicationIdentifier)
+        }
+        
+        return groups
     }
 }
 
@@ -36,12 +62,14 @@ enum ProvisioningProfileParser {
         let appId = entitlements["application-identifier"] as? String ?? ""
         let teamId = (plistDict["TeamIdentifier"] as? [String])?.first ?? ""
         let appIdPrefix = plistDict["ApplicationIdentifierPrefix"] as? [String] ?? []
+        let appGroups = entitlements["com.apple.security.application-groups"] as? [String] ?? []
         
         return ProvisioningProfile(
             keychainAccessGroups: keychainGroups,
             applicationIdentifier: appId,
             teamIdentifier: teamId,
-            appIdentifierPrefix: appIdPrefix
+            appIdentifierPrefix: appIdPrefix,
+            applicationGroups: appGroups
         )
     }
     
