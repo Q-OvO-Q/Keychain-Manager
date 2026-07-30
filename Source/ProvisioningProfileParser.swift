@@ -1,99 +1,128 @@
 import Foundation
 
 // MARK: - 描述文件数据模型
+
 struct ProvisioningProfile {
+    let name: String
     let keychainAccessGroups: [String]
     let applicationIdentifier: String
     let teamIdentifier: String
     let appIdentifierPrefix: [String]
     let applicationGroups: [String]
-    
-    /// 通过 TeamID 前缀生成通配符 Group (例如 "TEAMID.*")
+    let expirationDate: Date?
+
+    /// 用于替换 entitlements 里的 `$(AppIdentifierPrefix)` 占位符
+    var identifierPrefix: String {
+        appIdentifierPrefix.first(where: { !$0.isEmpty }) ?? teamIdentifier
+    }
+
+    /// 通配符 Group（TEAMID.*）。只有描述文件本身授予了通配符权限时查询才会成功
     var wildcardGroup: String? {
-        // 查找第一个非空前缀
-        let prefix = appIdentifierPrefix.first(where: { !$0.isEmpty }) ?? teamIdentifier
+        let prefix = identifierPrefix
         guard !prefix.isEmpty else { return nil }
         return "\(prefix).*"
     }
-    
-    /// 汇总所有可用的 Keychain Access Group
-    /// 包含: 通配符、keychain-access-groups、application-identifier
+
+    /// 汇总所有可用作 kSecAttrAccessGroup 的取值。
+    ///
+    /// 包含通配符、显式声明的 keychain-access-groups、application-identifier
+    /// （它本身就是应用的默认 keychain 组），以及 App Group —— 在 iOS 上
+    /// App Group 标识符同样可以当作 keychain access group 使用。
     var allAccessGroups: [String] {
         var groups: [String] = []
-        
-        // 1. 通配符 (TeamID.*)
-        if let wildcard = wildcardGroup {
-            groups.append(wildcard)
+
+        func append(_ group: String) {
+            let resolved = resolvePlaceholders(in: group)
+            guard !resolved.isEmpty, !groups.contains(resolved) else { return }
+            groups.append(resolved)
         }
-        
-        // 2. 显式的 keychain-access-groups
-        for group in keychainAccessGroups {
-            if !groups.contains(group) {
-                groups.append(group)
-            }
-        }
-        
-        // 3. application-identifier 本身也是隐式的 Keychain Access Group
-        if !applicationIdentifier.isEmpty && !groups.contains(applicationIdentifier) {
-            groups.append(applicationIdentifier)
-        }
-        
+
+        if let wildcard = wildcardGroup { append(wildcard) }
+        keychainAccessGroups.forEach(append)
+        append(applicationIdentifier)
+        applicationGroups.forEach(append)
+
         return groups
+    }
+
+    var summary: String {
+        var parts: [String] = []
+        if !name.isEmpty { parts.append(name) }
+        if !identifierPrefix.isEmpty { parts.append("Team \(identifierPrefix)") }
+        if let expirationDate {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd"
+            let expired = expirationDate < Date() ? "已过期 " : "有效至 "
+            parts.append(expired + formatter.string(from: expirationDate))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// entitlements 中可能残留 `$(AppIdentifierPrefix)` 之类的占位符
+    private func resolvePlaceholders(in group: String) -> String {
+        let prefix = identifierPrefix
+        guard !prefix.isEmpty else { return group }
+        return group
+            .replacingOccurrences(of: "$(AppIdentifierPrefix)", with: prefix + ".")
+            .replacingOccurrences(of: "$(TeamIdentifierPrefix)", with: prefix + ".")
+            // 占位符本身通常已带尾点，替换后可能出现连续两个点
+            .replacingOccurrences(of: "..", with: ".")
     }
 }
 
 // MARK: - 描述文件解析器
+
 enum ProvisioningProfileParser {
-    
-    /// 解析应用内嵌的 embedded.mobileprovision 文件
-    /// 提取 keychain-access-groups 等关键信息
+
+    /// 解析应用内嵌的 embedded.mobileprovision
     static func parse() -> ProvisioningProfile? {
-        guard let profilePath = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision"),
-              let profileData = try? Data(contentsOf: URL(fileURLWithPath: profilePath)) else {
+        guard let data = loadProfileData(), let plist = extractPlist(from: data) else {
             return nil
         }
-        
-        guard let plistDict = extractPlist(from: profileData) else {
-            return nil
-        }
-        
-        let entitlements = plistDict["Entitlements"] as? [String: Any] ?? [:]
-        let keychainGroups = entitlements["keychain-access-groups"] as? [String] ?? []
-        let appId = entitlements["application-identifier"] as? String ?? ""
-        let teamId = (plistDict["TeamIdentifier"] as? [String])?.first ?? ""
-        let appIdPrefix = plistDict["ApplicationIdentifierPrefix"] as? [String] ?? []
-        let appGroups = entitlements["com.apple.security.application-groups"] as? [String] ?? []
-        
+
+        let entitlements = plist["Entitlements"] as? [String: Any] ?? [:]
+
         return ProvisioningProfile(
-            keychainAccessGroups: keychainGroups,
-            applicationIdentifier: appId,
-            teamIdentifier: teamId,
-            appIdentifierPrefix: appIdPrefix,
-            applicationGroups: appGroups
+            name: plist["Name"] as? String ?? "",
+            keychainAccessGroups: entitlements["keychain-access-groups"] as? [String] ?? [],
+            applicationIdentifier: entitlements["application-identifier"] as? String ?? "",
+            teamIdentifier: (plist["TeamIdentifier"] as? [String])?.first ?? "",
+            appIdentifierPrefix: plist["ApplicationIdentifierPrefix"] as? [String] ?? [],
+            applicationGroups: entitlements["com.apple.security.application-groups"] as? [String] ?? [],
+            expirationDate: plist["ExpirationDate"] as? Date
         )
     }
-    
-    /// 从 CMS/PKCS#7 签名数据中提取 XML plist
+
+    /// 描述文件通常在 .app 根目录，越狱/重签环境下也可能落在其它位置
+    private static func loadProfileData() -> Data? {
+        if let path = Bundle.main.path(forResource: "embedded", ofType: "mobileprovision"),
+           let data = try? Data(contentsOf: URL(fileURLWithPath: path)) {
+            return data
+        }
+
+        let fallback = Bundle.main.bundleURL.appendingPathComponent("embedded.mobileprovision")
+        return try? Data(contentsOf: fallback)
+    }
+
+    /// 从 CMS/PKCS#7 签名容器里截出内嵌的 XML plist
     private static func extractPlist(from data: Data) -> [String: Any]? {
-        // mobileprovision 文件是 CMS SignedData 结构
-        // 其中包含一段 XML plist，通过标记定位并提取
         guard let startMarker = "<?xml".data(using: .utf8),
               let endMarker = "</plist>".data(using: .utf8),
               let startRange = data.range(of: startMarker) else {
             return nil
         }
-        
-        // 仅在 XML 起始标记之后搜索结束标记，避免生成无效范围
+
+        // 只在起始标记之后搜索结束标记，避免构造出无效区间
         guard let endRange = data.range(of: endMarker,
-                                        options: [],
-                                        in: startRange.lowerBound..<data.endIndex) else {
+                                       options: [],
+                                       in: startRange.lowerBound..<data.endIndex) else {
             return nil
         }
-        
-        let plistData = data[startRange.lowerBound..<endRange.upperBound]
-        
+
+        let plistData = Data(data[startRange.lowerBound..<endRange.upperBound])
+
         return try? PropertyListSerialization.propertyList(
-            from: Data(plistData),
+            from: plistData,
             format: nil
         ) as? [String: Any]
     }
