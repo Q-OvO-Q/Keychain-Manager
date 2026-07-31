@@ -19,3 +19,6 @@ targets:
       path: Source/Info.plist
       properties:
         UILaunchScreen: {}
+        # 详情页「解锁读取」会对受 SecAccessControl 保护的条目触发生物识别。
+        # 缺少此键时系统会直接终止进程，而不是返回错误。
+        NSFaceIDUsageDescription: 使用 Face ID 读取受保护的 Keychain 条目内容

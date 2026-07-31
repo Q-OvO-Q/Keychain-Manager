@@ -127,13 +127,19 @@ enum KeychainStore {
         KeychainItemClass.allCases.firstIndex(of: itemClass) ?? 0
     }
 
-    /// 单条读取数据；返回的 status 用于向用户解释「为什么这条读不出来」
-    static func copyData(for item: KeychainItem) -> (data: Data?, status: OSStatus) {
+    /// 单条读取数据；返回的 status 用于向用户解释「为什么这条读不出来」。
+    ///
+    /// `allowAuthenticationUI` 只能由用户主动触发的操作打开，枚举列表时必须保持关闭，
+    /// 原因见 `applyAuthenticationPolicy`。
+    static func copyData(for item: KeychainItem,
+                        allowAuthenticationUI: Bool = false) -> (data: Data?, status: OSStatus) {
         if let ref = item.persistentRef {
-            let query: [String: Any] = [
+            var query: [String: Any] = [
                 kSecValuePersistentRef as String: ref,
                 kSecReturnData as String: true
             ]
+            applyAuthenticationPolicy(to: &query, allowUI: allowAuthenticationUI)
+
             var output: AnyObject?
             let status = SecItemCopyMatching(query as CFDictionary, &output)
             if status == errSecSuccess {
@@ -148,6 +154,7 @@ enum KeychainStore {
         var query = item.primaryKeyQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        applyAuthenticationPolicy(to: &query, allowUI: allowAuthenticationUI)
 
         var output: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &output)
@@ -155,6 +162,17 @@ enum KeychainStore {
             return (output as? Data ?? Data(), errSecSuccess)
         }
         return (nil, status)
+    }
+
+    /// 单条 `kSecMatchLimitOne` + `kSecReturnData` 查询碰上受 `SecAccessControl` 保护的条目时，
+    /// 系统会弹出 Face ID / Touch ID 验证。这在枚举场景下有两个后果：
+    /// 刷新一次列表就要连续验证 N 次；且 Info.plist 缺少 `NSFaceIDUsageDescription` 时，
+    /// 系统会直接终止进程（启动即闪退）。
+    /// 因此枚举一律 Skip —— 受保护条目如实报 errSecInteractionNotAllowed，列表标注「受保护」，
+    /// 由用户在详情页主动解锁。
+    private static func applyAuthenticationPolicy(to query: inout [String: Any], allowUI: Bool) {
+        guard !allowUI else { return }
+        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
     }
 
     // MARK: - 删除
