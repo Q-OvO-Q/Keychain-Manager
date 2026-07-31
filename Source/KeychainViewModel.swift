@@ -175,8 +175,13 @@ final class KeychainViewModel: ObservableObject {
         isLoading = true
         statusMessage = "正在查询…"
 
+        // 广查询整类失败时用来逐组重试的候选列表
+        let knownGroups = detectedGroups
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let result = KeychainStore.fetchItems(scope: scope, classes: classes) { text in
+            let result = KeychainStore.fetchItems(scope: scope,
+                                                  classes: classes,
+                                                  fallbackGroups: knownGroups) { text in
                 DispatchQueue.main.async { self?.statusMessage = text }
             }
             DispatchQueue.main.async {
@@ -192,6 +197,8 @@ final class KeychainViewModel: ObservableObject {
 
         // 先给新增条目补上标签，再判断哪些标签成了孤儿
         applyPendingTagIfNeeded()
+
+        mergeDiscoveredGroups(from: result.items)
 
         // 只有全部类别都枚举成功，才敢按结果清理标签
         if result.classErrors.isEmpty {
@@ -213,6 +220,22 @@ final class KeychainViewModel: ObservableObject {
         statusMessage = parts.joined(separator: " · ")
 
         resetTagFilterIfNeeded()
+    }
+
+    /// 把查询结果里出现过的真实 Access Group 并入可选列表。
+    ///
+    /// 描述文件只包含签名申请时的 keychain-access-groups；重签名工具在签名阶段注入的组
+    /// （例如 LiveContainer 的 128 个 `...livecontainer.shared.N`）不会出现在描述文件里，
+    /// 因此只靠解析描述文件永远列不全，用户只能手动逐个输入。
+    private func mergeDiscoveredGroups(from items: [KeychainItem]) {
+        let discovered = Set(items.map(\.accessGroup)).filter { !$0.isEmpty }
+        let missing = discovered.subtracting(detectedGroups)
+        guard !missing.isEmpty else { return }
+
+        // 保留描述文件给出的原有顺序（通配符在前），新发现的追加在后。
+        // localizedStandardCompare 让 shared.2 排在 shared.10 前面而不是字典序
+        let appended = missing.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        detectedGroups += appended
     }
 
     // MARK: - 删除
