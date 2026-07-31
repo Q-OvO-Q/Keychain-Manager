@@ -123,6 +123,9 @@ struct ItemDetailView: View {
                     }
                     .padding(.vertical, 2)
                 }
+                // ScrollView 在 Form 行里同样会画不透明底色盖住分隔线
+                .scrollContentBackground(.hidden)
+                .listRowSeparator(.visible)
             }
         }
     }
@@ -159,6 +162,7 @@ struct ItemDetailView: View {
                 Text("十六进制").tag(true)
             }
             .pickerStyle(.segmented)
+            .listRowSeparator(.visible)
 
             if let conversionWarning {
                 Text(conversionWarning)
@@ -179,6 +183,7 @@ struct ItemDetailView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .fill(Color.secondary.opacity(0.08))
                 )
+                .listRowSeparator(.visible)
 
             HStack {
                 Text(byteCountDescription)
@@ -193,6 +198,7 @@ struct ItemDetailView: View {
                 }
                 .buttonStyle(.plain)
             }
+            .listRowSeparator(.visible)
 
             if let saveNotice {
                 Text(saveNotice)
