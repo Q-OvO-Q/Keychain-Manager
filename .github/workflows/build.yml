@@ -13,7 +13,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v7
 
     - name: Install XcodeGen
       run: brew install xcodegen
@@ -42,7 +42,7 @@ jobs:
         zip -r KeychainManager_Unsigned.ipa Payload
 
     - name: Upload IPA
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: KeychainManager_Unsigned_IPA
         path: KeychainManager_Unsigned.ipa
