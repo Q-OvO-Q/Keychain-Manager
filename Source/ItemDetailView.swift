@@ -85,7 +85,7 @@ struct ItemDetailView: View {
             Text("核心标识（构成主键，不可修改）")
         } footer: {
             if !item.canBeTargeted {
-                Text("系统未回传该条目的持久引用与主键属性，为避免误删同组其它条目，已禁用删除与修改。")
+                Text("系统没回传能唯一定位这条的属性。删除它会波及同组其它条目，因此已禁用。")
                     .foregroundStyle(.orange)
             }
         }
@@ -225,18 +225,24 @@ struct ItemDetailView: View {
                     // 否则整行点击都会触发其中一个
                     .buttonStyle(.borderless)
                     .disabled(!item.itemClass.supportsDataEditing || !item.canBeTargeted)
-            }
 
-            if let saveNotice {
-                Text(saveNotice)
-                    .font(.caption)
-                    .foregroundStyle(.green)
+                // 保存提示也收进同一行：单独成行的话，它和按钮之间那条
+                // 系统分割线又会被盖住（和标签区当初一模一样的问题）
+                if let saveNotice {
+                    Divider()
+
+                    Text(saveNotice)
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                }
             }
         } header: {
             Text("数据 (kSecValueData)")
         } footer: {
             if !item.itemClass.supportsDataEditing {
-                Text("\(item.itemClass.displayName)条目的数据由系统管理，仅支持查看与删除。")
+                Text("\(item.itemClass.displayName)的数据不可改，只能查看或删除整条。")
             }
         }
     }
@@ -302,15 +308,16 @@ struct ItemDetailView: View {
                         .font(.callout)
 
                     case .fourCharCode:
-                        attributeRow(attribute, placeholder: "未设置（如 aapl 或十进制）") {
-                            TextField("", text: fourCharCodeBinding(attribute))
+                        attributeRow(attribute) {
+                            // 之前这里传的是空占位符，值为空时整行看不出是「未设置」还是坏了
+                            TextField("未设置", text: fourCharCodeBinding(attribute))
                                 .font(.system(.callout, design: .monospaced))
                                 .textInputAutocapitalization(.never)
                                 .autocorrectionDisabled()
                         }
 
                     case .text:
-                        attributeRow(attribute, placeholder: "未设置") {
+                        attributeRow(attribute) {
                             TextField("未设置", text: textBinding(attribute))
                                 .font(.callout)
                                 .textInputAutocapitalization(.never)
@@ -323,19 +330,18 @@ struct ItemDetailView: View {
             } header: {
                 Text("可修改的元数据")
             } footer: {
-                Text("主键属性不可改：改动等于把条目挪到另一个主键上，会和已有条目冲突。网络密码多出的 srvr / ptcl / atyp / port / path / sdmn 恰好全是它的主键，所以两类密码可改的是同一批字段。")
+                Text("这里列出了该类别所有能改的属性。未列出的要么构成主键，要么由系统从数据中解析。")
             }
         }
     }
 
     private func attributeRow<Field: View>(_ attribute: KeychainStore.EditableAttribute,
-                                          placeholder: String,
                                           @ViewBuilder field: () -> Field) -> some View {
         HStack {
             Text(attribute.displayName)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 96, alignment: .leading)
+                .frame(width: 116, alignment: .leading)
             field()
         }
     }
@@ -431,7 +437,7 @@ struct ItemDetailView: View {
         } header: {
             Text("已设置的元数据（\(item.rawAttributes.count)）")
         } footer: {
-            Text("这里是系统实际回传的全部属性，一个不漏。")
+            Text("系统实际回传的全部属性。")
         }
 
         let unset = unsetAttributes(item)
@@ -451,7 +457,7 @@ struct ItemDetailView: View {
             } header: {
                 Text("未设置的元数据（\(unset.count)）")
             } footer: {
-                Text("SecItemCopyMatching 只回传有值的键，这些属性在本条目上为空，因此不出现在上面那一节。「可修改的元数据」是固定列出的，所以其中几项会在这里而不在上面。")
+                Text("这些属性在本条目上没有值。系统只回传有值的键，所以它们不在上一节里。")
             }
         }
     }

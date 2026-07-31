@@ -32,10 +32,30 @@ struct AddItemView: View {
     @State private var keyClass = ""
     @State private var keyType = ""
     @State private var applicationTag = ""
+    @State private var applicationLabel = ""
+    @State private var keySizeInBits = ""
+    @State private var effectiveKeySize = ""
+    @State private var isPermanent = false
+    @State private var canEncrypt = false
+    @State private var canDecrypt = false
+    @State private var canDerive = false
+    @State private var canSign = false
+    @State private var canVerify = false
+    @State private var canWrap = false
+    @State private var canUnwrap = false
 
     /// 通配符 Group 只是权限声明，不能作为写入目标
     private var writableGroups: [String] {
         viewModel.detectedGroups.filter { !KeychainStore.isWildcardGroup($0) }
+    }
+
+    /// 输入框内容直接当筛选词；已精确命中某个组时不再收窄，
+    /// 否则点一下列表就只剩这一项
+    private var matchingGroups: [String] {
+        let keyword = accessGroup.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !keyword.isEmpty else { return writableGroups }
+        if writableGroups.contains(where: { $0.lowercased() == keyword }) { return writableGroups }
+        return writableGroups.filter { $0.lowercased().contains(keyword) }
     }
 
     private var parsedData: Data? {
@@ -79,7 +99,7 @@ struct AddItemView: View {
                 } header: {
                     Text("保护级别")
                 } footer: {
-                    Text("可访问性决定条目在设备锁定时是否可读。同步属性是主键的一部分，两者写入后都不可再改。")
+                    Text("两项写入后都不可再改。")
                 }
 
                 accessGroupSection
@@ -94,11 +114,11 @@ struct AddItemView: View {
                             .textInputAutocapitalization(.never)
                         TextField("备注 (icmt)", text: $comment)
                             .textInputAutocapitalization(.never)
-                        TextField("创建者 (crtr)，如 aapl 或十进制", text: $creator)
+                        TextField("创建者 (crtr) — aapl 或十进制", text: $creator)
                             .font(.system(.body, design: .monospaced))
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
-                        TextField("类型码 (type)，如 aapl 或十进制", text: $typeCode)
+                        TextField("类型码 (type) — aapl 或十进制", text: $typeCode)
                             .font(.system(.body, design: .monospaced))
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
@@ -109,9 +129,9 @@ struct AddItemView: View {
                     Text("元数据（可选）")
                 } footer: {
                     if itemClass.supportsDataEditing {
-                        Text("与详情页「可修改的元数据」一致，写入后仍可修改。crtr / type 解析不出四字符码或十进制时会被忽略。")
+                        Text("这些写入后都还能改。crtr / type 填不出四字符码或十进制时会被忽略。")
                     } else {
-                        Text("\(itemClass.displayName)条目只有 labl 一项描述性字段可设，其余属性由系统从数据本身派生。")
+                        Text("\(itemClass.displayName)只有 labl 可设，其余属性由系统从数据中解析。")
                     }
                 }
 
@@ -168,7 +188,7 @@ struct AddItemView: View {
             } header: {
                 Text("主键字段")
             } footer: {
-                Text("网络密码的主键包含这 7 项，写入后都不可再改。")
+                Text("这 7 项构成主键，写入后不可再改。")
             }
 
         case .key:
@@ -183,19 +203,31 @@ struct AddItemView: View {
                         Text(option.title).tag(option.value)
                     }
                 }
-                labeledField("Application Tag (atag)", "自定义标识，可留空", $applicationTag)
+                labeledField("Key Size (bsiz)", "位数，如 2048", $keySizeInBits)
+                    .keyboardType(.numberPad)
+                labeledField("Effective Size (esiz)", "位数，可留空", $effectiveKeySize)
+                    .keyboardType(.numberPad)
+                labeledField("Application Label (klbl)", "可留空", $applicationLabel)
+                labeledField("Application Tag (atag)", "可留空", $applicationTag)
             } header: {
-                Text("密钥属性")
+                Text("主键字段")
             } footer: {
-                Text("下方数据须是与所选类别 / 算法匹配的原始密钥字节，格式不符时系统会拒绝写入并报错。")
+                Text("密钥的主键由这 6 项构成，写入后都不可再改。导入原始密钥时系统推断不出位数，bsiz 留空通常会直接返回 -50。")
+            }
+
+            Section("用途标志") {
+                Toggle("永久存储 (perm)", isOn: $isPermanent)
+                Toggle("可加密 (encr)", isOn: $canEncrypt)
+                Toggle("可解密 (decr)", isOn: $canDecrypt)
+                Toggle("可派生 (drve)", isOn: $canDerive)
+                Toggle("可签名 (sign)", isOn: $canSign)
+                Toggle("可验签 (vrfy)", isOn: $canVerify)
+                Toggle("可包装密钥 (wrap)", isOn: $canWrap)
+                Toggle("可解包密钥 (unwp)", isOn: $canUnwrap)
             }
 
         case .certificate:
-            Section {
-                EmptyView()
-            } footer: {
-                Text("证书由下方数据决定：请填入 DER 编码的证书（建议用十六进制输入）。主体、签发者、序列号都由系统从证书本身解析，无需也无法手填。")
-            }
+            EmptyView()
         }
     }
 
@@ -210,6 +242,14 @@ struct AddItemView: View {
             TextField(placeholder, text: text)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+        }
+    }
+
+    private var dataSectionTitle: String {
+        switch itemClass {
+        case .certificate: return "证书数据 (DER)"
+        case .key:         return "密钥数据"
+        default:           return "数据 (kSecValueData)"
         }
     }
 
@@ -235,13 +275,17 @@ struct AddItemView: View {
                         .fill(Color.secondary.opacity(0.08))
                 )
         } header: {
-            Text("Data（内容）")
+            Text(dataSectionTitle)
         } footer: {
-            if let data = parsedData {
-                Text("\(data.count) 字节")
-            } else {
-                Text("十六进制内容不合法：长度需为偶数且只含 0-9 / a-f。")
+            if parsedData == nil {
+                Text("十六进制不合法：长度需为偶数，且只含 0-9 / a-f。")
                     .foregroundStyle(.orange)
+            } else if itemClass == .certificate {
+                Text("须是 DER 编码的证书，请用十六进制输入。主体、签发者、序列号由系统从证书中解析。")
+            } else if itemClass == .key {
+                Text("须是与上方类别 / 算法匹配的原始密钥字节。")
+            } else {
+                Text("\(parsedData?.count ?? 0) 字节")
             }
         }
     }
@@ -249,11 +293,12 @@ struct AddItemView: View {
     @ViewBuilder
     private var accessGroupSection: some View {
         Section {
-            TextField("留空则写入应用默认组", text: $accessGroup)
+            // 与查询设置页一致：一个输入框兼作手动输入与列表筛选
+            TextField("输入组名，或用于筛选下方列表", text: $accessGroup)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
 
-            ForEach(writableGroups, id: \.self) { group in
+            ForEach(matchingGroups, id: \.self) { group in
                 Button {
                     accessGroup = group
                 } label: {
@@ -261,6 +306,9 @@ struct AddItemView: View {
                         Text(group)
                             .font(.callout)
                             .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            // 组名的区别在尾部编号上，掐中间才看得见
+                            .truncationMode(.middle)
                         Spacer()
                         if accessGroup == group {
                             Image(systemName: "checkmark")
@@ -270,13 +318,15 @@ struct AddItemView: View {
                 }
             }
         } header: {
-            Text("Access Group")
+            Text("Access Group（\(matchingGroups.count)/\(writableGroups.count)）")
         } footer: {
             if KeychainStore.isWildcardGroup(accessGroup) {
-                Text("通配符 Group 只是权限声明，不能作为写入目标；保存时会忽略该值并写入应用默认组。")
+                Text("通配符组不能写入，保存时会忽略它、改用应用默认组。")
                     .foregroundStyle(.orange)
+            } else if accessGroup.isEmpty {
+                Text("留空则写入应用默认组。")
             } else {
-                Text("必须是本应用 entitlements 中已声明的组，否则会返回 -34018。")
+                Text("须是签名 entitlements 里声明过的组，否则保存时返回 -34018。")
             }
         }
     }
@@ -354,6 +404,17 @@ struct AddItemView: View {
         newItem.keyClass = keyClass
         newItem.keyType = keyType
         newItem.applicationTag = applicationTag
+        newItem.applicationLabel = applicationLabel
+        newItem.keySizeInBits = keySizeInBits
+        newItem.effectiveKeySize = effectiveKeySize
+        newItem.isPermanent = isPermanent
+        newItem.canEncrypt = canEncrypt
+        newItem.canDecrypt = canDecrypt
+        newItem.canDerive = canDerive
+        newItem.canSign = canSign
+        newItem.canVerify = canVerify
+        newItem.canWrap = canWrap
+        newItem.canUnwrap = canUnwrap
         newItem.isInvisible = isInvisible
         newItem.isNegative = isNegative
 

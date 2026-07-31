@@ -446,6 +446,15 @@ enum KeychainStore {
         case accessible
         case invisible
         case negative
+        // 密钥专有：这些都是普通列，不构成主键，SecItemUpdate 接受
+        case isPermanent
+        case canEncrypt
+        case canDecrypt
+        case canDerive
+        case canSign
+        case canVerify
+        case canWrap
+        case canUnwrap
 
         var id: String { rawValue }
 
@@ -459,6 +468,14 @@ enum KeychainStore {
             case .accessible:  return kSecAttrAccessible as String
             case .invisible:   return kSecAttrIsInvisible as String
             case .negative:    return kSecAttrIsNegative as String
+            case .isPermanent: return kSecAttrIsPermanent as String
+            case .canEncrypt:  return kSecAttrCanEncrypt as String
+            case .canDecrypt:  return kSecAttrCanDecrypt as String
+            case .canDerive:   return kSecAttrCanDerive as String
+            case .canSign:     return kSecAttrCanSign as String
+            case .canVerify:   return kSecAttrCanVerify as String
+            case .canWrap:     return kSecAttrCanWrap as String
+            case .canUnwrap:   return kSecAttrCanUnwrap as String
             }
         }
 
@@ -472,6 +489,14 @@ enum KeychainStore {
             case .accessible:  return "可访问性 (pdmn)"
             case .invisible:   return "隐藏 (invi)"
             case .negative:    return "占位条目 (nega)"
+            case .isPermanent: return "永久存储 (perm)"
+            case .canEncrypt:  return "可加密 (encr)"
+            case .canDecrypt:  return "可解密 (decr)"
+            case .canDerive:   return "可派生 (drve)"
+            case .canSign:     return "可签名 (sign)"
+            case .canVerify:   return "可验签 (vrfy)"
+            case .canWrap:     return "可包装密钥 (wrap)"
+            case .canUnwrap:   return "可解包密钥 (unwp)"
             }
         }
 
@@ -485,21 +510,35 @@ enum KeychainStore {
 
         var kind: Kind {
             switch self {
-            case .invisible, .negative:  return .boolean
-            case .accessible:            return .accessibility
-            case .creator, .type:        return .fourCharCode
-            default:                     return .text
+            case .invisible, .negative, .isPermanent,
+                 .canEncrypt, .canDecrypt, .canDerive,
+                 .canSign, .canVerify, .canWrap, .canUnwrap:
+                return .boolean
+            case .accessible:
+                return .accessibility
+            case .creator, .type:
+                return .fourCharCode
+            case .label, .comment, .description:
+                return .text
             }
         }
 
+        /// 每个类别里**所有**非主键、非派生的属性。
+        ///
+        /// 排除的只有两类：构成主键的（改了等于挪走条目），
+        /// 以及系统从密钥 / 证书数据算出来的（subj / issr / slnr / skid / pkhh /
+        /// ctyp / cenc），手改只会和实际内容对不上。
         static func available(for itemClass: KeychainItemClass) -> [EditableAttribute] {
             switch itemClass {
             case .genericPassword, .internetPassword:
-                return allCases
-            case .key, .certificate:
-                // 这两类的其余字段要么是主键，要么由系统从密钥 / 证书本身派生
-                // （subj / issr / slnr / skid / pkhh），改了只会和实际内容对不上。
-                // 但 labl 和 pdmn 是普通属性，没有理由锁死。
+                return [.label, .description, .comment, .creator, .type,
+                        .accessible, .invisible, .negative]
+            case .key:
+                return [.label, .accessible, .isPermanent,
+                        .canEncrypt, .canDecrypt, .canDerive,
+                        .canSign, .canVerify, .canWrap, .canUnwrap]
+            case .certificate:
+                // 证书除了 labl 和 pdmn，其余列全部由证书本身决定
                 return [.label, .accessible]
             }
         }
@@ -672,6 +711,18 @@ enum KeychainStore {
         var keyClass: String = ""
         var keyType: String = ""
         var applicationTag: String = ""
+        /// klbl：非对称密钥通常由系统按公钥哈希填，导入原始密钥时可自定
+        var applicationLabel: String = ""
+        var keySizeInBits: String = ""
+        var effectiveKeySize: String = ""
+        var isPermanent = false
+        var canEncrypt = false
+        var canDecrypt = false
+        var canDerive = false
+        var canSign = false
+        var canVerify = false
+        var canWrap = false
+        var canUnwrap = false
     }
 
     static func add(_ newItem: NewItem) -> OSStatus {
@@ -729,9 +780,28 @@ enum KeychainStore {
             if !newItem.keyType.isEmpty {
                 attributes[kSecAttrKeyType as String] = newItem.keyType
             }
+            // bsiz 属于密钥主键。导入原始密钥时系统一般无从自行推断，
+            // 缺了它 SecItemAdd 往往直接 errSecParam。
+            if let bits = Int(newItem.keySizeInBits.trimmingCharacters(in: .whitespaces)), bits > 0 {
+                attributes[kSecAttrKeySizeInBits as String] = bits
+            }
+            if let bits = Int(newItem.effectiveKeySize.trimmingCharacters(in: .whitespaces)), bits > 0 {
+                attributes[kSecAttrEffectiveKeySize as String] = bits
+            }
             if let tag = newItem.applicationTag.data(using: .utf8), !tag.isEmpty {
                 attributes[kSecAttrApplicationTag as String] = tag
             }
+            if let appLabel = newItem.applicationLabel.data(using: .utf8), !appLabel.isEmpty {
+                attributes[kSecAttrApplicationLabel as String] = appLabel
+            }
+            if newItem.isPermanent { attributes[kSecAttrIsPermanent as String] = true }
+            if newItem.canEncrypt { attributes[kSecAttrCanEncrypt as String] = true }
+            if newItem.canDecrypt { attributes[kSecAttrCanDecrypt as String] = true }
+            if newItem.canDerive { attributes[kSecAttrCanDerive as String] = true }
+            if newItem.canSign { attributes[kSecAttrCanSign as String] = true }
+            if newItem.canVerify { attributes[kSecAttrCanVerify as String] = true }
+            if newItem.canWrap { attributes[kSecAttrCanWrap as String] = true }
+            if newItem.canUnwrap { attributes[kSecAttrCanUnwrap as String] = true }
         }
 
         if !newItem.label.isEmpty {
