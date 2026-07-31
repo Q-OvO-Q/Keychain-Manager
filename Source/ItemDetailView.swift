@@ -335,8 +335,16 @@ struct ItemDetailView: View {
 
     // MARK: 全部属性
 
+    /// 该类别已知、但这条条目上没有值的属性
+    private func unsetAttributes(_ item: KeychainItem) -> [String] {
+        item.itemClass.knownAttributes
+            .filter { item.rawAttributes[$0] == nil }
+            .sorted()
+    }
+
+    @ViewBuilder
     private func attributesSection(_ item: KeychainItem) -> some View {
-        Section("全部元数据") {
+        Section {
             ForEach(item.rawAttributes.keys.sorted(), id: \.self) { key in
                 if let value = item.rawAttributes[key] {
                     VStack(alignment: .leading, spacing: 2) {
@@ -350,6 +358,31 @@ struct ItemDetailView: View {
                     }
                     .padding(.vertical, 2)
                 }
+            }
+        } header: {
+            Text("已设置的元数据（\(item.rawAttributes.count)）")
+        } footer: {
+            Text("这里是系统实际回传的全部属性，一个不漏。")
+        }
+
+        let unset = unsetAttributes(item)
+        if !unset.isEmpty {
+            Section {
+                ForEach(unset, id: \.self) { key in
+                    HStack {
+                        Text(KeychainAttributeFormatter.label(for: key))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text("未设置")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            } header: {
+                Text("未设置的元数据（\(unset.count)）")
+            } footer: {
+                Text("SecItemCopyMatching 只回传有值的键，这些属性在本条目上为空，因此不出现在上面那一节。「可修改的元数据」是固定列出的，所以其中几项会在这里而不在上面。")
             }
         }
     }
