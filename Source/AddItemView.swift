@@ -66,7 +66,11 @@ struct AddItemView: View {
         guard let data = parsedData else { return false }
         switch itemClass {
         case .genericPassword, .internetPassword:
-            return !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            // service / server 允许为空（keychain 本身接受），
+            // 但两者与 account 全空就成了无从辨认的条目，要求至少填一个
+            let hasTitle = !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let hasAccount = !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            return hasTitle || hasAccount
         case .key, .certificate:
             // 这两类没有标题，条目内容完全由数据决定，空数据无从写起
             return !data.isEmpty
