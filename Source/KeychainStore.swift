@@ -61,6 +61,7 @@ enum KeychainStore {
     static func fetchItems(scope: KeychainScope,
                           classes: [KeychainItemClass],
                           knownGroups: [String] = [],
+                          includeProtected: Bool = false,
                           loadData: Bool = true,
                           progress: ((String) -> Void)? = nil) -> KeychainFetchResult {
         var result = KeychainFetchResult()
@@ -94,12 +95,26 @@ enum KeychainStore {
                     progress?("正在枚举\(itemClass.displayName)条目 \(completed)/\(total)…")
                 }
 
-                let outcome = enumerate(itemClass: itemClass, accessGroup: target)
+                let outcome = enumerate(itemClass: itemClass,
+                                       accessGroup: target,
+                                       skipAuthenticationUI: !includeProtected)
 
                 switch outcome.status {
                 case errSecSuccess, errSecItemNotFound:
                     rows.append(contentsOf: outcome.rows.map { (itemClass, $0) })
+
                 default:
+                    // 允许验证时失败（用户取消、验证不通过、整批认证失败等）：
+                    // 退回跳过验证再查一次，至少把不需要验证的条目拿到手，
+                    // 同时如实记录失败，好定位是哪个组里藏着受保护条目。
+                    if includeProtected {
+                        let retry = enumerate(itemClass: itemClass,
+                                             accessGroup: target,
+                                             skipAuthenticationUI: true)
+                        if retry.status == errSecSuccess || retry.status == errSecItemNotFound {
+                            rows.append(contentsOf: retry.rows.map { (itemClass, $0) })
+                        }
+                    }
                     result.classErrors.append(KeychainClassError(itemClass: itemClass,
                                                                  accessGroup: target,
                                                                  status: outcome.status))
@@ -148,11 +163,15 @@ enum KeychainStore {
 
     /// 枚举单个类别。`accessGroup` 为 nil 表示不限定组。
     ///
-    /// 这里**不**跳过需要验证的条目：keychain 只加密 `v_Data`，属性本身是明文，
-    /// 取属性不需要解密，因此受保护条目也能被列出来（数据留到 `copyData` 再处理，
-    /// 那里会跳过验证并如实报 errSecInteractionNotAllowed，界面标注「受保护」）。
+    /// `skipAuthenticationUI` 决定受 `SecAccessControl` 保护的条目如何处理：
+    /// 跳过则它们不会出现在结果里，不跳过则系统可能弹出验证。
+    ///
+    /// 注意：不能假设「取属性不需要解密所以枚举不会弹验证」。iOS 13 起 keychain 的
+    /// 元数据本身也是加密的，返回属性同样要解密，受保护条目在枚举阶段就会要求验证 ——
+    /// 实机上正是枚举阶段弹的验证框。
     private static func enumerate(itemClass: KeychainItemClass,
-                                 accessGroup: String?) -> (rows: [[String: Any]], status: OSStatus) {
+                                 accessGroup: String?,
+                                 skipAuthenticationUI: Bool) -> (rows: [[String: Any]], status: OSStatus) {
         var query: [String: Any] = [
             kSecClass as String: itemClass.secClass,
             kSecMatchLimit as String: kSecMatchLimitAll,
@@ -164,6 +183,7 @@ enum KeychainStore {
         if let accessGroup {
             query[kSecAttrAccessGroup as String] = accessGroup
         }
+        applyAuthenticationPolicy(to: &query, allowUI: !skipAuthenticationUI)
 
         var output: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &output)

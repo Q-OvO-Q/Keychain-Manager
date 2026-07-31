@@ -15,6 +15,7 @@ final class KeychainViewModel: ObservableObject {
     private let targetGroupKey = "targetAccessGroup"
     private let allGroupsKey = "useAllAccessibleGroups"
     private let enabledClassesKey = "enabledItemClasses"
+    private let includeProtectedKey = "includeProtectedItems"
 
     @Published var targetGroup: String {
         didSet { UserDefaults.standard.set(targetGroup, forKey: targetGroupKey) }
@@ -32,6 +33,16 @@ final class KeychainViewModel: ObservableObject {
         }
     }
 
+    /// 枚举时是否允许系统弹出验证。
+    ///
+    /// 关闭（默认）时跳过需要验证的条目：不会弹框、也不会因为整批认证失败而丢掉整个类别，
+    /// 代价是受保护条目不出现在列表里。
+    /// 开启后受保护条目会被列出，但可能弹出 Face ID；某个组验证失败时会自动退回跳过重查，
+    /// 因此最差也不会比关闭时少拿到条目。
+    @Published var includeProtectedItems: Bool {
+        didSet { UserDefaults.standard.set(includeProtectedItems, forKey: includeProtectedKey) }
+    }
+
     // MARK: - 数据
 
     @Published private(set) var items: [KeychainItem] = []
@@ -42,6 +53,10 @@ final class KeychainViewModel: ObservableObject {
 
     @Published private(set) var detectedGroups: [String] = []
     @Published private(set) var profileSummary: String?
+
+    /// 本次查询中每个失败的 (类别, Access Group)。
+    /// 弹验证的到底是哪个组，只能靠它定位 —— 状态栏放不下，界面上可点开查看全部。
+    @Published private(set) var enumerationFailures: [String] = []
 
     // MARK: - 筛选与选择
 
@@ -56,6 +71,7 @@ final class KeychainViewModel: ObservableObject {
         let defaults = UserDefaults.standard
         targetGroup = defaults.string(forKey: targetGroupKey) ?? ""
         useAllGroups = defaults.object(forKey: allGroupsKey) as? Bool ?? true
+        includeProtectedItems = defaults.object(forKey: includeProtectedKey) as? Bool ?? false
 
         if let raw = defaults.array(forKey: enabledClassesKey) as? [String] {
             let restored = raw.compactMap { KeychainItemClass(rawValue: $0) }
@@ -203,11 +219,13 @@ final class KeychainViewModel: ObservableObject {
 
         // 「全部可访问」靠逐组枚举实现，需要完整的组列表
         let knownGroups = detectedGroups
+        let includeProtected = includeProtectedItems
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = KeychainStore.fetchItems(scope: scope,
                                                   classes: classes,
-                                                  knownGroups: knownGroups) { text in
+                                                  knownGroups: knownGroups,
+                                                  includeProtected: includeProtected) { text in
                 DispatchQueue.main.async { self?.statusMessage = text }
             }
             DispatchQueue.main.async {
@@ -233,18 +251,14 @@ final class KeychainViewModel: ObservableObject {
             TagManager.shared.cleanupOrphanedTags(existingKeys: existingKeys, inAccessGroups: groups)
         }
 
+        enumerationFailures = result.classErrors.map(\.description)
+
         var parts = ["共 \(result.items.count) 条"]
         if unreadableCount > 0 {
             parts.append("\(unreadableCount) 条受保护/不可读")
         }
-        if !result.classErrors.isEmpty {
-            // 逐组枚举下失败项可能很多（例如某个组对每个类别都失败），只列前两条
-            let shown = result.classErrors.prefix(2).map(\.description)
-            var detail = shown.joined(separator: "；")
-            if result.classErrors.count > shown.count {
-                detail += "；另有 \(result.classErrors.count - shown.count) 项失败"
-            }
-            parts.append(detail)
+        if !enumerationFailures.isEmpty {
+            parts.append("\(enumerationFailures.count) 项查询失败（点击查看）")
         }
         statusMessage = parts.joined(separator: " · ")
 
