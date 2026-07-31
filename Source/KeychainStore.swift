@@ -68,78 +68,83 @@ enum KeychainStore {
         var result = KeychainFetchResult()
         var rows: [(KeychainItemClass, [String: Any])] = []
 
-        // 逐组枚举而不是一次不限组的广查询。
-        //
-        // 不限组查询会横跨全部 entitlement 组，只要其中一个组出问题
-        // （实机上是 com.apple.token 触发验证），整个类别一起返回 errSecAuthFailed，
-        // 该类别的条目就全部看不到了。逐组之后单个组失败只影响它自己。
-        //
-        // 前提是拿得到完整的组列表 —— 通配符组在查询里是**字面匹配**，
-        // 用 `TEAMID.*` 查只会返回 agrp 恰好等于该字符串的条目，
-        // 不会展开命中 `TEAMID.foo.bar`，所以必须逐个真实组名去查。
-        let targets: [String?]
-        switch scope {
-        case .group(let group):
-            targets = [group]
-        case .allAccessible:
-            // 末尾追加一次不限组扫描（nil）。
-            //
-            // 通配符 entitlement（TEAMID.*）授予的是「该前缀下所有组」的访问权，
-            // 这些组名不出现在 entitlements 里，逐组枚举永远猜不到它们。
-            // 不限组查询不依赖组名，正好补上这个缺口；重复条目由持久引用去重消化。
-            targets = knownGroups.isEmpty ? [nil] : knownGroups.map { Optional($0) } + [nil]
+        /// 跑一趟枚举并把结果收进 rows；失败时按 (类别, 组) 记录。
+        ///
+        /// 允许验证却失败（用户取消、整批认证失败等）时退回跳过验证再查一次，
+        /// 至少把不需要验证的条目拿到手。
+        func collect(itemClass: KeychainItemClass, group: String?, skipAuthenticationUI: Bool) {
+            let outcome = enumerate(itemClass: itemClass,
+                                   accessGroup: group,
+                                   skipAuthenticationUI: skipAuthenticationUI)
+
+            switch outcome.status {
+            case errSecSuccess, errSecItemNotFound:
+                rows.append(contentsOf: outcome.rows.map { (itemClass, $0) })
+
+            default:
+                if !skipAuthenticationUI {
+                    let retry = enumerate(itemClass: itemClass,
+                                         accessGroup: group,
+                                         skipAuthenticationUI: true)
+                    if retry.status == errSecSuccess || retry.status == errSecItemNotFound {
+                        rows.append(contentsOf: retry.rows.map { (itemClass, $0) })
+                    }
+                }
+                result.classErrors.append(KeychainClassError(itemClass: itemClass,
+                                                             accessGroup: group,
+                                                             status: outcome.status))
+            }
         }
 
-        // 兜底扫描是否只是「补充的一趟」（前面已经逐组查过）
-        let sweepIsSupplementary = !knownGroups.isEmpty
+        switch scope {
+        case .group(let group):
+            for itemClass in classes {
+                progress?("正在枚举\(itemClass.displayName)条目…")
+                collect(itemClass: itemClass, group: group, skipAuthenticationUI: !includeProtected)
+            }
 
-        let total = classes.count * targets.count
-        var completed = 0
+        case .allAccessible:
+            // 第一趟：不限组的兜底扫描。
+            //
+            // 通配符 entitlement（TEAMID.*）授予的是「该前缀下所有组」的访问权，
+            // 这些组名不出现在 entitlements 里，逐组枚举永远猜不到它们；
+            // 不限组查询不依赖组名，正好补上这个缺口。
+            //
+            // 它始终跳过验证：职责只是覆盖「名字未知的组」，而不限组查询横跨全部组，
+            // 正是最初把整个通用类打掉的那条查询 —— 放开验证只会白弹一次框，
+            // 然后照样整批 errSecAuthFailed，一条也换不回来。
+            for itemClass in classes {
+                progress?("正在扫描\(itemClass.displayName)条目…")
+                collect(itemClass: itemClass, group: nil, skipAuthenticationUI: true)
+            }
 
-        for itemClass in classes {
-            for target in targets {
-                completed += 1
-                if total <= 1 || completed % 10 == 0 || completed == total {
-                    progress?("正在枚举\(itemClass.displayName)条目 \(completed)/\(total)…")
-                }
+            // 把扫描结果里出现的组名并入待查列表。
+            // 放在逐组之前是有意的：这样兜底新发现的组本次就能被逐组覆盖到
+            // （包括其中的受保护条目），不必等下一次刷新。
+            var groups = knownGroups
+            var seen = Set(groups)
+            for row in rows {
+                guard let group = row.1[kSecAttrAccessGroup as String] as? String,
+                      !group.isEmpty, seen.insert(group).inserted else { continue }
+                groups.append(group)
+            }
 
-                // 补充性的兜底扫描一律跳过验证。
-                //
-                // 它的职责只是覆盖「名字未知的组」，已知组里的受保护条目在前面
-                // 逐组那几趟里已经处理过了。而不限组查询横跨全部组，正是最初
-                // 把整个通用类打掉的那条查询 —— 放开验证只会白弹一次框，
-                // 然后照样整批 errSecAuthFailed，一条也换不回来。
-                let isSupplementarySweep = target == nil && sweepIsSupplementary
-
-                let outcome = enumerate(itemClass: itemClass,
-                                       accessGroup: target,
-                                       skipAuthenticationUI: !includeProtected || isSupplementarySweep)
-
-                switch outcome.status {
-                case errSecSuccess, errSecItemNotFound:
-                    rows.append(contentsOf: outcome.rows.map { (itemClass, $0) })
-
-                default:
-                    // 允许验证时失败（用户取消、验证不通过、整批认证失败等）：
-                    // 退回跳过验证再查一次，至少把不需要验证的条目拿到手，
-                    // 同时如实记录失败，好定位是哪个组里藏着受保护条目。
-                    // 兜底扫描本来就已经是 skip，不必再重试一遍同样的查询
-                    if includeProtected && !isSupplementarySweep {
-                        let retry = enumerate(itemClass: itemClass,
-                                             accessGroup: target,
-                                             skipAuthenticationUI: true)
-                        if retry.status == errSecSuccess || retry.status == errSecItemNotFound {
-                            rows.append(contentsOf: retry.rows.map { (itemClass, $0) })
-                        }
+            // 第二趟：逐组枚举。单个组失败只影响它自己，
+            // 不会像不限组查询那样把整个类别一起带走。
+            let total = classes.count * groups.count
+            var completed = 0
+            for itemClass in classes {
+                for group in groups {
+                    completed += 1
+                    if completed % 10 == 0 || completed == total {
+                        progress?("正在枚举\(itemClass.displayName)条目 \(completed)/\(total)…")
                     }
-                    result.classErrors.append(KeychainClassError(itemClass: itemClass,
-                                                                 accessGroup: target,
-                                                                 status: outcome.status))
+                    collect(itemClass: itemClass, group: group, skipAuthenticationUI: !includeProtected)
                 }
             }
         }
 
-        // 同一条目可能被多个组名命中（例如字面存在的通配符组），按持久引用去重
+        // 兜底扫描和逐组枚举必然大量重叠（同一条目两趟都会命中），按持久引用去重
         rows = deduplicate(rows)
 
         var items: [KeychainItem] = []
