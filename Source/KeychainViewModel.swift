@@ -313,10 +313,6 @@ final class KeychainViewModel: ObservableObject {
         if unreadableCount > 0 {
             parts.append("\(unreadableCount) 条受保护/不可读")
         }
-        if result.hiddenItemCount > 0 {
-            // 探测到存在、但属性读不出来因而无法列出的条目
-            parts.append("另有 \(result.hiddenItemCount) 条无法列出")
-        }
         if !enumerationFailures.isEmpty {
             parts.append("\(enumerationFailures.count) 项查询失败（点击查看）")
         }
