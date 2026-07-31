@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import LocalAuthentication
 
 // MARK: - 查询范围
 
@@ -89,6 +90,9 @@ enum KeychainStore {
             targets = knownGroups.isEmpty ? [nil] : knownGroups.map { Optional($0) } + [nil]
         }
 
+        // 兜底扫描是否只是「补充的一趟」（前面已经逐组查过）
+        let sweepIsSupplementary = !knownGroups.isEmpty
+
         let total = classes.count * targets.count
         var completed = 0
 
@@ -99,9 +103,17 @@ enum KeychainStore {
                     progress?("正在枚举\(itemClass.displayName)条目 \(completed)/\(total)…")
                 }
 
+                // 补充性的兜底扫描一律跳过验证。
+                //
+                // 它的职责只是覆盖「名字未知的组」，已知组里的受保护条目在前面
+                // 逐组那几趟里已经处理过了。而不限组查询横跨全部组，正是最初
+                // 把整个通用类打掉的那条查询 —— 放开验证只会白弹一次框，
+                // 然后照样整批 errSecAuthFailed，一条也换不回来。
+                let isSupplementarySweep = target == nil && sweepIsSupplementary
+
                 let outcome = enumerate(itemClass: itemClass,
                                        accessGroup: target,
-                                       skipAuthenticationUI: !includeProtected)
+                                       skipAuthenticationUI: !includeProtected || isSupplementarySweep)
 
                 switch outcome.status {
                 case errSecSuccess, errSecItemNotFound:
@@ -111,7 +123,8 @@ enum KeychainStore {
                     // 允许验证时失败（用户取消、验证不通过、整批认证失败等）：
                     // 退回跳过验证再查一次，至少把不需要验证的条目拿到手，
                     // 同时如实记录失败，好定位是哪个组里藏着受保护条目。
-                    if includeProtected {
+                    // 兜底扫描本来就已经是 skip，不必再重试一遍同样的查询
+                    if includeProtected && !isSupplementarySweep {
                         let retry = enumerate(itemClass: itemClass,
                                              accessGroup: target,
                                              skipAuthenticationUI: true)
@@ -246,20 +259,34 @@ enum KeychainStore {
     /// 原因见 `applyAuthenticationPolicy`。
     static func copyData(for item: KeychainItem,
                         allowAuthenticationUI: Bool = false) -> (data: Data?, status: OSStatus) {
+        // 主动解锁时给一个显式的 LAContext：可以自定义验证提示文案，
+        // 也让下面两次尝试共用同一次验证结果，不会连弹两个框
+        var context: LAContext?
+        if allowAuthenticationUI {
+            let created = LAContext()
+            created.localizedReason = "读取受保护的 Keychain 条目内容"
+            context = created
+        }
+
+        var referenceStatus = errSecItemNotFound
+
         if let ref = item.persistentRef {
             var query: [String: Any] = [
                 kSecValuePersistentRef as String: ref,
                 kSecReturnData as String: true
             ]
-            applyAuthenticationPolicy(to: &query, allowUI: allowAuthenticationUI)
+            applyAuthenticationPolicy(to: &query, allowUI: allowAuthenticationUI, context: context)
 
             var output: AnyObject?
             let status = SecItemCopyMatching(query as CFDictionary, &output)
             if status == errSecSuccess {
                 return (output as? Data ?? Data(), errSecSuccess)
             }
-            // 引用失效才退回主键查询，其它错误（如条目受保护）直接如实上报
-            if status != errSecItemNotFound {
+            referenceStatus = status
+
+            // 枚举阶段维持原行为：只有引用失效才退回主键查询。
+            // 主动解锁时两条路都试 —— 持久引用被拒不代表主键查询也会被拒。
+            if !allowAuthenticationUI && status != errSecItemNotFound {
                 return (nil, status)
             }
         }
@@ -267,12 +294,17 @@ enum KeychainStore {
         var query = item.primaryKeyQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
-        applyAuthenticationPolicy(to: &query, allowUI: allowAuthenticationUI)
+        applyAuthenticationPolicy(to: &query, allowUI: allowAuthenticationUI, context: context)
 
         var output: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &output)
         if status == errSecSuccess {
             return (output as? Data ?? Data(), errSecSuccess)
+        }
+
+        // 两条路都失败时，报信息量更大的那个（「找不到」通常是最没用的那个）
+        if status == errSecItemNotFound && referenceStatus != errSecItemNotFound {
+            return (nil, referenceStatus)
         }
         return (nil, status)
     }
@@ -283,9 +315,16 @@ enum KeychainStore {
     /// 系统会直接终止进程（启动即闪退）。
     /// 因此枚举一律 Skip —— 受保护条目如实报 errSecInteractionNotAllowed，列表标注「受保护」，
     /// 由用户在详情页主动解锁。
-    private static func applyAuthenticationPolicy(to query: inout [String: Any], allowUI: Bool) {
-        guard !allowUI else { return }
-        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+    private static func applyAuthenticationPolicy(to query: inout [String: Any],
+                                                 allowUI: Bool,
+                                                 context: LAContext? = nil) {
+        guard allowUI else {
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+            return
+        }
+        if let context {
+            query[kSecUseAuthenticationContext as String] = context
+        }
     }
 
     // MARK: - 删除

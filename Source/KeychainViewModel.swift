@@ -467,11 +467,26 @@ final class KeychainViewModel: ObservableObject {
                 }
 
                 if outcome.status != errSecSuccess {
-                    self.alertMessage = "解锁失败：\(KeychainStore.message(for: outcome.status))"
+                    self.alertMessage = KeychainViewModel.describeUnlockFailure(outcome.status)
                 }
                 completion(updated)
             }
         }
+    }
+
+    private static func describeUnlockFailure(_ status: OSStatus) -> String {
+        guard status == errSecAuthFailed else {
+            return "解锁失败：\(KeychainStore.message(for: status))"
+        }
+        // 验证已经通过却仍然 -25293，说明卡在访问控制而不是生物识别本身
+        return """
+        解锁失败：认证失败 (-25293)
+
+        如果 Face ID 验证本身是通过的，那么问题不在验证，而在条目的访问控制：\
+        SecAccessControl 会绑定创建它的那个 App 的身份，共享 Access Group 只让你\
+        看得到这条目，不代表能满足它的解锁条件。这种情况下本 App 读不出其内容，\
+        但仍然可以查看元数据、改标签和删除。
+        """
     }
 
     // MARK: - 修改数据
