@@ -3,6 +3,9 @@ name: Build Unsigned IPA
 on:
   push:
     branches: [ "main" ]
+  # 合并前就跑一次编译，避免破坏 main 之后才发现
+  pull_request:
+    branches: [ "main" ]
   workflow_dispatch:
 
 jobs:
