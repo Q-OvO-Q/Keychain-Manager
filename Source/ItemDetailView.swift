@@ -17,6 +17,8 @@ struct ItemDetailView: View {
     @State private var tagValue = ""
     @State private var didLoad = false
     @State private var confirmDelete = false
+    /// 只存被改动过的属性，未改动的直接读条目当前值
+    @State private var editedAttributes: [String: Any] = [:]
 
     private var item: KeychainItem? { viewModel.item(withID: itemID) }
 
@@ -43,6 +45,7 @@ struct ItemDetailView: View {
             identitySection(item)
             tagSection(item)
             dataSection(item)
+            editableAttributesSection(item)
             attributesSection(item)
             deleteSection(item)
         }
@@ -163,11 +166,19 @@ struct ItemDetailView: View {
                     .foregroundStyle(.orange)
             }
 
+            // TextEditor 在 Form 里会画一块不透明底色，铺满整行并盖住分隔线。
+            // 关掉它自带的背景，再自己画一个带内边距的圆角框。
             TextEditor(text: $content)
                 .frame(height: 130)
                 .font(.system(.body, design: .monospaced))
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.secondary.opacity(0.08))
+                )
 
             HStack {
                 Text(byteCountDescription)
@@ -237,6 +248,89 @@ struct ItemDetailView: View {
         let data = isHexMode ? content.hexData : content.data(using: .utf8)
         guard let data else { return "内容不合法" }
         return "\(data.count) 字节"
+    }
+
+    // MARK: 可修改的元数据
+
+    @ViewBuilder
+    private func editableAttributesSection(_ item: KeychainItem) -> some View {
+        let editable = KeychainStore.EditableAttribute.available(for: item.itemClass)
+
+        if !editable.isEmpty {
+            Section {
+                ForEach(editable) { attribute in
+                    if attribute.isBoolean {
+                        Toggle(attribute.displayName, isOn: booleanBinding(attribute))
+                            .font(.callout)
+                    } else if attribute == .accessible {
+                        Picker(attribute.displayName, selection: accessibleBinding) {
+                            ForEach(AccessibleOption.options(including: accessibleBinding.wrappedValue)) { option in
+                                Text(option.title).tag(option.value)
+                            }
+                        }
+                        .font(.callout)
+                    } else {
+                        HStack {
+                            Text(attribute.displayName)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .frame(width: 96, alignment: .leading)
+                            TextField("未设置", text: textBinding(attribute))
+                                .font(.callout)
+                                .textInputAutocapitalization(.never)
+                        }
+                    }
+                }
+
+                Button("保存元数据") { saveAttributes(item) }
+                    .disabled(!item.canBeTargeted || editedAttributes.isEmpty)
+            } header: {
+                Text("可修改的元数据")
+            } footer: {
+                Text("主键属性（账号 / 服务 / 组 / 同步）不可改：改动等于把条目挪到另一个主键上，会和已有条目冲突。")
+            }
+        }
+    }
+
+    private func textBinding(_ attribute: KeychainStore.EditableAttribute) -> Binding<String> {
+        Binding(
+            get: {
+                if let edited = editedAttributes[attribute.key] as? String { return edited }
+                guard let item else { return "" }
+                return KeychainItem.stringValue(item.rawAttributes[attribute.key]) ?? ""
+            },
+            set: { editedAttributes[attribute.key] = $0 }
+        )
+    }
+
+    private func booleanBinding(_ attribute: KeychainStore.EditableAttribute) -> Binding<Bool> {
+        Binding(
+            get: {
+                if let edited = editedAttributes[attribute.key] as? Bool { return edited }
+                guard let item else { return false }
+                return (item.rawAttributes[attribute.key] as? NSNumber)?.boolValue ?? false
+            },
+            set: { editedAttributes[attribute.key] = $0 }
+        )
+    }
+
+    private var accessibleBinding: Binding<String> {
+        let key = KeychainStore.EditableAttribute.accessible.key
+        return Binding(
+            get: {
+                if let edited = editedAttributes[key] as? String { return edited }
+                guard let item else { return "" }
+                return KeychainItem.stringValue(item.rawAttributes[key]) ?? ""
+            },
+            set: { editedAttributes[key] = $0 }
+        )
+    }
+
+    private func saveAttributes(_ item: KeychainItem) {
+        if viewModel.updateAttributes(item, changes: editedAttributes) {
+            editedAttributes.removeAll()
+            saveNotice = "元数据已更新"
+        }
     }
 
     // MARK: 全部属性

@@ -113,26 +113,40 @@ final class KeychainViewModel: ObservableObject {
         currentScope?.displayName ?? "未指定"
     }
 
+    /// 筛选维度。算某个维度的计数时要排除它自己，否则计数不会随其它维度联动
+    private enum Facet {
+        case itemClass, group, tag
+    }
+
     var filteredItems: [KeychainItem] {
+        narrowed(excluding: nil)
+    }
+
+    /// 应用除 `facet` 之外的全部筛选条件。
+    /// 传 nil 表示全都应用，即列表实际显示的内容。
+    private func narrowed(excluding facet: Facet?) -> [KeychainItem] {
         var result = items
 
-        if let classFilter {
+        if facet != .itemClass, let classFilter {
             result = result.filter { $0.itemClass == classFilter }
         }
 
-        if !groupFilter.isEmpty {
+        if facet != .group, !groupFilter.isEmpty {
             result = result.filter { $0.accessGroup == groupFilter }
         }
 
-        switch selectedTagFilter {
-        case "":
-            break
-        case untaggedFilterKey:
-            result = result.filter { $0.appTag.isEmpty }
-        default:
-            result = result.filter { $0.appTag == selectedTagFilter }
+        if facet != .tag {
+            switch selectedTagFilter {
+            case "":
+                break
+            case untaggedFilterKey:
+                result = result.filter { $0.appTag.isEmpty }
+            default:
+                result = result.filter { $0.appTag == selectedTagFilter }
+            }
         }
 
+        // 搜索词对所有维度都生效，计数才和看到的列表对得上
         let keyword = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !keyword.isEmpty {
             // searchIndex 是查询结束时预先拼好的，这里只做子串比较
@@ -148,18 +162,23 @@ final class KeychainViewModel: ObservableObject {
         classFilter != nil || !groupFilter.isEmpty || !selectedTagFilter.isEmpty
     }
 
-    /// 当前结果里实际出现过的类别及数量
+    /// 各筛选维度「全部」一项对应的基数
+    var classFacetTotal: Int { narrowed(excluding: .itemClass).count }
+    var groupFacetTotal: Int { narrowed(excluding: .group).count }
+
+    /// 类别计数，已应用组 / 标签 / 搜索的筛选
     var classCounts: [ClassCount] {
-        KeychainItemClass.allCases.compactMap { itemClass in
-            let count = items.filter { $0.itemClass == itemClass }.count
+        let base = narrowed(excluding: .itemClass)
+        return KeychainItemClass.allCases.compactMap { itemClass in
+            let count = base.filter { $0.itemClass == itemClass }.count
             return count > 0 ? ClassCount(itemClass: itemClass, count: count) : nil
         }
     }
 
-    /// 当前结果里实际出现过的 Access Group 及数量，按条目数从多到少
+    /// Access Group 计数，已应用类别 / 标签 / 搜索的筛选，按条目数从多到少
     var groupCounts: [GroupCount] {
         var counts: [String: Int] = [:]
-        for item in items where !item.accessGroup.isEmpty {
+        for item in narrowed(excluding: .group) where !item.accessGroup.isEmpty {
             counts[item.accessGroup, default: 0] += 1
         }
         return counts
@@ -177,15 +196,19 @@ final class KeychainViewModel: ObservableObject {
         selectedTagFilter = ""
     }
 
+    /// 标签计数，已应用类别 / 组 / 搜索的筛选
     var tagCounts: [String: Int] {
         var counts: [String: Int] = [:]
-        for item in items {
+        for item in narrowed(excluding: .tag) {
             let tag = item.appTag
             let key = tag.isEmpty ? untaggedFilterKey : tag
             counts[key, default: 0] += 1
         }
         return counts
     }
+
+    /// 标签筛选条里「全部」对应的基数
+    var tagFacetTotal: Int { narrowed(excluding: .tag).count }
 
     var unreadableCount: Int {
         items.filter { $0.dataStatus != nil && $0.dataStatus != errSecSuccess }.count
@@ -487,6 +510,25 @@ final class KeychainViewModel: ObservableObject {
         看得到这条目，不代表能满足它的解锁条件。这种情况下本 App 读不出其内容，\
         但仍然可以查看元数据、改标签和删除。
         """
+    }
+
+    // MARK: - 修改元数据
+
+    /// 改完立刻重查该条目的属性，让详情页显示的是系统里真实的值而不是我们以为写进去的值
+    func updateAttributes(_ item: KeychainItem, changes: [String: Any]) -> Bool {
+        let status = KeychainStore.updateAttributes(item, changes: changes)
+        guard status == errSecSuccess else {
+            alertMessage = "保存元数据失败：\(KeychainStore.message(for: status))"
+            return false
+        }
+        // 就地重读这一条，而不是为一次改动重跑整轮逐组查询
+        if let index = items.firstIndex(where: { $0.id == item.id }),
+           let reloaded = KeychainStore.reload(item) {
+            items[index] = reloaded
+        }
+
+        statusMessage = "已更新「\(item.displayTitle)」的元数据"
+        return true
     }
 
     // MARK: - 修改数据
