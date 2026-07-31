@@ -130,7 +130,6 @@ struct AddItemView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .fill(Color.secondary.opacity(0.08))
                 )
-                .listRowSeparator(.visible)
         } header: {
             Text("Data（内容）")
         } footer: {
@@ -204,9 +203,10 @@ struct AddItemView: View {
                     }
                     .padding(.vertical, 2)
                 }
-                // 同详情页：ScrollView 在 Form 行里会画不透明底色盖住分隔线
+                // 同详情页：ScrollView 会画不透明底色盖住分隔线，
+                // 且只补上方那条，避免在 section 末尾多画一条
                 .scrollContentBackground(.hidden)
-                .listRowSeparator(.visible)
+                .listRowSeparator(.visible, edges: .top)
             }
         }
     }
