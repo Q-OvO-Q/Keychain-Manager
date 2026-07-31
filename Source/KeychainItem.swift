@@ -58,6 +58,46 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
         }
     }
 
+    /// 该类别在 keychain 表里已知的列。
+    ///
+    /// `SecItemCopyMatching` **只回传有值的键**，没设过的属性直接不出现在结果里。
+    /// 详情页靠这份清单把「未设置」的属性也列出来，否则看起来就像这些属性不存在，
+    /// 也会和「可修改的元数据」那一节对不上（那节是固定列出的）。
+    var knownAttributes: [String] {
+        let shared = [kSecAttrLabel, kSecAttrCreationDate, kSecAttrModificationDate,
+                      kSecAttrAccessGroup, kSecAttrAccessible, kSecAttrSynchronizable]
+            .map { $0 as String } + ["accc"]
+
+        switch self {
+        case .genericPassword:
+            return [kSecAttrAccount, kSecAttrService, kSecAttrGeneric,
+                    kSecAttrDescription, kSecAttrComment, kSecAttrCreator,
+                    kSecAttrType, kSecAttrIsInvisible, kSecAttrIsNegative]
+                .map { $0 as String } + shared
+
+        case .internetPassword:
+            return [kSecAttrAccount, kSecAttrSecurityDomain, kSecAttrServer,
+                    kSecAttrProtocol, kSecAttrAuthenticationType, kSecAttrPort, kSecAttrPath,
+                    kSecAttrDescription, kSecAttrComment, kSecAttrCreator,
+                    kSecAttrType, kSecAttrIsInvisible, kSecAttrIsNegative]
+                .map { $0 as String } + shared
+
+        case .key:
+            return [kSecAttrApplicationLabel, kSecAttrApplicationTag, kSecAttrKeyClass,
+                    kSecAttrKeyType, kSecAttrKeySizeInBits, kSecAttrEffectiveKeySize,
+                    kSecAttrIsPermanent, kSecAttrCanEncrypt, kSecAttrCanDecrypt,
+                    kSecAttrCanDerive, kSecAttrCanSign, kSecAttrCanVerify,
+                    kSecAttrCanWrap, kSecAttrCanUnwrap]
+                .map { $0 as String } + shared
+
+        case .certificate:
+            return [kSecAttrCertificateType, kSecAttrCertificateEncoding,
+                    kSecAttrSubject, kSecAttrIssuer, kSecAttrSerialNumber,
+                    kSecAttrSubjectKeyID, kSecAttrPublicKeyHash]
+                .map { $0 as String } + shared
+        }
+    }
+
     /// 足以把单条记录从同组其它条目里区分出来的属性。
     /// 一条都拿不到时禁止按属性删除 —— 那样的查询会命中整个 Access Group。
     var identityAttributes: [String] {
