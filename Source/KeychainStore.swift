@@ -492,10 +492,59 @@ enum KeychainStore {
             }
         }
 
-        /// 证书 / 密钥的描述性字段由系统维护，只放开密码类
         static func available(for itemClass: KeychainItemClass) -> [EditableAttribute] {
-            itemClass.supportsDataEditing ? allCases : []
+            switch itemClass {
+            case .genericPassword, .internetPassword:
+                return allCases
+            case .key, .certificate:
+                // 这两类的其余字段要么是主键，要么由系统从密钥 / 证书本身派生
+                // （subj / issr / slnr / skid / pkhh），改了只会和实际内容对不上。
+                // 但 labl 和 pdmn 是普通属性，没有理由锁死。
+                return [.label, .accessible]
+            }
         }
+    }
+
+    /// 取值来自 Security 框架常量的属性，用选择器而不是自由输入
+    struct AttributeOption: Identifiable {
+        let title: String
+        let value: String
+        var id: String { value.isEmpty ? "__unset__" : value }
+
+        static let unset = AttributeOption(title: "不设置", value: "")
+
+        static let protocols: [AttributeOption] = [unset] + [
+            ("HTTP", kSecAttrProtocolHTTP), ("HTTPS", kSecAttrProtocolHTTPS),
+            ("FTP", kSecAttrProtocolFTP), ("FTPS", kSecAttrProtocolFTPS),
+            ("SSH", kSecAttrProtocolSSH), ("SMTP", kSecAttrProtocolSMTP),
+            ("IMAP", kSecAttrProtocolIMAP), ("IMAPS", kSecAttrProtocolIMAPS),
+            ("POP3", kSecAttrProtocolPOP3), ("POP3S", kSecAttrProtocolPOP3S),
+            ("LDAP", kSecAttrProtocolLDAP), ("LDAPS", kSecAttrProtocolLDAPS),
+            ("SMB", kSecAttrProtocolSMB), ("IRC", kSecAttrProtocolIRC),
+            ("Telnet", kSecAttrProtocolTelnet), ("SOCKS", kSecAttrProtocolSOCKS)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
+
+        static let authenticationTypes: [AttributeOption] = [unset] + [
+            ("HTTP Basic", kSecAttrAuthenticationTypeHTTPBasic),
+            ("HTTP Digest", kSecAttrAuthenticationTypeHTTPDigest),
+            ("HTML 表单", kSecAttrAuthenticationTypeHTMLForm),
+            ("NTLM", kSecAttrAuthenticationTypeNTLM),
+            ("MSN", kSecAttrAuthenticationTypeMSN),
+            ("DPA", kSecAttrAuthenticationTypeDPA),
+            ("RPA", kSecAttrAuthenticationTypeRPA),
+            ("默认", kSecAttrAuthenticationTypeDefault)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
+
+        static let keyClasses: [AttributeOption] = [unset] + [
+            ("公钥", kSecAttrKeyClassPublic),
+            ("私钥", kSecAttrKeyClassPrivate),
+            ("对称密钥", kSecAttrKeyClassSymmetric)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
+
+        static let keyTypes: [AttributeOption] = [unset] + [
+            ("RSA", kSecAttrKeyTypeRSA),
+            ("EC (SEC Prime Random)", kSecAttrKeyTypeECSECPrimeRandom)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
     }
 
     /// `kSecAttrCreator` / `kSecAttrType` 存的是 32 位整数，
@@ -591,12 +640,15 @@ enum KeychainStore {
 
     struct NewItem {
         var itemClass: KeychainItemClass = .genericPassword
-        /// genp 写入 kSecAttrService，inet 写入 kSecAttrServer
+        /// genp 写入 kSecAttrService，inet 写入 kSecAttrServer；密钥 / 证书不用
         var title: String = ""
         var account: String = ""
         var data: Data = Data()
         var accessGroup: String = ""
         var accessible: String = kSecAttrAccessibleWhenUnlocked as String
+        var synchronizable = false
+
+        // 描述性字段
         var label: String = ""
         var itemDescription: String = ""
         var comment: String = ""
@@ -605,44 +657,107 @@ enum KeychainStore {
         var typeCode: String = ""
         var isInvisible = false
         var isNegative = false
+
+        // 通用密码
+        var generic: String = ""
+
+        // 网络密码（这几项都是它主键的一部分，只能在新增时定）
+        var securityDomain: String = ""
+        var networkProtocol: String = ""
+        var authenticationType: String = ""
+        var port: String = ""
+        var path: String = ""
+
+        // 密钥
+        var keyClass: String = ""
+        var keyType: String = ""
+        var applicationTag: String = ""
     }
 
     static func add(_ newItem: NewItem) -> OSStatus {
-        guard newItem.itemClass.supportsDataEditing else { return errSecUnimplemented }
-
         var attributes: [String: Any] = [
             kSecClass as String: newItem.itemClass.secClass,
-            kSecAttrAccount as String: newItem.account,
-            kSecValueData as String: newItem.data,
             kSecAttrAccessible as String: newItem.accessible
         ]
+        if newItem.synchronizable {
+            attributes[kSecAttrSynchronizable as String] = true
+        }
 
-        if newItem.itemClass == .internetPassword {
-            attributes[kSecAttrServer as String] = newItem.title
-        } else {
+        switch newItem.itemClass {
+        case .genericPassword:
             attributes[kSecAttrService as String] = newItem.title
+            attributes[kSecAttrAccount as String] = newItem.account
+            attributes[kSecValueData as String] = newItem.data
+            if let generic = newItem.generic.data(using: .utf8), !generic.isEmpty {
+                attributes[kSecAttrGeneric as String] = generic
+            }
+
+        case .internetPassword:
+            attributes[kSecAttrServer as String] = newItem.title
+            attributes[kSecAttrAccount as String] = newItem.account
+            attributes[kSecValueData as String] = newItem.data
+            if !newItem.securityDomain.isEmpty {
+                attributes[kSecAttrSecurityDomain as String] = newItem.securityDomain
+            }
+            if !newItem.networkProtocol.isEmpty {
+                attributes[kSecAttrProtocol as String] = newItem.networkProtocol
+            }
+            if !newItem.authenticationType.isEmpty {
+                attributes[kSecAttrAuthenticationType as String] = newItem.authenticationType
+            }
+            if let port = Int(newItem.port.trimmingCharacters(in: .whitespaces)), port > 0 {
+                attributes[kSecAttrPort as String] = port
+            }
+            if !newItem.path.isEmpty {
+                attributes[kSecAttrPath as String] = newItem.path
+            }
+
+        case .certificate:
+            // 证书不是「一堆属性」，而是一份 DER 数据：subj / issr / slnr 都由系统
+            // 从证书本身解析，手填没有意义也不被接受。所以先构造 SecCertificate，
+            // 传 kSecValueRef 而不是 kSecValueData。
+            guard let certificate = SecCertificateCreateWithData(nil, newItem.data as CFData) else {
+                return errSecDecode
+            }
+            attributes[kSecValueRef as String] = certificate
+
+        case .key:
+            attributes[kSecValueData as String] = newItem.data
+            if !newItem.keyClass.isEmpty {
+                attributes[kSecAttrKeyClass as String] = newItem.keyClass
+            }
+            if !newItem.keyType.isEmpty {
+                attributes[kSecAttrKeyType as String] = newItem.keyType
+            }
+            if let tag = newItem.applicationTag.data(using: .utf8), !tag.isEmpty {
+                attributes[kSecAttrApplicationTag as String] = tag
+            }
         }
 
         if !newItem.label.isEmpty {
             attributes[kSecAttrLabel as String] = newItem.label
         }
-        if !newItem.itemDescription.isEmpty {
-            attributes[kSecAttrDescription as String] = newItem.itemDescription
-        }
-        if !newItem.comment.isEmpty {
-            attributes[kSecAttrComment as String] = newItem.comment
-        }
-        if let creator = FourCharCode.number(from: newItem.creator) {
-            attributes[kSecAttrCreator as String] = creator
-        }
-        if let typeCode = FourCharCode.number(from: newItem.typeCode) {
-            attributes[kSecAttrType as String] = typeCode
-        }
-        if newItem.isInvisible {
-            attributes[kSecAttrIsInvisible as String] = true
-        }
-        if newItem.isNegative {
-            attributes[kSecAttrIsNegative as String] = true
+
+        // 其余描述性字段只有密码类有对应的列
+        if newItem.itemClass.supportsDataEditing {
+            if !newItem.itemDescription.isEmpty {
+                attributes[kSecAttrDescription as String] = newItem.itemDescription
+            }
+            if !newItem.comment.isEmpty {
+                attributes[kSecAttrComment as String] = newItem.comment
+            }
+            if let creator = FourCharCode.number(from: newItem.creator) {
+                attributes[kSecAttrCreator as String] = creator
+            }
+            if let typeCode = FourCharCode.number(from: newItem.typeCode) {
+                attributes[kSecAttrType as String] = typeCode
+            }
+            if newItem.isInvisible {
+                attributes[kSecAttrIsInvisible as String] = true
+            }
+            if newItem.isNegative {
+                attributes[kSecAttrIsNegative as String] = true
+            }
         }
 
         // 通配符 Group 只是权限声明，不是可写入的实际 Group
