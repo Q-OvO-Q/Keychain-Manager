@@ -81,8 +81,12 @@ enum KeychainStore {
         case .group(let group):
             targets = [group]
         case .allAccessible:
-            // 组列表为空时退回不限组查询，至少还能看到点东西
-            targets = knownGroups.isEmpty ? [nil] : knownGroups.map { Optional($0) }
+            // 末尾追加一次不限组扫描（nil）。
+            //
+            // 通配符 entitlement（TEAMID.*）授予的是「该前缀下所有组」的访问权，
+            // 这些组名不出现在 entitlements 里，逐组枚举永远猜不到它们。
+            // 不限组查询不依赖组名，正好补上这个缺口；重复条目由持久引用去重消化。
+            targets = knownGroups.isEmpty ? [nil] : knownGroups.map { Optional($0) } + [nil]
         }
 
         let total = classes.count * targets.count
@@ -136,8 +140,21 @@ enum KeychainStore {
                 }
                 let outcome = copyData(for: item)
                 item.data = outcome.data
-                item.dataStatus = outcome.status
+
+                // `kSecUseAuthenticationUISkip` 对需要验证的条目是**静默跳过**，
+                // 取数据因此返回 errSecItemNotFound（找不到）而不是 errSecInteractionNotAllowed。
+                // 但条目刚刚才枚举出来，不可能不存在 —— 照原样上报会让界面显示
+                // 「读取失败 / 未找到匹配条目」，而且「解锁读取」按钮的出现条件是
+                // errSecInteractionNotAllowed，于是这些条目彻底没法解锁。
+                // 这里翻译成语义正确的状态。
+                if outcome.status == errSecItemNotFound {
+                    item.dataStatus = errSecInteractionNotAllowed
+                } else {
+                    item.dataStatus = outcome.status
+                }
             }
+
+            item.searchIndex = makeSearchIndex(for: item)
             items.append(item)
         }
 
@@ -159,6 +176,15 @@ enum KeychainStore {
 
     private static func classOrder(_ itemClass: KeychainItemClass) -> Int {
         KeychainItemClass.allCases.firstIndex(of: itemClass) ?? 0
+    }
+
+    /// 把可检索字段拼成一个小写串，只在查询结束时算一次
+    private static func makeSearchIndex(for item: KeychainItem) -> String {
+        var parts = [item.displayTitle, item.account, item.accessGroup]
+        if item.isDataReadable, let text = item.data?.utf8Text {
+            parts.append(text)
+        }
+        return parts.joined(separator: "\n").lowercased()
     }
 
     /// 枚举单个类别。`accessGroup` 为 nil 表示不限定组。

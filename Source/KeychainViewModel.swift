@@ -3,6 +3,21 @@ import Security
 
 let untaggedFilterKey = "__untagged__"
 
+/// 筛选面板用的计数条目。
+/// 用结构体而不是具名元组：Swift 不支持指向元组元素的 KeyPath，
+/// `ForEach(..., id: \.group)` 对元组编译不过。
+struct ClassCount: Identifiable {
+    let itemClass: KeychainItemClass
+    let count: Int
+    var id: String { itemClass.rawValue }
+}
+
+struct GroupCount: Identifiable {
+    let group: String
+    let count: Int
+    var id: String { group }
+}
+
 /// 列表状态与全部业务动作。
 ///
 /// 所有 `@Published` 属性只在主线程写入；keychain 查询放到后台队列执行后再回主线程提交。
@@ -62,6 +77,10 @@ final class KeychainViewModel: ObservableObject {
 
     @Published var searchText = ""
     @Published var selectedTagFilter = ""
+    /// nil 表示不限类别
+    @Published var classFilter: KeychainItemClass?
+    /// 空串表示不限 Access Group
+    @Published var groupFilter = ""
     @Published var isSelectionMode = false
     @Published var selectedIDs: Set<String> = []
 
@@ -97,6 +116,14 @@ final class KeychainViewModel: ObservableObject {
     var filteredItems: [KeychainItem] {
         var result = items
 
+        if let classFilter {
+            result = result.filter { $0.itemClass == classFilter }
+        }
+
+        if !groupFilter.isEmpty {
+            result = result.filter { $0.accessGroup == groupFilter }
+        }
+
         switch selectedTagFilter {
         case "":
             break
@@ -108,17 +135,46 @@ final class KeychainViewModel: ObservableObject {
 
         let keyword = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         if !keyword.isEmpty {
-            result = result.filter { item in
-                item.displayTitle.lowercased().contains(keyword)
-                    || item.account.lowercased().contains(keyword)
-                    || item.accessGroup.lowercased().contains(keyword)
-                    || item.appTag.lowercased().contains(keyword)
-                    || (item.isDataReadable
-                        && (String(data: item.data ?? Data(), encoding: .utf8)?.lowercased().contains(keyword) ?? false))
+            // searchIndex 是查询结束时预先拼好的，这里只做子串比较
+            result = result.filter {
+                $0.searchIndex.contains(keyword) || $0.appTag.lowercased().contains(keyword)
             }
         }
 
         return result
+    }
+
+    var hasActiveFilter: Bool {
+        classFilter != nil || !groupFilter.isEmpty || !selectedTagFilter.isEmpty
+    }
+
+    /// 当前结果里实际出现过的类别及数量
+    var classCounts: [ClassCount] {
+        KeychainItemClass.allCases.compactMap { itemClass in
+            let count = items.filter { $0.itemClass == itemClass }.count
+            return count > 0 ? ClassCount(itemClass: itemClass, count: count) : nil
+        }
+    }
+
+    /// 当前结果里实际出现过的 Access Group 及数量，按条目数从多到少
+    var groupCounts: [GroupCount] {
+        var counts: [String: Int] = [:]
+        for item in items where !item.accessGroup.isEmpty {
+            counts[item.accessGroup, default: 0] += 1
+        }
+        return counts
+            .map { GroupCount(group: $0.key, count: $0.value) }
+            .sorted {
+                $0.count != $1.count
+                    ? $0.count > $1.count
+                    : $0.group.localizedStandardCompare($1.group) == .orderedAscending
+            }
+    }
+
+    func clearFilters() {
+        classFilter = nil
+        groupFilter = ""
+        selectedTagFilter = ""
     }
 
     var tagCounts: [String: Int] {
@@ -487,12 +543,21 @@ final class KeychainViewModel: ObservableObject {
     func clearDisplay() {
         items = []
         selectedIDs.removeAll()
-        selectedTagFilter = ""
+        clearFilters()
+        enumerationFailures = []
         statusMessage = "已清空显示，点击刷新重新查询"
     }
 
-    /// 当前标签筛选已无匹配项时退回「全部」，避免列表空白无从下手
+    /// 筛选条件已无匹配项时自动放开，避免列表空白却看不出原因
     private func resetTagFilterIfNeeded() {
+        if let classFilter, !items.contains(where: { $0.itemClass == classFilter }) {
+            self.classFilter = nil
+        }
+
+        if !groupFilter.isEmpty, !items.contains(where: { $0.accessGroup == groupFilter }) {
+            groupFilter = ""
+        }
+
         guard !selectedTagFilter.isEmpty else { return }
 
         let stillMatches: Bool

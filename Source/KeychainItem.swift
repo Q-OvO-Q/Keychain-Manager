@@ -108,6 +108,11 @@ struct KeychainItem: Identifiable {
     var data: Data?
     var dataStatus: OSStatus?
 
+    /// 预先拼好的小写检索串，查询结束时填充一次。
+    /// 上千条目时若每次按键都实时拼字符串并把 Data 转成 String，输入会明显卡顿。
+    /// 标签不在其中 —— 它随时可改，检索时单独查（字典查找，很便宜）。
+    var searchIndex: String = ""
+
     var appTag: String { TagManager.shared.tag(for: tagKey) }
 
     /// 无持久引用、也没有任何区分性属性时，任何删除查询都会波及同组其它条目
