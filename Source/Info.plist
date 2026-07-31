@@ -14,5 +14,7 @@
     <string>1</string>
     <key>UILaunchScreen</key>
     <dict/>
+    <key>NSFaceIDUsageDescription</key>
+    <string>使用 Face ID 读取受保护的 Keychain 条目内容</string>
 </dict>
 </plist>

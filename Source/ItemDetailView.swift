@@ -133,6 +133,22 @@ struct ItemDetailView: View {
                 Label(KeychainStore.message(for: status), systemImage: "exclamationmark.triangle")
                     .font(.caption)
                     .foregroundStyle(.orange)
+
+                // 枚举时一律跳过验证，受保护条目只能在这里由用户主动解锁
+                if status == errSecInteractionNotAllowed {
+                    Button {
+                        unlock(item)
+                    } label: {
+                        HStack {
+                            Label("解锁读取", systemImage: "faceid")
+                            if viewModel.isUnlocking {
+                                Spacer()
+                                ProgressView()
+                            }
+                        }
+                    }
+                    .disabled(viewModel.isUnlocking)
+                }
             }
 
             Picker("编辑模式", selection: modeBinding) {
@@ -261,7 +277,11 @@ struct ItemDetailView: View {
         didLoad = true
 
         tagValue = item.appTag
+        loadContent(from: item)
+    }
 
+    /// 只刷新数据内容，不动标签输入框（解锁后复用）
+    private func loadContent(from item: KeychainItem) {
         guard item.isDataReadable, let data = item.data else {
             content = ""
             isHexMode = false
@@ -274,6 +294,15 @@ struct ItemDetailView: View {
         } else {
             content = data.hexString
             isHexMode = true
+        }
+    }
+
+    private func unlock(_ item: KeychainItem) {
+        viewModel.unlockData(for: item) { updated in
+            guard let updated, updated.isDataReadable else { return }
+            conversionWarning = nil
+            loadContent(from: updated)
+            saveNotice = "已解锁，读取到 \(updated.data?.count ?? 0) 字节"
         }
     }
 

@@ -36,6 +36,7 @@ final class KeychainViewModel: ObservableObject {
 
     @Published private(set) var items: [KeychainItem] = []
     @Published private(set) var isLoading = false
+    @Published private(set) var isUnlocking = false
     @Published var statusMessage = "正在读取描述文件…"
     @Published var alertMessage: String?
 
@@ -321,6 +322,36 @@ final class KeychainViewModel: ObservableObject {
 
         guard !keys.isEmpty else { return }
         TagManager.shared.setTag(pending.tag, for: keys)
+    }
+
+    // MARK: - 解锁受保护条目
+
+    /// 主动解锁：这是唯一允许弹出生物识别的入口。
+    /// 验证框会阻塞发起线程，因此必须放到后台队列，否则主线程卡住会被看门狗杀掉。
+    func unlockData(for item: KeychainItem, completion: @escaping (KeychainItem?) -> Void) {
+        guard !isUnlocking else { return }
+        isUnlocking = true
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let outcome = KeychainStore.copyData(for: item, allowAuthenticationUI: true)
+
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isUnlocking = false
+
+                var updated: KeychainItem?
+                if let index = self.items.firstIndex(where: { $0.id == item.id }) {
+                    self.items[index].data = outcome.data
+                    self.items[index].dataStatus = outcome.status
+                    updated = self.items[index]
+                }
+
+                if outcome.status != errSecSuccess {
+                    self.alertMessage = "解锁失败：\(KeychainStore.message(for: outcome.status))"
+                }
+                completion(updated)
+            }
+        }
     }
 
     // MARK: - 修改数据
