@@ -20,12 +20,20 @@ enum KeychainScope: Equatable, Hashable {
 
 struct KeychainClassError {
     let itemClass: KeychainItemClass
+    /// nil 表示这次是不限定 Access Group 的查询
+    let accessGroup: String?
     let status: OSStatus
+
+    var description: String {
+        let scope = accessGroup.map { "「\($0)」" } ?? ""
+        return "\(itemClass.displayName)\(scope)：\(KeychainStore.message(for: status))"
+    }
 }
 
 struct KeychainFetchResult {
     var items: [KeychainItem] = []
-    /// 按类别记录查询失败原因；只要有失败就不能把「查到 0 条」当成「确实没有」
+    /// 逐个类别 / Access Group 记录失败原因；
+    /// 只要有失败就不能把「查到 0 条」当成「确实没有」
     var classErrors: [KeychainClassError] = []
 }
 
@@ -52,44 +60,70 @@ enum KeychainStore {
     /// 2. 再逐条按持久引用取数据，单条失败不影响其它条目照常显示和删除。
     static func fetchItems(scope: KeychainScope,
                           classes: [KeychainItemClass],
+                          knownGroups: [String] = [],
+                          includeProtected: Bool = false,
                           loadData: Bool = true,
                           progress: ((String) -> Void)? = nil) -> KeychainFetchResult {
         var result = KeychainFetchResult()
         var rows: [(KeychainItemClass, [String: Any])] = []
 
+        // 逐组枚举而不是一次不限组的广查询。
+        //
+        // 不限组查询会横跨全部 entitlement 组，只要其中一个组出问题
+        // （实机上是 com.apple.token 触发验证），整个类别一起返回 errSecAuthFailed，
+        // 该类别的条目就全部看不到了。逐组之后单个组失败只影响它自己。
+        //
+        // 前提是拿得到完整的组列表 —— 通配符组在查询里是**字面匹配**，
+        // 用 `TEAMID.*` 查只会返回 agrp 恰好等于该字符串的条目，
+        // 不会展开命中 `TEAMID.foo.bar`，所以必须逐个真实组名去查。
+        let targets: [String?]
+        switch scope {
+        case .group(let group):
+            targets = [group]
+        case .allAccessible:
+            // 组列表为空时退回不限组查询，至少还能看到点东西
+            targets = knownGroups.isEmpty ? [nil] : knownGroups.map { Optional($0) }
+        }
+
+        let total = classes.count * targets.count
+        var completed = 0
+
         for itemClass in classes {
-            progress?("正在枚举\(itemClass.displayName)条目…")
-
-            var query: [String: Any] = [
-                kSecClass as String: itemClass.secClass,
-                kSecMatchLimit as String: kSecMatchLimitAll,
-                kSecReturnAttributes as String: true,
-                kSecReturnPersistentRef as String: true,
-                // 缺省只返回非同步条目，iCloud 同步的条目会整批隐身
-                kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
-            ]
-            if case .group(let group) = scope {
-                query[kSecAttrAccessGroup as String] = group
-            }
-
-            var output: AnyObject?
-            let status = SecItemCopyMatching(query as CFDictionary, &output)
-
-            switch status {
-            case errSecSuccess:
-                if let array = output as? [[String: Any]] {
-                    for attributes in array {
-                        rows.append((itemClass, attributes))
-                    }
-                } else if let single = output as? [String: Any] {
-                    rows.append((itemClass, single))
+            for target in targets {
+                completed += 1
+                if total <= 1 || completed % 10 == 0 || completed == total {
+                    progress?("正在枚举\(itemClass.displayName)条目 \(completed)/\(total)…")
                 }
-            case errSecItemNotFound:
-                break
-            default:
-                result.classErrors.append(KeychainClassError(itemClass: itemClass, status: status))
+
+                let outcome = enumerate(itemClass: itemClass,
+                                       accessGroup: target,
+                                       skipAuthenticationUI: !includeProtected)
+
+                switch outcome.status {
+                case errSecSuccess, errSecItemNotFound:
+                    rows.append(contentsOf: outcome.rows.map { (itemClass, $0) })
+
+                default:
+                    // 允许验证时失败（用户取消、验证不通过、整批认证失败等）：
+                    // 退回跳过验证再查一次，至少把不需要验证的条目拿到手，
+                    // 同时如实记录失败，好定位是哪个组里藏着受保护条目。
+                    if includeProtected {
+                        let retry = enumerate(itemClass: itemClass,
+                                             accessGroup: target,
+                                             skipAuthenticationUI: true)
+                        if retry.status == errSecSuccess || retry.status == errSecItemNotFound {
+                            rows.append(contentsOf: retry.rows.map { (itemClass, $0) })
+                        }
+                    }
+                    result.classErrors.append(KeychainClassError(itemClass: itemClass,
+                                                                 accessGroup: target,
+                                                                 status: outcome.status))
+                }
             }
         }
+
+        // 同一条目可能被多个组名命中（例如字面存在的通配符组），按持久引用去重
+        rows = deduplicate(rows)
 
         var items: [KeychainItem] = []
         items.reserveCapacity(rows.count)
@@ -125,6 +159,59 @@ enum KeychainStore {
 
     private static func classOrder(_ itemClass: KeychainItemClass) -> Int {
         KeychainItemClass.allCases.firstIndex(of: itemClass) ?? 0
+    }
+
+    /// 枚举单个类别。`accessGroup` 为 nil 表示不限定组。
+    ///
+    /// `skipAuthenticationUI` 决定受 `SecAccessControl` 保护的条目如何处理：
+    /// 跳过则它们不会出现在结果里，不跳过则系统可能弹出验证。
+    ///
+    /// 注意：不能假设「取属性不需要解密所以枚举不会弹验证」。iOS 13 起 keychain 的
+    /// 元数据本身也是加密的，返回属性同样要解密，受保护条目在枚举阶段就会要求验证 ——
+    /// 实机上正是枚举阶段弹的验证框。
+    private static func enumerate(itemClass: KeychainItemClass,
+                                 accessGroup: String?,
+                                 skipAuthenticationUI: Bool) -> (rows: [[String: Any]], status: OSStatus) {
+        var query: [String: Any] = [
+            kSecClass as String: itemClass.secClass,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true,
+            kSecReturnPersistentRef as String: true,
+            // 缺省只返回非同步条目，iCloud 同步的条目会整批隐身
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
+        ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        applyAuthenticationPolicy(to: &query, allowUI: !skipAuthenticationUI)
+
+        var output: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &output)
+        guard status == errSecSuccess else { return ([], status) }
+
+        if let array = output as? [[String: Any]] { return (array, status) }
+        if let single = output as? [String: Any] { return ([single], status) }
+        return ([], status)
+    }
+
+    /// 按持久引用去重；拿不到持久引用的条目一律保留，宁可重复也不丢
+    private static func deduplicate(
+        _ rows: [(KeychainItemClass, [String: Any])]
+    ) -> [(KeychainItemClass, [String: Any])] {
+        var seen = Set<Data>()
+        var unique: [(KeychainItemClass, [String: Any])] = []
+        unique.reserveCapacity(rows.count)
+
+        for row in rows {
+            guard let reference = row.1[kSecValuePersistentRef as String] as? Data else {
+                unique.append(row)
+                continue
+            }
+            if seen.insert(reference).inserted {
+                unique.append(row)
+            }
+        }
+        return unique
     }
 
     /// 单条读取数据；返回的 status 用于向用户解释「为什么这条读不出来」。

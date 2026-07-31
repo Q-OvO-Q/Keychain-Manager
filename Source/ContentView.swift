@@ -16,6 +16,7 @@ struct ContentView: View {
     @State private var showAddItem = false
     @State private var showBatchTagSheet = false
     @State private var confirmBatchDelete = false
+    @State private var showFailureDetail = false
 
     var body: some View {
         NavigationStack {
@@ -48,6 +49,9 @@ struct ContentView: View {
             BatchTagSheet(count: viewModel.selectedIDs.count) { tag in
                 viewModel.applyTagToSelection(tag)
             }
+        }
+        .sheet(isPresented: $showFailureDetail) {
+            FailureDetailView(failures: viewModel.enumerationFailures)
         }
         .alert("操作未完成", isPresented: alertPresented) {
             Button("好", role: .cancel) {}
@@ -304,16 +308,25 @@ struct ContentView: View {
     // MARK: - 状态栏
 
     private var statusBar: some View {
-        HStack(spacing: 6) {
-            if viewModel.isLoading {
-                ProgressView().scaleEffect(0.7)
+        Button {
+            guard !viewModel.enumerationFailures.isEmpty else { return }
+            showFailureDetail = true
+        } label: {
+            HStack(spacing: 6) {
+                if viewModel.isLoading {
+                    ProgressView().scaleEffect(0.7)
+                }
+                Text(viewModel.statusMessage)
+                    .font(.caption2)
+                    .foregroundStyle(viewModel.enumerationFailures.isEmpty ? Color.secondary : Color.orange)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
+                Spacer()
             }
-            Text(viewModel.statusMessage)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-            Spacer()
+            .contentShape(Rectangle())
         }
+        .buttonStyle(.plain)
+        .disabled(viewModel.enumerationFailures.isEmpty)
         .padding(.horizontal)
         .padding(.vertical, 6)
         .background(Color.secondary.opacity(0.08))
@@ -408,14 +421,24 @@ struct KeychainItemRow: View {
 struct ScopeSettingsView: View {
     @ObservedObject var viewModel: KeychainViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var groupFilter = ""
+
+    /// 签名 entitlements 里动辄上百个组（LiveContainer 有 128 个 shared.N），需要筛选才能用
+    private var matchingGroups: [String] {
+        let keyword = groupFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !keyword.isEmpty else { return viewModel.detectedGroups }
+        return viewModel.detectedGroups.filter { $0.lowercased().contains(keyword) }
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     Toggle("查询全部可访问条目", isOn: $viewModel.useAllGroups)
+                } header: {
+                    Text("查询范围")
                 } footer: {
-                    Text("开启时不限定 Access Group，返回本应用有权访问的所有条目。若通配符 Group 因缺少 entitlement 查不到数据，请保持开启。")
+                    Text("开启后遍历下方全部 \(viewModel.detectedGroups.count) 个 Access Group。逐组查询可以避免某个组出问题时整个类别一起查不到。")
                 }
 
                 if !viewModel.useAllGroups {
@@ -423,9 +446,17 @@ struct ScopeSettingsView: View {
                         TextField("例如 TEAMID.com.example.app", text: $viewModel.targetGroup)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                    }
 
-                        if !viewModel.detectedGroups.isEmpty {
-                            ForEach(viewModel.detectedGroups, id: \.self) { group in
+                    if !viewModel.detectedGroups.isEmpty {
+                        Section {
+                            if viewModel.detectedGroups.count > 8 {
+                                TextField("筛选组名", text: $groupFilter)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                            }
+
+                            ForEach(matchingGroups, id: \.self) { group in
                                 Button {
                                     viewModel.targetGroup = group
                                 } label: {
@@ -441,8 +472,16 @@ struct ScopeSettingsView: View {
                                     }
                                 }
                             }
+                        } header: {
+                            Text("已识别的组（\(matchingGroups.count)/\(viewModel.detectedGroups.count)）")
                         }
                     }
+                }
+
+                Section {
+                    Toggle("包含受保护条目", isOn: $viewModel.includeProtectedItems)
+                } footer: {
+                    Text("关闭时跳过需要验证的条目，不会弹出验证框。开启后这类条目才会出现在列表里，但系统可能弹出 Face ID；某个组验证失败时会自动退回跳过重查，因此不会比关闭时拿到更少的条目。")
                 }
 
                 Section {
@@ -495,6 +534,39 @@ struct ScopeSettingsView: View {
                 }
             }
         )
+    }
+}
+
+// MARK: - 查询失败详情
+
+/// 逐组枚举下失败项可能有几十条，状态栏放不下。
+/// 弹验证的到底是哪个组、哪个类别，靠这里定位。
+struct FailureDetailView: View {
+    let failures: [String]
+
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(Array(failures.enumerated()), id: \.offset) { _, failure in
+                        Text(failure)
+                            .font(.caption)
+                            .textSelection(.enabled)
+                    }
+                } footer: {
+                    Text("每一行是一个「类别 + Access Group」组合。若某组报认证相关错误，说明受保护条目就在该组里。")
+                }
+            }
+            .navigationTitle("查询失败 \(failures.count) 项")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") { dismiss() }
+                }
+            }
+        }
     }
 }
 
