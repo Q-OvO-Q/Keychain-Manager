@@ -176,7 +176,7 @@ struct ContentView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     filterChip(label: "全部",
-                               count: viewModel.items.count,
+                               count: viewModel.tagFacetTotal,
                                isSelected: viewModel.selectedTagFilter.isEmpty) {
                         viewModel.selectedTagFilter = ""
                     }
@@ -401,6 +401,7 @@ struct KeychainItemRow: View {
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
         .padding(.vertical, 2)
@@ -475,6 +476,8 @@ struct ScopeSettingsView: View {
                                         .font(.callout)
                                         .foregroundStyle(.primary)
                                         .lineLimit(1)
+                                        // 同上：尾部编号才是区分点
+                                        .truncationMode(.middle)
                                     Spacer()
                                     if viewModel.targetGroup == group {
                                         Image(systemName: "checkmark")
@@ -570,7 +573,7 @@ struct FilterSheet: View {
             Form {
                 Section("类别") {
                     selectionRow(title: "全部",
-                                 count: viewModel.items.count,
+                                 count: viewModel.classFacetTotal,
                                  isSelected: viewModel.classFilter == nil) {
                         viewModel.classFilter = nil
                     }
@@ -591,7 +594,7 @@ struct FilterSheet: View {
                     }
 
                     selectionRow(title: "全部",
-                                 count: viewModel.items.count,
+                                 count: viewModel.groupFacetTotal,
                                  isSelected: viewModel.groupFilter.isEmpty) {
                         viewModel.groupFilter = ""
                     }
@@ -633,6 +636,8 @@ struct FilterSheet: View {
                     .font(.callout)
                     .foregroundStyle(.primary)
                     .lineLimit(1)
+                    // 组名区别全在尾部的编号上，掐中间才看得见 shared.93 的 93
+                    .truncationMode(.middle)
                 Spacer()
                 Text("\(count)")
                     .font(.caption)

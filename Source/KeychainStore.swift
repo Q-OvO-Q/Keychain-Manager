@@ -38,6 +38,35 @@ struct KeychainFetchResult {
     var classErrors: [KeychainClassError] = []
 }
 
+// MARK: - 保护级别选项
+
+struct AccessibleOption: Identifiable {
+    let title: String
+    let value: String
+    var id: String { value }
+
+    static let all: [AccessibleOption] = [
+        AccessibleOption(title: "解锁后可访问",
+                         value: kSecAttrAccessibleWhenUnlocked as String),
+        AccessibleOption(title: "首次解锁后可访问",
+                         value: kSecAttrAccessibleAfterFirstUnlock as String),
+        AccessibleOption(title: "解锁后 · 仅本机",
+                         value: kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String),
+        AccessibleOption(title: "首次解锁后 · 仅本机",
+                         value: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String),
+        AccessibleOption(title: "需设置密码 · 仅本机",
+                         value: kSecAttrAccessibleWhenPasscodeSetThisDeviceOnly as String)
+    ]
+
+    /// 条目当前值可能是已废弃的取值（dk / dku），不在标准列表里。
+    /// 那样 Picker 会选不中任何一项而显示空白，所以按需补进去。
+    static func options(including current: String) -> [AccessibleOption] {
+        guard !current.isEmpty, !all.contains(where: { $0.value == current }) else { return all }
+        let label = KeychainAttributeFormatter.accessibilityDescription(current)
+        return all + [AccessibleOption(title: label, value: current)]
+    }
+}
+
 // MARK: - 操作结果
 
 struct KeychainOperationFailure {
@@ -401,6 +430,98 @@ enum KeychainStore {
 
     // MARK: - 修改
 
+    /// 可以改的元数据。
+    ///
+    /// 主键属性（account / service / server / agrp / sync 等）不在此列：
+    /// 改它们等于把条目挪到另一个主键上，会和已存在的条目撞车返回
+    /// errSecDuplicateItem，风险远大于收益。这里只放纯描述性字段
+    /// 和保护级别。
+    enum EditableAttribute: String, CaseIterable, Identifiable {
+        case label
+        case comment
+        case description
+        case accessible
+        case invisible
+        case negative
+
+        var id: String { rawValue }
+
+        var key: String {
+            switch self {
+            case .label:       return kSecAttrLabel as String
+            case .comment:     return kSecAttrComment as String
+            case .description: return kSecAttrDescription as String
+            case .accessible:  return kSecAttrAccessible as String
+            case .invisible:   return kSecAttrIsInvisible as String
+            case .negative:    return kSecAttrIsNegative as String
+            }
+        }
+
+        var displayName: String {
+            switch self {
+            case .label:       return "标签 (labl)"
+            case .comment:     return "备注 (icmt)"
+            case .description: return "描述 (desc)"
+            case .accessible:  return "可访问性 (pdmn)"
+            case .invisible:   return "隐藏 (invi)"
+            case .negative:    return "占位条目 (nega)"
+            }
+        }
+
+        var isBoolean: Bool {
+            self == .invisible || self == .negative
+        }
+
+        /// 证书 / 密钥的描述性字段由系统维护，只放开密码类
+        static func available(for itemClass: KeychainItemClass) -> [EditableAttribute] {
+            itemClass.supportsDataEditing ? allCases : []
+        }
+    }
+
+    /// 重新读取单条条目的属性。
+    ///
+    /// 改完元数据后用它就地刷新，不必为一次改动重跑整轮逐组查询。
+    /// 保留原有的数据与读取状态 —— 这次改的是属性，数据没动。
+    static func reload(_ item: KeychainItem) -> KeychainItem? {
+        guard let ref = item.persistentRef else { return nil }
+
+        let query: [String: Any] = [
+            kSecValuePersistentRef as String: ref,
+            kSecReturnAttributes as String: true
+        ]
+
+        var output: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &output) == errSecSuccess,
+              var attributes = output as? [String: Any] else {
+            return nil
+        }
+
+        // 按引用查询不一定回传 v_PersistentRef，补回去，id 才能保持不变
+        attributes[kSecValuePersistentRef as String] = ref
+
+        var reloaded = KeychainItem(itemClass: item.itemClass,
+                                    attributes: attributes,
+                                    fallbackIndex: 0)
+        reloaded.data = item.data
+        reloaded.dataStatus = item.dataStatus
+        reloaded.searchIndex = makeSearchIndex(for: reloaded)
+        return reloaded
+    }
+
+    /// 批量修改元数据。传入空字符串会把该属性置空。
+    static func updateAttributes(_ item: KeychainItem, changes: [String: Any]) -> OSStatus {
+        guard !changes.isEmpty else { return errSecSuccess }
+        guard item.canBeTargeted else { return errSecParam }
+
+        if let ref = item.persistentRef {
+            let query: [String: Any] = [kSecValuePersistentRef as String: ref]
+            let status = SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+            if status == errSecSuccess { return errSecSuccess }
+        }
+
+        return SecItemUpdate(item.primaryKeyQuery as CFDictionary, changes as CFDictionary)
+    }
+
     static func updateData(_ item: KeychainItem, to data: Data) -> OSStatus {
         guard item.itemClass.supportsDataEditing else { return errSecUnimplemented }
         guard item.canBeTargeted else { return errSecParam }
@@ -427,6 +548,10 @@ enum KeychainStore {
         var accessGroup: String = ""
         var accessible: String = kSecAttrAccessibleWhenUnlocked as String
         var label: String = ""
+        var itemDescription: String = ""
+        var comment: String = ""
+        var isInvisible = false
+        var isNegative = false
     }
 
     static func add(_ newItem: NewItem) -> OSStatus {
@@ -447,6 +572,18 @@ enum KeychainStore {
 
         if !newItem.label.isEmpty {
             attributes[kSecAttrLabel as String] = newItem.label
+        }
+        if !newItem.itemDescription.isEmpty {
+            attributes[kSecAttrDescription as String] = newItem.itemDescription
+        }
+        if !newItem.comment.isEmpty {
+            attributes[kSecAttrComment as String] = newItem.comment
+        }
+        if newItem.isInvisible {
+            attributes[kSecAttrIsInvisible as String] = true
+        }
+        if newItem.isNegative {
+            attributes[kSecAttrIsNegative as String] = true
         }
 
         // 通配符 Group 只是权限声明，不是可写入的实际 Group

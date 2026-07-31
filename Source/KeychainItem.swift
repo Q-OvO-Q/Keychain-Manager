@@ -346,7 +346,45 @@ enum KeychainAttributeFormatter {
         (kSecAttrSubjectKeyID as String, "主体密钥 ID"),
         (kSecAttrPublicKeyHash as String, "公钥哈希"),
         (kSecValueData as String, "数据"),
-        (kSecValuePersistentRef as String, "持久引用")
+        (kSecValuePersistentRef as String, "持久引用"),
+
+        // 以下短码没有对应的公开常量，但系统确实会回传，只能按 securityd 的
+        // 表结构直接写字面量。缺了它们详情页就会出现一串看不懂的四字母。
+        ("accc", "访问控制 SecAccessControl"),
+        ("tomb", "墓碑标记（已删除待同步）"),
+        ("musr", "多用户 / Persona 标识"),
+        ("sha1", "证书 SHA-1 指纹"),
+        ("vwht", "同步视图提示 View Hint"),
+        ("tkid", "令牌 ID"),
+        ("sysb", "系统绑定"),
+        ("UUID", "条目 UUID"),
+        ("persistref", "持久引用"),
+        ("alis", "别名 Alias"),
+        ("scrp", "脚本码"),
+        ("cusi", "自定义图标"),
+        ("prot", "保护数据"),
+        ("pcss", "受保护类密钥"),
+        ("pcsk", "受保护类公钥"),
+        ("pcsi", "受保护类标识"),
+        ("sdat", "生效时间"),
+        ("edat", "失效时间"),
+        // 密钥用途位
+        ("sens", "敏感 Sensitive"),
+        ("asen", "总是敏感"),
+        ("extr", "可导出"),
+        ("next", "永不可导出"),
+        ("encr", "可用于加密"),
+        ("decr", "可用于解密"),
+        ("drve", "可用于派生"),
+        ("sign", "可用于签名"),
+        ("vrfy", "可用于验签"),
+        ("snrc", "可用于恢复签名"),
+        ("vyrc", "可用于恢复验签"),
+        ("wrap", "可用于包装密钥"),
+        ("unwp", "可用于解包密钥"),
+        ("priv", "私钥"),
+        ("modi", "可修改"),
+        ("perm", "永久存储")
     ])
 
     /// 保留首次出现的映射，重复键直接忽略

@@ -16,23 +16,10 @@ struct AddItemView: View {
     @State private var accessible = kSecAttrAccessibleWhenUnlocked as String
     @State private var accessGroup = ""
     @State private var tagValue = ""
-
-    private struct AccessibleOption: Identifiable {
-        let title: String
-        let value: String
-        var id: String { value }
-    }
-
-    private static let accessibleOptions: [AccessibleOption] = [
-        AccessibleOption(title: "解锁后可访问",
-                         value: kSecAttrAccessibleWhenUnlocked as String),
-        AccessibleOption(title: "首次解锁后可访问",
-                         value: kSecAttrAccessibleAfterFirstUnlock as String),
-        AccessibleOption(title: "解锁后可访问 · 仅本机",
-                         value: kSecAttrAccessibleWhenUnlockedThisDeviceOnly as String),
-        AccessibleOption(title: "首次解锁后可访问 · 仅本机",
-                         value: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as String)
-    ]
+    @State private var itemDescription = ""
+    @State private var comment = ""
+    @State private var isInvisible = false
+    @State private var isNegative = false
 
     /// 通配符 Group 只是权限声明，不能作为写入目标
     private var writableGroups: [String] {
@@ -75,7 +62,7 @@ struct AddItemView: View {
 
                 Section {
                     Picker("可访问性", selection: $accessible) {
-                        ForEach(AddItemView.accessibleOptions) { option in
+                        ForEach(AccessibleOption.all) { option in
                             Text(option.title).tag(option.value)
                         }
                     }
@@ -87,9 +74,19 @@ struct AddItemView: View {
 
                 accessGroupSection
 
-                Section("Label（可选）") {
-                    TextField("显示名称", text: $label)
+                Section {
+                    TextField("标签 (labl)", text: $label)
                         .textInputAutocapitalization(.never)
+                    TextField("描述 (desc)", text: $itemDescription)
+                        .textInputAutocapitalization(.never)
+                    TextField("备注 (icmt)", text: $comment)
+                        .textInputAutocapitalization(.never)
+                    Toggle("隐藏 (invi)", isOn: $isInvisible)
+                    Toggle("占位条目 (nega)", isOn: $isNegative)
+                } header: {
+                    Text("元数据（可选）")
+                } footer: {
+                    Text("与详情页「可修改的元数据」一致，写入后仍可修改。")
                 }
 
                 tagSection
@@ -126,6 +123,13 @@ struct AddItemView: View {
                 .font(.system(.body, design: .monospaced))
                 .autocorrectionDisabled()
                 .textInputAutocapitalization(.never)
+                // 同详情页：Form 里的 TextEditor 底色会盖住分隔线
+                .scrollContentBackground(.hidden)
+                .padding(6)
+                .background(
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.secondary.opacity(0.08))
+                )
         } header: {
             Text("Data（内容）")
         } footer: {
@@ -224,6 +228,10 @@ struct AddItemView: View {
         newItem.accessGroup = accessGroup
         newItem.accessible = accessible
         newItem.label = label
+        newItem.itemDescription = itemDescription
+        newItem.comment = comment
+        newItem.isInvisible = isInvisible
+        newItem.isNegative = isNegative
 
         if viewModel.add(newItem, tag: tagValue) {
             dismiss()
