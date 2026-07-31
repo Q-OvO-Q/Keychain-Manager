@@ -432,14 +432,17 @@ enum KeychainStore {
 
     /// 可以改的元数据。
     ///
-    /// 主键属性（account / service / server / agrp / sync 等）不在此列：
-    /// 改它们等于把条目挪到另一个主键上，会和已存在的条目撞车返回
-    /// errSecDuplicateItem，风险远大于收益。这里只放纯描述性字段
-    /// 和保护级别。
+    /// 主键属性不在此列：改它们等于把条目挪到另一个主键上，会和已存在的条目
+    /// 撞车返回 errSecDuplicateItem，风险远大于收益。
+    ///
+    /// 网络密码看起来元数据更多（srvr / ptcl / atyp / port / path / sdmn），
+    /// 但那几项**全都是它的主键**，所以两类密码可改的其实是同一批非主键字段。
     enum EditableAttribute: String, CaseIterable, Identifiable {
         case label
         case comment
         case description
+        case creator
+        case type
         case accessible
         case invisible
         case negative
@@ -451,6 +454,8 @@ enum KeychainStore {
             case .label:       return kSecAttrLabel as String
             case .comment:     return kSecAttrComment as String
             case .description: return kSecAttrDescription as String
+            case .creator:     return kSecAttrCreator as String
+            case .type:        return kSecAttrType as String
             case .accessible:  return kSecAttrAccessible as String
             case .invisible:   return kSecAttrIsInvisible as String
             case .negative:    return kSecAttrIsNegative as String
@@ -462,19 +467,113 @@ enum KeychainStore {
             case .label:       return "标签 (labl)"
             case .comment:     return "备注 (icmt)"
             case .description: return "描述 (desc)"
+            case .creator:     return "创建者 (crtr)"
+            case .type:        return "类型码 (type)"
             case .accessible:  return "可访问性 (pdmn)"
             case .invisible:   return "隐藏 (invi)"
             case .negative:    return "占位条目 (nega)"
             }
         }
 
-        var isBoolean: Bool {
-            self == .invisible || self == .negative
+        enum Kind {
+            case text
+            case boolean
+            case accessibility
+            /// 四字符码：系统按 32 位整数存储，写成 'aapl' 这样四个字符更好认
+            case fourCharCode
         }
 
-        /// 证书 / 密钥的描述性字段由系统维护，只放开密码类
+        var kind: Kind {
+            switch self {
+            case .invisible, .negative:  return .boolean
+            case .accessible:            return .accessibility
+            case .creator, .type:        return .fourCharCode
+            default:                     return .text
+            }
+        }
+
         static func available(for itemClass: KeychainItemClass) -> [EditableAttribute] {
-            itemClass.supportsDataEditing ? allCases : []
+            switch itemClass {
+            case .genericPassword, .internetPassword:
+                return allCases
+            case .key, .certificate:
+                // 这两类的其余字段要么是主键，要么由系统从密钥 / 证书本身派生
+                // （subj / issr / slnr / skid / pkhh），改了只会和实际内容对不上。
+                // 但 labl 和 pdmn 是普通属性，没有理由锁死。
+                return [.label, .accessible]
+            }
+        }
+    }
+
+    /// 取值来自 Security 框架常量的属性，用选择器而不是自由输入
+    struct AttributeOption: Identifiable {
+        let title: String
+        let value: String
+        var id: String { value.isEmpty ? "__unset__" : value }
+
+        static let unset = AttributeOption(title: "不设置", value: "")
+
+        static let protocols: [AttributeOption] = [unset] + [
+            ("HTTP", kSecAttrProtocolHTTP), ("HTTPS", kSecAttrProtocolHTTPS),
+            ("FTP", kSecAttrProtocolFTP), ("FTPS", kSecAttrProtocolFTPS),
+            ("SSH", kSecAttrProtocolSSH), ("SMTP", kSecAttrProtocolSMTP),
+            ("IMAP", kSecAttrProtocolIMAP), ("IMAPS", kSecAttrProtocolIMAPS),
+            ("POP3", kSecAttrProtocolPOP3), ("POP3S", kSecAttrProtocolPOP3S),
+            ("LDAP", kSecAttrProtocolLDAP), ("LDAPS", kSecAttrProtocolLDAPS),
+            ("SMB", kSecAttrProtocolSMB), ("IRC", kSecAttrProtocolIRC),
+            ("Telnet", kSecAttrProtocolTelnet), ("SOCKS", kSecAttrProtocolSOCKS)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
+
+        static let authenticationTypes: [AttributeOption] = [unset] + [
+            ("HTTP Basic", kSecAttrAuthenticationTypeHTTPBasic),
+            ("HTTP Digest", kSecAttrAuthenticationTypeHTTPDigest),
+            ("HTML 表单", kSecAttrAuthenticationTypeHTMLForm),
+            ("NTLM", kSecAttrAuthenticationTypeNTLM),
+            ("MSN", kSecAttrAuthenticationTypeMSN),
+            ("DPA", kSecAttrAuthenticationTypeDPA),
+            ("RPA", kSecAttrAuthenticationTypeRPA),
+            ("默认", kSecAttrAuthenticationTypeDefault)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
+
+        static let keyClasses: [AttributeOption] = [unset] + [
+            ("公钥", kSecAttrKeyClassPublic),
+            ("私钥", kSecAttrKeyClassPrivate),
+            ("对称密钥", kSecAttrKeyClassSymmetric)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
+
+        static let keyTypes: [AttributeOption] = [unset] + [
+            ("RSA", kSecAttrKeyTypeRSA),
+            ("EC (SEC Prime Random)", kSecAttrKeyTypeECSECPrimeRandom)
+        ].map { AttributeOption(title: $0.0, value: $0.1 as String) }
+    }
+
+    /// `kSecAttrCreator` / `kSecAttrType` 存的是 32 位整数，
+    /// 但惯例是当成四个 ASCII 字符看（例如 'aapl'）。两种写法都接受。
+    enum FourCharCode {
+        static func text(from value: Any?) -> String {
+            guard let number = value as? NSNumber else { return "" }
+            let raw = number.uint32Value
+            let bytes = [UInt8(truncatingIfNeeded: raw >> 24),
+                         UInt8(truncatingIfNeeded: raw >> 16),
+                         UInt8(truncatingIfNeeded: raw >> 8),
+                         UInt8(truncatingIfNeeded: raw)]
+            // 四个字节都可打印才按字符显示，否则退回十进制
+            if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
+                return String(decoding: bytes, as: UTF8.self)
+            }
+            return String(raw)
+        }
+
+        static func number(from text: String) -> NSNumber? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return nil }
+
+            if let decimal = UInt32(trimmed) { return NSNumber(value: decimal) }
+
+            let bytes = Array(trimmed.utf8)
+            guard bytes.count == 4 else { return nil }
+            let raw = bytes.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            return NSNumber(value: raw)
         }
     }
 
@@ -541,49 +640,124 @@ enum KeychainStore {
 
     struct NewItem {
         var itemClass: KeychainItemClass = .genericPassword
-        /// genp 写入 kSecAttrService，inet 写入 kSecAttrServer
+        /// genp 写入 kSecAttrService，inet 写入 kSecAttrServer；密钥 / 证书不用
         var title: String = ""
         var account: String = ""
         var data: Data = Data()
         var accessGroup: String = ""
         var accessible: String = kSecAttrAccessibleWhenUnlocked as String
+        var synchronizable = false
+
+        // 描述性字段
         var label: String = ""
         var itemDescription: String = ""
         var comment: String = ""
+        /// 四字符码文本，留空表示不设置
+        var creator: String = ""
+        var typeCode: String = ""
         var isInvisible = false
         var isNegative = false
+
+        // 通用密码
+        var generic: String = ""
+
+        // 网络密码（这几项都是它主键的一部分，只能在新增时定）
+        var securityDomain: String = ""
+        var networkProtocol: String = ""
+        var authenticationType: String = ""
+        var port: String = ""
+        var path: String = ""
+
+        // 密钥
+        var keyClass: String = ""
+        var keyType: String = ""
+        var applicationTag: String = ""
     }
 
     static func add(_ newItem: NewItem) -> OSStatus {
-        guard newItem.itemClass.supportsDataEditing else { return errSecUnimplemented }
-
         var attributes: [String: Any] = [
             kSecClass as String: newItem.itemClass.secClass,
-            kSecAttrAccount as String: newItem.account,
-            kSecValueData as String: newItem.data,
             kSecAttrAccessible as String: newItem.accessible
         ]
+        if newItem.synchronizable {
+            attributes[kSecAttrSynchronizable as String] = true
+        }
 
-        if newItem.itemClass == .internetPassword {
-            attributes[kSecAttrServer as String] = newItem.title
-        } else {
+        switch newItem.itemClass {
+        case .genericPassword:
             attributes[kSecAttrService as String] = newItem.title
+            attributes[kSecAttrAccount as String] = newItem.account
+            attributes[kSecValueData as String] = newItem.data
+            if let generic = newItem.generic.data(using: .utf8), !generic.isEmpty {
+                attributes[kSecAttrGeneric as String] = generic
+            }
+
+        case .internetPassword:
+            attributes[kSecAttrServer as String] = newItem.title
+            attributes[kSecAttrAccount as String] = newItem.account
+            attributes[kSecValueData as String] = newItem.data
+            if !newItem.securityDomain.isEmpty {
+                attributes[kSecAttrSecurityDomain as String] = newItem.securityDomain
+            }
+            if !newItem.networkProtocol.isEmpty {
+                attributes[kSecAttrProtocol as String] = newItem.networkProtocol
+            }
+            if !newItem.authenticationType.isEmpty {
+                attributes[kSecAttrAuthenticationType as String] = newItem.authenticationType
+            }
+            if let port = Int(newItem.port.trimmingCharacters(in: .whitespaces)), port > 0 {
+                attributes[kSecAttrPort as String] = port
+            }
+            if !newItem.path.isEmpty {
+                attributes[kSecAttrPath as String] = newItem.path
+            }
+
+        case .certificate:
+            // 证书不是「一堆属性」，而是一份 DER 数据：subj / issr / slnr 都由系统
+            // 从证书本身解析，手填没有意义也不被接受。所以先构造 SecCertificate，
+            // 传 kSecValueRef 而不是 kSecValueData。
+            guard let certificate = SecCertificateCreateWithData(nil, newItem.data as CFData) else {
+                return errSecDecode
+            }
+            attributes[kSecValueRef as String] = certificate
+
+        case .key:
+            attributes[kSecValueData as String] = newItem.data
+            if !newItem.keyClass.isEmpty {
+                attributes[kSecAttrKeyClass as String] = newItem.keyClass
+            }
+            if !newItem.keyType.isEmpty {
+                attributes[kSecAttrKeyType as String] = newItem.keyType
+            }
+            if let tag = newItem.applicationTag.data(using: .utf8), !tag.isEmpty {
+                attributes[kSecAttrApplicationTag as String] = tag
+            }
         }
 
         if !newItem.label.isEmpty {
             attributes[kSecAttrLabel as String] = newItem.label
         }
-        if !newItem.itemDescription.isEmpty {
-            attributes[kSecAttrDescription as String] = newItem.itemDescription
-        }
-        if !newItem.comment.isEmpty {
-            attributes[kSecAttrComment as String] = newItem.comment
-        }
-        if newItem.isInvisible {
-            attributes[kSecAttrIsInvisible as String] = true
-        }
-        if newItem.isNegative {
-            attributes[kSecAttrIsNegative as String] = true
+
+        // 其余描述性字段只有密码类有对应的列
+        if newItem.itemClass.supportsDataEditing {
+            if !newItem.itemDescription.isEmpty {
+                attributes[kSecAttrDescription as String] = newItem.itemDescription
+            }
+            if !newItem.comment.isEmpty {
+                attributes[kSecAttrComment as String] = newItem.comment
+            }
+            if let creator = FourCharCode.number(from: newItem.creator) {
+                attributes[kSecAttrCreator as String] = creator
+            }
+            if let typeCode = FourCharCode.number(from: newItem.typeCode) {
+                attributes[kSecAttrType as String] = typeCode
+            }
+            if newItem.isInvisible {
+                attributes[kSecAttrIsInvisible as String] = true
+            }
+            if newItem.isNegative {
+                attributes[kSecAttrIsNegative as String] = true
+            }
         }
 
         // 通配符 Group 只是权限声明，不是可写入的实际 Group

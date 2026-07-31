@@ -281,22 +281,29 @@ struct ItemDetailView: View {
         if !editable.isEmpty {
             Section {
                 ForEach(editable) { attribute in
-                    if attribute.isBoolean {
+                    switch attribute.kind {
+                    case .boolean:
                         Toggle(attribute.displayName, isOn: booleanBinding(attribute))
                             .font(.callout)
-                    } else if attribute == .accessible {
+
+                    case .accessibility:
                         Picker(attribute.displayName, selection: accessibleBinding) {
                             ForEach(AccessibleOption.options(including: accessibleBinding.wrappedValue)) { option in
                                 Text(option.title).tag(option.value)
                             }
                         }
                         .font(.callout)
-                    } else {
-                        HStack {
-                            Text(attribute.displayName)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .frame(width: 96, alignment: .leading)
+
+                    case .fourCharCode:
+                        attributeRow(attribute, placeholder: "未设置（如 aapl 或十进制）") {
+                            TextField("", text: fourCharCodeBinding(attribute))
+                                .font(.system(.callout, design: .monospaced))
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled()
+                        }
+
+                    case .text:
+                        attributeRow(attribute, placeholder: "未设置") {
                             TextField("未设置", text: textBinding(attribute))
                                 .font(.callout)
                                 .textInputAutocapitalization(.never)
@@ -309,9 +316,42 @@ struct ItemDetailView: View {
             } header: {
                 Text("可修改的元数据")
             } footer: {
-                Text("主键属性（账号 / 服务 / 组 / 同步）不可改：改动等于把条目挪到另一个主键上，会和已有条目冲突。")
+                Text("主键属性不可改：改动等于把条目挪到另一个主键上，会和已有条目冲突。网络密码多出的 srvr / ptcl / atyp / port / path / sdmn 恰好全是它的主键，所以两类密码可改的是同一批字段。")
             }
         }
+    }
+
+    private func attributeRow<Field: View>(_ attribute: KeychainStore.EditableAttribute,
+                                          placeholder: String,
+                                          @ViewBuilder field: () -> Field) -> some View {
+        HStack {
+            Text(attribute.displayName)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 96, alignment: .leading)
+            field()
+        }
+    }
+
+    /// 四字符码字段：输入 'aapl' 这样四个字符，或直接写十进制
+    private func fourCharCodeBinding(_ attribute: KeychainStore.EditableAttribute) -> Binding<String> {
+        Binding(
+            get: {
+                if let edited = editedAttributes[attribute.key] {
+                    return KeychainStore.FourCharCode.text(from: edited)
+                }
+                guard let item else { return "" }
+                return KeychainStore.FourCharCode.text(from: item.rawAttributes[attribute.key])
+            },
+            set: { text in
+                // 解析不出来就不写进改动集，避免把非法值发给 SecItemUpdate
+                if let number = KeychainStore.FourCharCode.number(from: text) {
+                    editedAttributes[attribute.key] = number
+                } else {
+                    editedAttributes.removeValue(forKey: attribute.key)
+                }
+            }
+        )
     }
 
     private func textBinding(_ attribute: KeychainStore.EditableAttribute) -> Binding<String> {
@@ -373,7 +413,7 @@ struct ItemDetailView: View {
                         Text(KeychainAttributeFormatter.label(for: key))
                             .font(.caption)
                             .foregroundStyle(Color.accentColor)
-                        Text(KeychainAttributeFormatter.value(value))
+                        Text(KeychainAttributeFormatter.value(value, forKey: key))
                             .font(.system(size: 12, design: .monospaced))
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
