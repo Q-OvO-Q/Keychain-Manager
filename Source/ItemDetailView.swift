@@ -17,6 +17,7 @@ struct ItemDetailView: View {
     @State private var tagValue = ""
     @State private var didLoad = false
     @State private var confirmDelete = false
+    @State private var didRequestDelete = false
     /// 只存被改动过的属性，未改动的直接读条目当前值
     @State private var editedAttributes: [String: Any] = [:]
 
@@ -52,12 +53,18 @@ struct ItemDetailView: View {
         .onAppear { load(item) }
         .confirmationDialog("删除这条条目？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("删除", role: .destructive) {
+                didRequestDelete = true
                 viewModel.delete([item])
-                if viewModel.item(withID: itemID) == nil { dismiss() }
             }
             Button("取消", role: .cancel) {}
         } message: {
             Text("此操作不可撤销。")
+        }
+        // 删除改成异步执行后，触发的当下条目还在，只能等它真的消失了再退出
+        .onChange(of: viewModel.items.count) { _, _ in
+            if didRequestDelete, viewModel.item(withID: itemID) == nil {
+                dismiss()
+            }
         }
     }
 
@@ -415,7 +422,7 @@ struct ItemDetailView: View {
         Section {
             Button("删除此条目", role: .destructive) { confirmDelete = true }
                 .frame(maxWidth: .infinity)
-                .disabled(!item.canBeTargeted)
+                .disabled(!item.canBeTargeted || viewModel.isDeleting)
         }
     }
 

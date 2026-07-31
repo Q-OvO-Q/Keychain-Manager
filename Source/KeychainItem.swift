@@ -266,23 +266,24 @@ struct KeychainItem: Identifiable {
             if !label.isEmpty { return (label, server) }
             return ("(无 Server)", server)
 
+        // 密钥 / 证书的标签键刻意**不用 labl**：它是可编辑的，
+        // 拿它当键的话，用户改一次标签就会让已打的 App 标签失联。
+        // 改用主键里的稳定标识（klbl / atag、slnr），显示仍优先用 labl。
         case .key:
-            if !label.isEmpty { return (label, label) }
+            let stable = (attributes[kSecAttrApplicationLabel as String] as? Data)?.hexString
+                ?? stringValue(attributes[kSecAttrApplicationTag as String])
+                ?? ""
+            if !label.isEmpty { return (label, stable) }
             if let tag = stringValue(attributes[kSecAttrApplicationTag as String]), !tag.isEmpty {
-                return (tag, tag)
+                return (tag, stable)
             }
-            if let appLabel = attributes[kSecAttrApplicationLabel as String] as? Data {
-                let hex = appLabel.hexString
-                return ("Key " + String(hex.prefix(16)), hex)
-            }
+            if !stable.isEmpty { return ("Key " + String(stable.prefix(16)), stable) }
             return ("(未命名密钥)", "")
 
         case .certificate:
-            if !label.isEmpty { return (label, label) }
-            if let serial = attributes[kSecAttrSerialNumber as String] as? Data {
-                let hex = serial.hexString
-                return ("Cert " + String(hex.prefix(16)), hex)
-            }
+            let stable = (attributes[kSecAttrSerialNumber as String] as? Data)?.hexString ?? ""
+            if !label.isEmpty { return (label, stable) }
+            if !stable.isEmpty { return ("Cert " + String(stable.prefix(16)), stable) }
             return ("(未命名证书)", "")
         }
     }

@@ -257,7 +257,7 @@ struct ContentView: View {
 
     /// 选择模式下禁用侧滑删除，避免与勾选手势冲突
     private var deleteHandler: ((IndexSet) -> Void)? {
-        guard !viewModel.isSelectionMode else { return nil }
+        guard !viewModel.isSelectionMode, !viewModel.isDeleting else { return nil }
         return { offsets in viewModel.deleteFiltered(at: offsets) }
     }
 
@@ -311,7 +311,7 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                     .tint(.red)
             }
-            .disabled(viewModel.selectedIDs.isEmpty)
+            .disabled(viewModel.selectedIDs.isEmpty || viewModel.isDeleting)
         }
         .padding(.horizontal)
         .padding(.vertical, 10)

@@ -232,7 +232,7 @@ enum KeychainStore {
     }
 
     /// 把可检索字段拼成一个小写串，只在查询结束时算一次
-    private static func makeSearchIndex(for item: KeychainItem) -> String {
+    static func makeSearchIndex(for item: KeychainItem) -> String {
         var parts = [item.displayTitle, item.account, item.accessGroup]
         if item.isDataReadable, let text = item.data?.utf8Text {
             parts.append(text)

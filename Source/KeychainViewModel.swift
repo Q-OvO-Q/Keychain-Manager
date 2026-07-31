@@ -63,6 +63,7 @@ final class KeychainViewModel: ObservableObject {
     @Published private(set) var items: [KeychainItem] = []
     @Published private(set) var isLoading = false
     @Published private(set) var isUnlocking = false
+    @Published private(set) var isDeleting = false
     @Published var statusMessage = "正在读取描述文件…"
     @Published var alertMessage: String?
 
@@ -362,22 +363,51 @@ final class KeychainViewModel: ObservableObject {
 
     /// 逐条删除并核对结果。失败的条目会留在列表里并给出原因，
     /// 不再出现「删除成功、刷新后又冒出来」的假象。
+    /// 删除放到后台队列执行。
+    ///
+    /// 每条最多要走 4 次同步 keychain 调用（持久引用 → 完整主键 → 退化主键 → 存在性核对），
+    /// 批量选中上千条时就是上千次同步 IPC。留在主线程会直接卡死界面，
+    /// 数量再大还会被看门狗杀掉。
     func delete(_ targets: [KeychainItem]) {
-        guard !targets.isEmpty else { return }
+        guard !targets.isEmpty, !isDeleting else { return }
 
-        var deletedIDs: Set<String> = []
-        var deletedTagKeys: Set<String> = []
-        var failures: [KeychainOperationFailure] = []
+        isDeleting = true
+        statusMessage = "正在删除 0/\(targets.count)…"
 
-        for item in targets {
-            let status = KeychainStore.delete(item)
-            if status == errSecSuccess {
-                deletedIDs.insert(item.id)
-                deletedTagKeys.insert(item.tagKey)
-            } else {
-                failures.append(KeychainOperationFailure(item: item, status: status))
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var deletedIDs: Set<String> = []
+            var deletedTagKeys: Set<String> = []
+            var failures: [KeychainOperationFailure] = []
+
+            for (index, item) in targets.enumerated() {
+                let status = KeychainStore.delete(item)
+                if status == errSecSuccess {
+                    deletedIDs.insert(item.id)
+                    deletedTagKeys.insert(item.tagKey)
+                } else {
+                    failures.append(KeychainOperationFailure(item: item, status: status))
+                }
+
+                if index % 20 == 0 {
+                    let done = index
+                    DispatchQueue.main.async {
+                        self?.statusMessage = "正在删除 \(done)/\(targets.count)…"
+                    }
+                }
+            }
+
+            DispatchQueue.main.async {
+                self?.finishDelete(deletedIDs: deletedIDs,
+                                   deletedTagKeys: deletedTagKeys,
+                                   failures: failures)
             }
         }
+    }
+
+    private func finishDelete(deletedIDs: Set<String>,
+                             deletedTagKeys: Set<String>,
+                             failures: [KeychainOperationFailure]) {
+        isDeleting = false
 
         items.removeAll { deletedIDs.contains($0.id) }
         selectedIDs.subtract(deletedIDs)
@@ -422,11 +452,12 @@ final class KeychainViewModel: ObservableObject {
 
     /// 新增条目后待应用的标签。写入时 Access Group 可能由系统决定，
     /// 无法预先算出 tagKey，只能等刷新拿到真实条目再打标签。
+    ///
+    /// 靠「刷新后多出来的条目」来认，而不是拿属性去比对：密钥和证书没有 title，
+    /// 按 title + account 匹配对它们永远匹配不上，标签会被静默丢掉。
     private struct PendingTag {
-        let itemClass: KeychainItemClass
-        let title: String
-        let account: String
         let tag: String
+        let knownIDs: Set<String>
     }
 
     private var pendingTag: PendingTag?
@@ -440,10 +471,7 @@ final class KeychainViewModel: ObservableObject {
 
         let trimmedTag = tag.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedTag.isEmpty {
-            pendingTag = PendingTag(itemClass: newItem.itemClass,
-                                    title: newItem.title,
-                                    account: newItem.account,
-                                    tag: trimmedTag)
+            pendingTag = PendingTag(tag: trimmedTag, knownIDs: Set(items.map(\.id)))
         }
 
         statusMessage = "已新增「\(newItem.title)」"
@@ -456,11 +484,7 @@ final class KeychainViewModel: ObservableObject {
         pendingTag = nil
 
         let keys = items
-            .filter {
-                $0.itemClass == pending.itemClass
-                    && $0.displayTitle == pending.title
-                    && $0.account == pending.account
-            }
+            .filter { !pending.knownIDs.contains($0.id) }
             .map(\.tagKey)
 
         guard !keys.isEmpty else { return }
@@ -486,6 +510,8 @@ final class KeychainViewModel: ObservableObject {
                 if let index = self.items.firstIndex(where: { $0.id == item.id }) {
                     self.items[index].data = outcome.data
                     self.items[index].dataStatus = outcome.status
+                    // 解锁后内容才可读，检索串要跟着补上
+                    self.items[index].searchIndex = KeychainStore.makeSearchIndex(for: self.items[index])
                     updated = self.items[index]
                 }
 
@@ -543,6 +569,8 @@ final class KeychainViewModel: ObservableObject {
         if let index = items.firstIndex(where: { $0.id == item.id }) {
             items[index].data = data
             items[index].dataStatus = errSecSuccess
+            // 检索串是查询结束时拼好的，数据变了不重算就搜不到新内容、反而能搜到旧内容
+            items[index].searchIndex = KeychainStore.makeSearchIndex(for: items[index])
         }
         statusMessage = "已保存「\(item.displayTitle)」"
         return true
