@@ -63,16 +63,26 @@ final class TagManager: ObservableObject {
 
     /// 清理孤立标签：条目已不存在但标签还留着。
     ///
-    /// 只处理本次确实成功枚举过的 Access Group —— 查询失败时条目列表为空，
-    /// 若照样清理就会把用户的标签全部误删。
-    func cleanupOrphanedTags(existingKeys: Set<String>, inAccessGroups groups: Set<String>) {
-        guard !groups.isEmpty else { return }
+    /// 只在**本次确实完整看过**的范围内清理，两个维度都要卡住：
+    ///
+    /// - Access Group：查询失败时条目列表为空，照样清理会把标签全删光；
+    /// - 类别：只查了通用时，网络条目一条都不在结果里，
+    ///   若只按 Group 判断，同组网络条目的标签会被当成孤儿抹掉。
+    ///
+    /// 调用方还需保证受保护条目没有被跳过 —— 跳过时它们同样不在结果里，
+    /// 无从区分「已删除」和「只是没列出来」。
+    func cleanupOrphanedTags(existingKeys: Set<String>,
+                            inAccessGroups groups: Set<String>,
+                            forClasses classDisplayNames: Set<String>) {
+        guard !groups.isEmpty, !classDisplayNames.isEmpty else { return }
 
         let survivors = tags.filter { key, _ in
             let components = key.components(separatedBy: separator)
             // tagKey 格式: classDisplay|||title|||account|||accessGroup
-            guard components.count >= 4, let keyGroup = components.last else { return true }
-            guard groups.contains(keyGroup) else { return true }
+            guard components.count >= 4,
+                  let keyGroup = components.last,
+                  let keyClass = components.first else { return true }
+            guard classDisplayNames.contains(keyClass), groups.contains(keyGroup) else { return true }
             return existingKeys.contains(key)
         }
 

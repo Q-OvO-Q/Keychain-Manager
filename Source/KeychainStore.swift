@@ -234,6 +234,16 @@ enum KeychainStore {
     /// 把可检索字段拼成一个小写串，只在查询结束时算一次
     static func makeSearchIndex(for item: KeychainItem) -> String {
         var parts = [item.displayTitle, item.account, item.accessGroup]
+
+        // 把所有能读成文本的属性都纳入：标签、描述、备注、路径、端口……
+        // 只索引标题 / 账号 / 组 / 内容的话，按这些字段是搜不到的。
+        // stringValue 对解不成 UTF-8 的二进制属性返回 nil，正好把它们排除在外。
+        for (key, value) in item.rawAttributes where key != (kSecValuePersistentRef as String) {
+            if let text = KeychainItem.stringValue(value), !text.isEmpty {
+                parts.append(text)
+            }
+        }
+
         if item.isDataReadable, let text = item.data?.utf8Text {
             parts.append(text)
         }

@@ -2,6 +2,14 @@ import SwiftUI
 import UIKit
 import Security
 
+/// 展示用的一行键值。用结构体而不是元组：Swift 不支持指向元组元素的 KeyPath，
+/// ForEach 拿元组编译不过。
+struct LabeledValue: Identifiable {
+    let label: String
+    let value: String
+    var id: String { label }
+}
+
 struct ItemDetailView: View {
 
     @ObservedObject var viewModel: KeychainViewModel
@@ -44,6 +52,7 @@ struct ItemDetailView: View {
     private func form(for item: KeychainItem) -> some View {
         Form {
             identitySection(item)
+            certificateSection(item)
             tagSection(item)
             dataSection(item)
             editableAttributesSection(item)
@@ -72,14 +81,14 @@ struct ItemDetailView: View {
 
     @ViewBuilder
     private func identitySection(_ item: KeychainItem) -> some View {
+        // 直接遍历该类别的主键属性来渲染，而不是写死 Service / Account 两行。
+        // 写死的版本对密钥和证书是错的：把 klbl 标成「Service」、显示一个恒为空的
+        // 「Account」，而它们真正的主键（kcls / type / bsiz、ctyp / issr / slnr）
+        // 一个都没露出来。照着 primaryKeyAttributes 走就不会再漏。
         Section {
             infoRow("类别", item.itemClass.displayName)
-            infoRow(item.itemClass == .internetPassword ? "Server" : "Service", item.displayTitle)
-            infoRow("Account", item.account)
-            infoRow("Access Group", item.accessGroup)
-            infoRow("iCloud 同步", item.isSynchronizable ? "是" : "否")
-            if let accessible = KeychainItem.stringValue(item.rawAttributes[kSecAttrAccessible as String]) {
-                infoRow("可访问性", KeychainAttributeFormatter.accessibilityDescription(accessible))
+            ForEach(item.itemClass.primaryKeyAttributes, id: \.self) { key in
+                infoRow(KeychainAttributeFormatter.label(for: key), primaryKeyValue(item, key))
             }
         } header: {
             Text("核心标识（构成主键，不可修改）")
@@ -87,6 +96,65 @@ struct ItemDetailView: View {
             if !item.canBeTargeted {
                 Text("系统没回传能唯一定位这条的属性。删除它会波及同组其它条目，因此已禁用。")
                     .foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private func primaryKeyValue(_ item: KeychainItem, _ key: String) -> String {
+        // sync 系统常常不回传，缺省即为「否」，显示成「未设置」会误导
+        if key == kSecAttrSynchronizable as String {
+            return item.isSynchronizable ? "是" : "否"
+        }
+        guard let value = item.rawAttributes[key] else { return "未设置" }
+        return KeychainAttributeFormatter.value(value, forKey: key)
+    }
+
+    // MARK: 证书解析
+
+    /// `subj` / `issr` 存的是 DER 编码的 X.509 名称，按十六进制显示等于没显示。
+    /// 用证书本身解析出可读信息补上。
+    private func certificateDetails(_ item: KeychainItem) -> [LabeledValue] {
+        guard item.itemClass == .certificate,
+              item.isDataReadable,
+              let data = item.data,
+              let certificate = SecCertificateCreateWithData(nil, data as CFData) else {
+            return []
+        }
+
+        var rows: [LabeledValue] = []
+
+        if let summary = SecCertificateCopySubjectSummary(certificate) as String?, !summary.isEmpty {
+            rows.append(LabeledValue(label: "主体摘要", value: summary))
+        }
+
+        var commonName: CFString?
+        if SecCertificateCopyCommonName(certificate, &commonName) == errSecSuccess,
+           let name = commonName as String?, !name.isEmpty {
+            rows.append(LabeledValue(label: "Common Name", value: name))
+        }
+
+        var emails: CFArray?
+        if SecCertificateCopyEmailAddresses(certificate, &emails) == errSecSuccess,
+           let list = emails as? [String], !list.isEmpty {
+            rows.append(LabeledValue(label: "邮箱", value: list.joined(separator: ", ")))
+        }
+
+        rows.append(LabeledValue(label: "DER 长度", value: "\(data.count) 字节"))
+        return rows
+    }
+
+    @ViewBuilder
+    private func certificateSection(_ item: KeychainItem) -> some View {
+        let rows = certificateDetails(item)
+        if !rows.isEmpty {
+            Section {
+                ForEach(rows) { row in
+                    infoRow(row.label, row.value)
+                }
+            } header: {
+                Text("证书内容")
+            } footer: {
+                Text("由证书数据本身解析，不是存储的属性。")
             }
         }
     }
@@ -544,6 +612,9 @@ struct ItemDetailView: View {
             Text(value.isEmpty ? "—" : value)
                 .font(.callout)
                 .textSelection(.enabled)
+                .lineLimit(3)
+                // 组名之类的长值，区别常在尾部
+                .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
             if !value.isEmpty {
                 Button {

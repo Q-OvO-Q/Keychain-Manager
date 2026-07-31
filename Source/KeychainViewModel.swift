@@ -324,11 +324,18 @@ final class KeychainViewModel: ObservableObject {
 
         mergeDiscoveredGroups(from: result.items)
 
-        // 只有全部类别都枚举成功，才敢按结果清理标签
-        if result.classErrors.isEmpty {
+        // 清理孤立标签的前提是「这次真的把该看的都看全了」：
+        // 枚举无失败，且受保护条目没有被跳过（跳过时它们不在结果里，
+        // 无从区分「已删除」和「只是没列出来」）。
+        // 清理范围还要限定在本次查询的类别内 —— 否则取消勾选某个类别后刷新，
+        // 该类别的标签会被整批当成孤儿抹掉。
+        if result.classErrors.isEmpty && includeProtectedItems {
             let existingKeys = Set(result.items.map(\.tagKey))
             let groups = Set(result.items.map(\.accessGroup)).filter { !$0.isEmpty }
-            TagManager.shared.cleanupOrphanedTags(existingKeys: existingKeys, inAccessGroups: groups)
+            let classNames = Set(enabledClasses.map(\.displayName))
+            TagManager.shared.cleanupOrphanedTags(existingKeys: existingKeys,
+                                                  inAccessGroups: groups,
+                                                  forClasses: classNames)
         }
 
         enumerationFailures = result.classErrors.map(\.description)
