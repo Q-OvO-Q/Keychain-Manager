@@ -123,9 +123,11 @@ struct ItemDetailView: View {
                     }
                     .padding(.vertical, 2)
                 }
-                // ScrollView 在 Form 行里同样会画不透明底色盖住分隔线
+                // ScrollView 在 Form 行里同样会画不透明底色盖住分隔线。
+                // 只补这一行**上方**那条：默认的 .all 会连带在 section 最后一行
+                // 下方也画一条，那是本不该有的。
                 .scrollContentBackground(.hidden)
-                .listRowSeparator(.visible)
+                .listRowSeparator(.visible, edges: .top)
             }
         }
     }
@@ -162,7 +164,6 @@ struct ItemDetailView: View {
                 Text("十六进制").tag(true)
             }
             .pickerStyle(.segmented)
-            .listRowSeparator(.visible)
 
             if let conversionWarning {
                 Text(conversionWarning)
@@ -183,7 +184,6 @@ struct ItemDetailView: View {
                     RoundedRectangle(cornerRadius: 8)
                         .fill(Color.secondary.opacity(0.08))
                 )
-                .listRowSeparator(.visible)
 
             HStack {
                 Text(byteCountDescription)
@@ -198,7 +198,6 @@ struct ItemDetailView: View {
                 }
                 .buttonStyle(.plain)
             }
-            .listRowSeparator(.visible)
 
             if let saveNotice {
                 Text(saveNotice)
@@ -209,6 +208,8 @@ struct ItemDetailView: View {
             Button("保存修改") { save(item) }
                 .frame(maxWidth: .infinity)
                 .disabled(!item.itemClass.supportsDataEditing || !item.canBeTargeted)
+                // 补「字节数 / 复制」这行与本行之间那条
+                .listRowSeparator(.visible, edges: .top)
         } header: {
             Text("数据 (kSecValueData)")
         } footer: {
