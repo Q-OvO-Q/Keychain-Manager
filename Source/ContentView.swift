@@ -456,7 +456,7 @@ struct ScopeSettingsView: View {
                 } header: {
                     Text("查询范围")
                 } footer: {
-                    Text("开启后逐个遍历已识别的 \(viewModel.detectedGroups.count) 个 Access Group，最后再补一次不限组的兜底扫描。逐组查询可以避免某个组出问题时整个类别一起查不到。")
+                    Text("逐个遍历已识别的 \(viewModel.detectedGroups.count) 个组，再补一次不限组扫描。逐组查是为了避免某个组出问题时整个类别都查不到。")
                 }
 
                 if !viewModel.useAllGroups {
@@ -496,7 +496,7 @@ struct ScopeSettingsView: View {
                 Section {
                     Toggle("包含受保护条目", isOn: $viewModel.includeProtectedItems)
                 } footer: {
-                    Text("关闭时跳过需要验证的条目，全程不弹验证框。开启后这类条目才会列出，代价是查询过程中每遇到一个含受保护条目的 Access Group 就要验证一次（可能连续弹多次）。条目数只增不减，但要用验证次数来换。")
+                    Text("开启后受保护条目才会列出，代价是每个含此类条目的组都要验证一次。条目数只增不减。")
                 }
 
                 Section {
@@ -506,7 +506,7 @@ struct ScopeSettingsView: View {
                 } header: {
                     Text("条目类别")
                 } footer: {
-                    Text("密钥与证书条目数量可能较多，按需开启。")
+                    Text("密钥与证书数量可能较多，按需开启。")
                 }
 
                 if let summary = viewModel.profileSummary {
@@ -609,7 +609,7 @@ struct FilterSheet: View {
                 } header: {
                     Text("Access Group（\(matchingGroups.count)/\(viewModel.groupCounts.count)）")
                 } footer: {
-                    Text("只列出当前结果里实际有条目的组。")
+                    Text("只列出当前结果里有条目的组。")
                 }
             }
             .navigationTitle("筛选")
@@ -670,7 +670,7 @@ struct FailureDetailView: View {
                             .textSelection(.enabled)
                     }
                 } footer: {
-                    Text("每一行是一个「类别 + Access Group」组合。若某组报认证相关错误，说明受保护条目就在该组里。")
+                    Text("每行是一个「类别 + 组」的组合。报认证类错误的组，就是受保护条目所在的组。")
                 }
             }
             .navigationTitle("查询失败 \(failures.count) 项")
