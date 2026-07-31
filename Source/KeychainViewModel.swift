@@ -593,11 +593,23 @@ final class KeychainViewModel: ObservableObject {
         let scoped = url.startAccessingSecurityScopedResource()
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
 
-        let parsed: KeychainExport.ParsedFile
         do {
-            parsed = try KeychainExport.parse(try Data(contentsOf: url))
+            let data = try Data(contentsOf: url)
+            importJSON(data, overrideGroup: overrideGroup, replaceExisting: replaceExisting)
         } catch {
             alertMessage = "读取失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 直接从一段 JSON 字节导入。文件选取器不可用时（粘贴）走这条。
+    func importJSON(_ data: Data, overrideGroup: String, replaceExisting: Bool) {
+        guard !isImporting else { return }
+
+        let parsed: KeychainExport.ParsedFile
+        do {
+            parsed = try KeychainExport.parse(data)
+        } catch {
+            alertMessage = "解析失败：\(error.localizedDescription)"
             return
         }
 

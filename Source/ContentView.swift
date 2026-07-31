@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import Security
 import UniformTypeIdentifiers
 
@@ -733,6 +734,17 @@ struct ImportOptionsView: View {
     // 文件选取器挂在本页内部：从一个 sheet 里 dismiss 后立刻presenting 另一个，
     // SwiftUI 经常会静默吞掉后者
     @State private var showPicker = false
+    @State private var showPasteError = false
+
+    private func pasteFromClipboard() {
+        guard let text = UIPasteboard.general.string,
+              let data = text.data(using: .utf8), !data.isEmpty else {
+            showPasteError = true
+            return
+        }
+        viewModel.importJSON(data, overrideGroup: groupOverride, replaceExisting: replaceExisting)
+        dismiss()
+    }
 
     private var matchingGroups: [String] {
         let keyword = groupOverride.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -781,6 +793,16 @@ struct ImportOptionsView: View {
                 } footer: {
                     Text("导出文件里的组在本机未必存在。指定一个有权限的组，可以把整份文件改投过去。")
                 }
+
+                Section {
+                    Button {
+                        pasteFromClipboard()
+                    } label: {
+                        Label("从剪贴板粘贴并导入", systemImage: "doc.on.clipboard")
+                    }
+                } footer: {
+                    Text("文件选取器打不开或文件选不中时走这条：把 JSON 全文复制到剪贴板即可。")
+                }
             }
             .navigationTitle("导入选项")
             .navigationBarTitleDisplayMode(.inline)
@@ -793,16 +815,24 @@ struct ImportOptionsView: View {
                         .fontWeight(.semibold)
                 }
             }
-            .fileImporter(isPresented: $showPicker, allowedContentTypes: [.json]) { result in
-                switch result {
-                case .success(let url):
+            .alert("粘贴 JSON", isPresented: $showPasteError) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text("剪贴板里没有文本。")
+            }
+            // 用 UIKit 的选取器而不是 .fileImporter：后者挂在 sheet 内部时
+            // 会出现「文件可选、点了没反应」——回调不触发，界面也不返回。
+            .sheet(isPresented: $showPicker) {
+                DocumentPicker { url in
+                    showPicker = false
                     viewModel.importFile(at: url,
                                          overrideGroup: groupOverride,
                                          replaceExisting: replaceExisting)
                     dismiss()
-                case .failure(let error):
-                    viewModel.alertMessage = "选取文件失败：\(error.localizedDescription)"
+                } onCancel: {
+                    showPicker = false
                 }
+                .ignoresSafeArea()
             }
         }
     }
