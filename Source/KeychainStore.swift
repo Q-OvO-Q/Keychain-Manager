@@ -849,6 +849,116 @@ enum KeychainStore {
         return SecItemAdd(attributes as CFDictionary, nil)
     }
 
+    // MARK: - 导入
+
+    struct ImportOutcome {
+        var added = 0
+        var replaced = 0
+        var failures: [(title: String, status: OSStatus)] = []
+
+        var attempted: Int { added + replaced + failures.count }
+    }
+
+    /// 按导入文件里的属性直接写入。
+    ///
+    /// 与 `add(_:)` 分开是有意的：那个方法接收界面上手填的字段，
+    /// 这里拿到的是从钥匙串导出来的原始属性，要尽量原样写回去。
+    ///
+    /// `overrideGroup` 非空时覆盖每条自带的 `agrp` —— 导出文件里的组在本机
+    /// 未必存在，此时必须能改投到一个有权限的组，否则整份文件都写不进去。
+    static func importItems(_ items: [KeychainExport.ParsedItem],
+                           overrideGroup: String?,
+                           replaceExisting: Bool,
+                           progress: ((Int, Int) -> Void)? = nil) -> ImportOutcome {
+        var outcome = ImportOutcome()
+
+        for (index, item) in items.enumerated() {
+            progress?(index, items.count)
+
+            var attributes = item.attributes
+            attributes[kSecClass as String] = item.itemClass.secClass
+
+            let group = overrideGroup?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !group.isEmpty {
+                attributes[kSecAttrAccessGroup as String] = group
+            }
+            // 通配符组只是权限声明，写不进去
+            if let target = attributes[kSecAttrAccessGroup as String] as? String,
+               isWildcardGroup(target) {
+                attributes.removeValue(forKey: kSecAttrAccessGroup as String)
+            }
+
+            // 证书由 DER 决定身份，必须还原成 SecCertificate 再交给 kSecValueRef
+            if item.itemClass == .certificate {
+                guard let der = attributes[kSecValueData as String] as? Data,
+                      let certificate = SecCertificateCreateWithData(nil, der as CFData) else {
+                    outcome.failures.append((describe(item), errSecDecode))
+                    continue
+                }
+                attributes.removeValue(forKey: kSecValueData as String)
+                attributes[kSecValueRef as String] = certificate
+            }
+
+            let status = SecItemAdd(attributes as CFDictionary, nil)
+            switch status {
+            case errSecSuccess:
+                outcome.added += 1
+
+            case errSecDuplicateItem:
+                guard replaceExisting else {
+                    outcome.failures.append((describe(item), status))
+                    continue
+                }
+                let replaceStatus = replace(attributes: attributes, itemClass: item.itemClass)
+                if replaceStatus == errSecSuccess {
+                    outcome.replaced += 1
+                } else {
+                    outcome.failures.append((describe(item), replaceStatus))
+                }
+
+            default:
+                outcome.failures.append((describe(item), status))
+            }
+        }
+
+        progress?(items.count, items.count)
+        return outcome
+    }
+
+    /// 条目已存在时改为更新：用主键定位，只写非主键的部分。
+    private static func replace(attributes: [String: Any],
+                               itemClass: KeychainItemClass) -> OSStatus {
+        var query: [String: Any] = [kSecClass as String: itemClass.secClass]
+        let primaryKeys = Set(itemClass.primaryKeyAttributes)
+        for key in primaryKeys {
+            if let value = attributes[key] { query[key] = value }
+        }
+        // 同步属性缺省按 false 处理，显式给出才不会漏掉 iCloud 条目
+        if query[kSecAttrSynchronizable as String] == nil {
+            query[kSecAttrSynchronizable as String] = false
+        }
+
+        var changes: [String: Any] = [:]
+        for (key, value) in attributes
+        where !primaryKeys.contains(key) && key != (kSecClass as String) {
+            changes[key] = value
+        }
+        guard !changes.isEmpty else { return errSecSuccess }
+
+        return SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+    }
+
+    private static func describe(_ item: KeychainExport.ParsedItem) -> String {
+        let candidates = [kSecAttrService, kSecAttrServer, kSecAttrLabel, kSecAttrAccount]
+            .map { $0 as String }
+        for key in candidates {
+            if let text = KeychainItem.stringValue(item.attributes[key]), !text.isEmpty {
+                return text
+            }
+        }
+        return "(\(item.itemClass.displayName)条目)"
+    }
+
     /// 通配符 Group（TEAMID.*）无法作为写入目标
     static func isWildcardGroup(_ group: String) -> Bool {
         group.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("*")

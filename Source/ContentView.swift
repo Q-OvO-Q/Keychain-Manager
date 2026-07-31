@@ -1,5 +1,6 @@
 import SwiftUI
 import Security
+import UniformTypeIdentifiers
 
 struct KeychainItemRoute: Hashable {
     let id: String
@@ -18,6 +19,21 @@ struct ContentView: View {
     @State private var confirmBatchDelete = false
     @State private var showFailureDetail = false
     @State private var showFilterSheet = false
+    @State private var showImportOptions = false
+
+    private var exportPresented: Binding<Bool> {
+        Binding(
+            get: { viewModel.exportDocument != nil },
+            set: { if !$0 { viewModel.exportDocument = nil } }
+        )
+    }
+
+    private var importReportPresented: Binding<Bool> {
+        Binding(
+            get: { viewModel.importReport != nil },
+            set: { if !$0 { viewModel.importReport = nil } }
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -52,10 +68,25 @@ struct ContentView: View {
             }
         }
         .sheet(isPresented: $showFailureDetail) {
-            FailureDetailView(failures: viewModel.enumerationFailures)
+            FailureDetailView.enumeration(viewModel.enumerationFailures)
         }
         .sheet(isPresented: $showFilterSheet) {
             FilterSheet(viewModel: viewModel)
+        }
+        .sheet(isPresented: $showImportOptions) {
+            ImportOptionsView(viewModel: viewModel)
+        }
+        .sheet(isPresented: importReportPresented) {
+            FailureDetailView.importResult(viewModel.importReport ?? [])
+        }
+        .fileExporter(isPresented: exportPresented,
+                      document: viewModel.exportDocument,
+                      contentType: .json,
+                      defaultFilename: viewModel.exportFileName) { result in
+            if case .failure(let error) = result {
+                viewModel.alertMessage = "保存失败：\(error.localizedDescription)"
+            }
+            viewModel.exportDocument = nil
         }
         .alert("操作未完成", isPresented: alertPresented) {
             Button("好", role: .cancel) {}
@@ -106,6 +137,44 @@ struct ContentView: View {
                       : "line.3.horizontal.decrease.circle")
             }
             .disabled(viewModel.items.isEmpty)
+        }
+
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Menu {
+                Section("导出") {
+                    Button {
+                        viewModel.export(viewModel.selectedItems)
+                    } label: {
+                        Label("导出选中 \(viewModel.selectedIDs.count) 条", systemImage: "checkmark.circle")
+                    }
+                    .disabled(viewModel.selectedIDs.isEmpty)
+
+                    Button {
+                        viewModel.export(viewModel.filteredItems)
+                    } label: {
+                        Label("导出当前筛选结果", systemImage: "line.3.horizontal.decrease")
+                    }
+                    .disabled(viewModel.filteredItems.isEmpty)
+
+                    Button {
+                        viewModel.export(viewModel.items)
+                    } label: {
+                        Label("导出全部 \(viewModel.items.count) 条", systemImage: "square.and.arrow.up")
+                    }
+                    .disabled(viewModel.items.isEmpty)
+                }
+
+                Section {
+                    Button {
+                        showImportOptions = true
+                    } label: {
+                        Label("导入 JSON…", systemImage: "square.and.arrow.down")
+                    }
+                    .disabled(viewModel.isImporting)
+                }
+            } label: {
+                Image(systemName: "arrow.up.arrow.down.circle")
+            }
         }
 
         ToolbarItem(placement: .navigationBarTrailing) {
@@ -651,14 +720,121 @@ struct FilterSheet: View {
     }
 }
 
+// MARK: - 导入选项
+
+/// 选文件之前先问清楚写到哪个组、重名怎么办 —— 文件选取器一旦返回就直接开写，
+/// 没有中途再问的机会。
+struct ImportOptionsView: View {
+    @ObservedObject var viewModel: KeychainViewModel
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var groupOverride = ""
+    @State private var replaceExisting = false
+    // 文件选取器挂在本页内部：从一个 sheet 里 dismiss 后立刻presenting 另一个，
+    // SwiftUI 经常会静默吞掉后者
+    @State private var showPicker = false
+
+    private var matchingGroups: [String] {
+        let keyword = groupOverride.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let writable = viewModel.detectedGroups.filter { !KeychainStore.isWildcardGroup($0) }
+        guard !keyword.isEmpty else { return writable }
+        if writable.contains(where: { $0.lowercased() == keyword }) { return writable }
+        return writable.filter { $0.lowercased().contains(keyword) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Toggle("覆盖已存在的条目", isOn: $replaceExisting)
+                } footer: {
+                    Text(replaceExisting
+                         ? "主键相同的条目会被更新，数据和元数据都以文件为准。"
+                         : "主键相同的条目会跳过并计入失败，原有数据不动。")
+                }
+
+                Section {
+                    TextField("留空则用文件中每条自带的组", text: $groupOverride)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    ForEach(matchingGroups, id: \.self) { group in
+                        Button {
+                            groupOverride = group
+                        } label: {
+                            HStack {
+                                Text(group)
+                                    .font(.callout)
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                Spacer()
+                                if groupOverride == group {
+                                    Image(systemName: "checkmark")
+                                        .foregroundStyle(Color.accentColor)
+                                }
+                            }
+                        }
+                    }
+                } header: {
+                    Text("写入到 Access Group")
+                } footer: {
+                    Text("导出文件里的组在本机未必存在。指定一个有权限的组，可以把整份文件改投过去。")
+                }
+            }
+            .navigationTitle("导入选项")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("取消") { dismiss() }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("选择文件") { showPicker = true }
+                        .fontWeight(.semibold)
+                }
+            }
+            .fileImporter(isPresented: $showPicker, allowedContentTypes: [.json]) { result in
+                switch result {
+                case .success(let url):
+                    viewModel.importFile(at: url,
+                                         overrideGroup: groupOverride,
+                                         replaceExisting: replaceExisting)
+                    dismiss()
+                case .failure(let error):
+                    viewModel.alertMessage = "选取文件失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+}
+
 // MARK: - 查询失败详情
 
 /// 逐组枚举下失败项可能有几十条，状态栏放不下。
 /// 弹验证的到底是哪个组、哪个类别，靠这里定位。
 struct FailureDetailView: View {
     let failures: [String]
+    /// 查询失败和导入失败共用这个列表，但说明文字必须各说各的
+    let title: String
+    let explanation: String
 
     @Environment(\.dismiss) private var dismiss
+
+    static func enumeration(_ failures: [String]) -> FailureDetailView {
+        FailureDetailView(
+            failures: failures,
+            title: "查询失败",
+            explanation: "每行是一个「类别 + 组」的组合。报认证类错误的组，就是受保护条目所在的组。"
+        )
+    }
+
+    static func importResult(_ failures: [String]) -> FailureDetailView {
+        FailureDetailView(
+            failures: failures,
+            title: "导入失败",
+            explanation: "-25299 表示主键相同的条目已存在（可在导入选项里开启覆盖）；-34018 表示目标组没有权限；-50 表示属性组合不被接受。"
+        )
+    }
 
     var body: some View {
         NavigationStack {
@@ -670,10 +846,10 @@ struct FailureDetailView: View {
                             .textSelection(.enabled)
                     }
                 } footer: {
-                    Text("每行是一个「类别 + 组」的组合。报认证类错误的组，就是受保护条目所在的组。")
+                    Text(explanation)
                 }
             }
-            .navigationTitle("查询失败 \(failures.count) 项")
+            .navigationTitle("\(title) \(failures.count) 项")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
