@@ -180,33 +180,37 @@ struct AddItemView: View {
     @ViewBuilder
     private var tagSection: some View {
         Section("App 标签（可选）") {
-            TextField("输入 App 名称", text: $tagValue)
-                .textInputAutocapitalization(.never)
+            // 同详情页：合并成同一个 Form 行，中间自己画 Divider。
+            // 系统分割线在这个位置会被上方那行的控件背景盖住。
+            VStack(spacing: 0) {
+                TextField("输入 App 名称", text: $tagValue)
+                    .textInputAutocapitalization(.never)
+                    .padding(.vertical, 6)
 
-            if !tagManager.allTags.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(tagManager.allTags, id: \.self) { tag in
-                            Button {
-                                tagValue = tag
-                            } label: {
-                                Text(tag)
-                                    .font(.caption)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(Color.orange.opacity(0.2))
-                                    .foregroundStyle(.orange)
-                                    .clipShape(Capsule())
+                if !tagManager.allTags.isEmpty {
+                    Divider()
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(tagManager.allTags, id: \.self) { tag in
+                                Button {
+                                    tagValue = tag
+                                } label: {
+                                    Text(tag)
+                                        .font(.caption)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.orange.opacity(0.2))
+                                        .foregroundStyle(.orange)
+                                        .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
+                        .padding(.vertical, 8)
                     }
-                    .padding(.vertical, 2)
+                    .scrollContentBackground(.hidden)
                 }
-                // 同详情页：ScrollView 会画不透明底色盖住分隔线，
-                // 且只补上方那条，避免在 section 末尾多画一条
-                .scrollContentBackground(.hidden)
-                .listRowSeparator(.visible, edges: .top)
             }
         }
     }

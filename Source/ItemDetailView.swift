@@ -88,46 +88,53 @@ struct ItemDetailView: View {
 
     private func tagSection(_ item: KeychainItem) -> some View {
         Section("App 标签") {
-            HStack {
-                TextField("输入 App 名称", text: $tagValue)
-                    .textInputAutocapitalization(.never)
-                Button("保存") {
-                    viewModel.setTag(tagValue, for: item)
-                    saveNotice = tagValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                        ? "已清除标签"
-                        : "已保存标签"
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-            }
-
-            if !tagManager.allTags.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(tagManager.allTags, id: \.self) { tag in
-                            Button {
-                                tagValue = tag
-                                viewModel.setTag(tag, for: item)
-                                saveNotice = "已保存标签"
-                            } label: {
-                                Text(tag)
-                                    .font(.caption)
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .background(Color.orange.opacity(0.2))
-                                    .foregroundStyle(.orange)
-                                    .clipShape(Capsule())
-                            }
-                            .buttonStyle(.plain)
-                        }
+            // 输入行与标签行合并成**同一个 Form 行**，中间自己画 Divider。
+            //
+            // 试过两轮系统分割线都不行：先是 listRowSeparator 默认作用于上下两条边，
+            // 在 section 末尾多画了一条；改成只要 top 之后，那条线仍然被上方那行的
+            // 控件背景盖住 —— 说明它是被覆盖而不是没被请求。
+            // 放进同一行的内容里，兄弟行的背景就盖不到它了。
+            VStack(spacing: 0) {
+                HStack {
+                    TextField("输入 App 名称", text: $tagValue)
+                        .textInputAutocapitalization(.never)
+                    Button("保存") {
+                        viewModel.setTag(tagValue, for: item)
+                        saveNotice = tagValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            ? "已清除标签"
+                            : "已保存标签"
                     }
-                    .padding(.vertical, 2)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
                 }
-                // ScrollView 在 Form 行里同样会画不透明底色盖住分隔线。
-                // 只补这一行**上方**那条：默认的 .all 会连带在 section 最后一行
-                // 下方也画一条，那是本不该有的。
-                .scrollContentBackground(.hidden)
-                .listRowSeparator(.visible, edges: .top)
+                .padding(.vertical, 6)
+
+                if !tagManager.allTags.isEmpty {
+                    Divider()
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            ForEach(tagManager.allTags, id: \.self) { tag in
+                                Button {
+                                    tagValue = tag
+                                    viewModel.setTag(tag, for: item)
+                                    saveNotice = "已保存标签"
+                                } label: {
+                                    Text(tag)
+                                        .font(.caption)
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(Color.orange.opacity(0.2))
+                                        .foregroundStyle(.orange)
+                                        .clipShape(Capsule())
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    .scrollContentBackground(.hidden)
+                }
             }
         }
     }
@@ -185,18 +192,32 @@ struct ItemDetailView: View {
                         .fill(Color.secondary.opacity(0.08))
                 )
 
-            HStack {
-                Text(byteCountDescription)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    copy(content)
-                } label: {
-                    Label("复制", systemImage: "doc.on.doc")
-                        .font(.caption)
+            // 同上：字节数行与保存按钮合并成同一个 Form 行，中间自己画 Divider
+            VStack(spacing: 0) {
+                HStack {
+                    Text(byteCountDescription)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Button {
+                        copy(content)
+                    } label: {
+                        Label("复制", systemImage: "doc.on.doc")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
+                .padding(.vertical, 6)
+
+                Divider()
+
+                Button("保存修改") { save(item) }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    // 同一行里有两个按钮，样式必须显式指定，
+                    // 否则整行点击都会触发其中一个
+                    .buttonStyle(.borderless)
+                    .disabled(!item.itemClass.supportsDataEditing || !item.canBeTargeted)
             }
 
             if let saveNotice {
@@ -204,12 +225,6 @@ struct ItemDetailView: View {
                     .font(.caption)
                     .foregroundStyle(.green)
             }
-
-            Button("保存修改") { save(item) }
-                .frame(maxWidth: .infinity)
-                .disabled(!item.itemClass.supportsDataEditing || !item.canBeTargeted)
-                // 补「字节数 / 复制」这行与本行之间那条
-                .listRowSeparator(.visible, edges: .top)
         } header: {
             Text("数据 (kSecValueData)")
         } footer: {
