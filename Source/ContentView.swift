@@ -17,6 +17,7 @@ struct ContentView: View {
     @State private var showBatchTagSheet = false
     @State private var confirmBatchDelete = false
     @State private var showFailureDetail = false
+    @State private var showFilterSheet = false
 
     var body: some View {
         NavigationStack {
@@ -52,6 +53,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showFailureDetail) {
             FailureDetailView(failures: viewModel.enumerationFailures)
+        }
+        .sheet(isPresented: $showFilterSheet) {
+            FilterSheet(viewModel: viewModel)
         }
         .alert("操作未完成", isPresented: alertPresented) {
             Button("好", role: .cancel) {}
@@ -93,6 +97,15 @@ struct ContentView: View {
                 }
             }
             .disabled(!viewModel.isSelectionMode && viewModel.items.isEmpty)
+        }
+
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Button { showFilterSheet = true } label: {
+                Image(systemName: viewModel.hasActiveFilter
+                      ? "line.3.horizontal.decrease.circle.fill"
+                      : "line.3.horizontal.decrease.circle")
+            }
+            .disabled(viewModel.items.isEmpty)
         }
 
         ToolbarItem(placement: .navigationBarTrailing) {
@@ -421,12 +434,16 @@ struct KeychainItemRow: View {
 struct ScopeSettingsView: View {
     @ObservedObject var viewModel: KeychainViewModel
     @Environment(\.dismiss) private var dismiss
-    @State private var groupFilter = ""
 
-    /// 签名 entitlements 里动辄上百个组（LiveContainer 有 128 个 shared.N），需要筛选才能用
+    /// 签名 entitlements 里动辄上百个组（LiveContainer 有 128 个 shared.N），需要筛选才能用。
+    /// 输入框内容直接当筛选词。
     private var matchingGroups: [String] {
-        let keyword = groupFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let keyword = viewModel.targetGroup.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !keyword.isEmpty else { return viewModel.detectedGroups }
+        // 已经精确命中某个组时不再收窄，否则点一下列表就只剩这一项
+        if viewModel.detectedGroups.contains(where: { $0.lowercased() == keyword }) {
+            return viewModel.detectedGroups
+        }
         return viewModel.detectedGroups.filter { $0.lowercased().contains(keyword) }
     }
 
@@ -438,50 +455,45 @@ struct ScopeSettingsView: View {
                 } header: {
                     Text("查询范围")
                 } footer: {
-                    Text("开启后遍历下方全部 \(viewModel.detectedGroups.count) 个 Access Group。逐组查询可以避免某个组出问题时整个类别一起查不到。")
+                    Text("开启后逐个遍历已识别的 \(viewModel.detectedGroups.count) 个 Access Group，最后再补一次不限组的兜底扫描。逐组查询可以避免某个组出问题时整个类别一起查不到。")
                 }
 
                 if !viewModel.useAllGroups {
-                    Section("指定 Access Group") {
-                        TextField("例如 TEAMID.com.example.app", text: $viewModel.targetGroup)
+                    Section {
+                        // 一个输入框兼作手动输入与列表筛选：
+                        // 原先上下并排两个框（一个填组名、一个筛选列表）太容易看错
+                        TextField("输入组名，或用于筛选下方列表", text: $viewModel.targetGroup)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
-                    }
 
-                    if !viewModel.detectedGroups.isEmpty {
-                        Section {
-                            if viewModel.detectedGroups.count > 8 {
-                                TextField("筛选组名", text: $groupFilter)
-                                    .textInputAutocapitalization(.never)
-                                    .autocorrectionDisabled()
-                            }
-
-                            ForEach(matchingGroups, id: \.self) { group in
-                                Button {
-                                    viewModel.targetGroup = group
-                                } label: {
-                                    HStack {
-                                        Text(group)
-                                            .font(.callout)
-                                            .foregroundStyle(.primary)
-                                        Spacer()
-                                        if viewModel.targetGroup == group {
-                                            Image(systemName: "checkmark")
-                                                .foregroundStyle(Color.accentColor)
-                                        }
+                        ForEach(matchingGroups, id: \.self) { group in
+                            Button {
+                                viewModel.targetGroup = group
+                            } label: {
+                                HStack {
+                                    Text(group)
+                                        .font(.callout)
+                                        .foregroundStyle(.primary)
+                                        .lineLimit(1)
+                                    Spacer()
+                                    if viewModel.targetGroup == group {
+                                        Image(systemName: "checkmark")
+                                            .foregroundStyle(Color.accentColor)
                                     }
                                 }
                             }
-                        } header: {
-                            Text("已识别的组（\(matchingGroups.count)/\(viewModel.detectedGroups.count)）")
                         }
+                    } header: {
+                        Text(viewModel.detectedGroups.isEmpty
+                             ? "指定 Access Group"
+                             : "指定 Access Group（\(matchingGroups.count)/\(viewModel.detectedGroups.count)）")
                     }
                 }
 
                 Section {
                     Toggle("包含受保护条目", isOn: $viewModel.includeProtectedItems)
                 } footer: {
-                    Text("关闭时跳过需要验证的条目，不会弹出验证框。开启后这类条目才会出现在列表里，但系统可能弹出 Face ID；某个组验证失败时会自动退回跳过重查，因此不会比关闭时拿到更少的条目。")
+                    Text("关闭时跳过需要验证的条目，全程不弹验证框。开启后这类条目才会列出，代价是查询过程中每遇到一个含受保护条目的 Access Group 就要验证一次（可能连续弹多次）。条目数只增不减，但要用验证次数来换。")
                 }
 
                 Section {
@@ -534,6 +546,103 @@ struct ScopeSettingsView: View {
                 }
             }
         )
+    }
+}
+
+// MARK: - 筛选
+
+/// 上千条目、上百个 Access Group 时，光靠搜索框翻不动，
+/// 因此把类别 / 组筛选放进独立面板（组太多，塞不进主界面的横向 chip 条）。
+struct FilterSheet: View {
+    @ObservedObject var viewModel: KeychainViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var groupKeyword = ""
+
+    private var matchingGroups: [GroupCount] {
+        let keyword = groupKeyword.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let all = viewModel.groupCounts
+        guard !keyword.isEmpty else { return all }
+        return all.filter { $0.group.lowercased().contains(keyword) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("类别") {
+                    selectionRow(title: "全部",
+                                 count: viewModel.items.count,
+                                 isSelected: viewModel.classFilter == nil) {
+                        viewModel.classFilter = nil
+                    }
+                    ForEach(viewModel.classCounts) { entry in
+                        selectionRow(title: entry.itemClass.displayName,
+                                     count: entry.count,
+                                     isSelected: viewModel.classFilter == entry.itemClass) {
+                            viewModel.classFilter = entry.itemClass
+                        }
+                    }
+                }
+
+                Section {
+                    if viewModel.groupCounts.count > 8 {
+                        TextField("筛选组名", text: $groupKeyword)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+
+                    selectionRow(title: "全部",
+                                 count: viewModel.items.count,
+                                 isSelected: viewModel.groupFilter.isEmpty) {
+                        viewModel.groupFilter = ""
+                    }
+
+                    ForEach(matchingGroups) { entry in
+                        selectionRow(title: entry.group,
+                                     count: entry.count,
+                                     isSelected: viewModel.groupFilter == entry.group) {
+                            viewModel.groupFilter = entry.group
+                        }
+                    }
+                } header: {
+                    Text("Access Group（\(matchingGroups.count)/\(viewModel.groupCounts.count)）")
+                } footer: {
+                    Text("只列出当前结果里实际有条目的组。")
+                }
+            }
+            .navigationTitle("筛选")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("清除") { viewModel.clearFilters() }
+                        .disabled(!viewModel.hasActiveFilter)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button("完成") { dismiss() }.fontWeight(.semibold)
+                }
+            }
+        }
+    }
+
+    private func selectionRow(title: String,
+                             count: Int,
+                             isSelected: Bool,
+                             action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack {
+                Text(title)
+                    .font(.callout)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                Spacer()
+                Text("\(count)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .foregroundStyle(Color.accentColor)
+                }
+            }
+        }
     }
 }
 
