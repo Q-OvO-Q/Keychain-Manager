@@ -545,6 +545,103 @@ final class KeychainViewModel: ObservableObject {
         """
     }
 
+    // MARK: - 导入 / 导出
+
+    /// 待导出的 JSON，非 nil 时界面弹出保存面板
+    @Published var exportDocument: JSONDocument?
+    @Published private(set) var exportFileName = "keychain_export.json"
+    @Published private(set) var isImporting = false
+    /// 导入结果详情，供结果弹窗展示
+    @Published var importReport: [String]?
+
+    /// 把给定条目编码成 JSON。
+    ///
+    /// 受保护、数据读不出来的条目仍会导出属性，只是缺 `v_Data` —— 与其整条丢掉，
+    /// 不如把能带走的带走，并在提示里说明有几条是这种情况。
+    func export(_ targets: [KeychainItem]) {
+        guard !targets.isEmpty else {
+            statusMessage = "没有可导出的条目"
+            return
+        }
+
+        let groups = Set(targets.map(\.accessGroup)).filter { !$0.isEmpty }
+        // 格式里 access_group 是单值；跨组时留空，导入端按每条自带的 agrp 走
+        let accessGroup = groups.count == 1 ? (groups.first ?? "") : ""
+
+        do {
+            let data = try KeychainExport.makeJSON(items: targets, accessGroup: accessGroup)
+            exportFileName = KeychainExport.suggestedFileName(accessGroup: accessGroup)
+            exportDocument = JSONDocument(data: data)
+
+            let withoutData = targets.filter { !$0.isDataReadable }.count
+            var parts = ["已准备 \(targets.count) 条"]
+            if groups.count > 1 { parts.append("跨 \(groups.count) 个组") }
+            if withoutData > 0 { parts.append("\(withoutData) 条数据不可读，仅导出属性") }
+            statusMessage = parts.joined(separator: " · ")
+        } catch {
+            alertMessage = "导出失败：\(error.localizedDescription)"
+        }
+    }
+
+    /// 解析并写入一份导出文件。
+    ///
+    /// `overrideGroup` 为空时沿用文件里每条自带的 `agrp`。
+    func importFile(at url: URL, overrideGroup: String, replaceExisting: Bool) {
+        guard !isImporting else { return }
+
+        // 文件来自「文件」App，必须先取得安全作用域访问权
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+
+        let parsed: KeychainExport.ParsedFile
+        do {
+            parsed = try KeychainExport.parse(try Data(contentsOf: url))
+        } catch {
+            alertMessage = "读取失败：\(error.localizedDescription)"
+            return
+        }
+
+        isImporting = true
+        statusMessage = "正在导入 0/\(parsed.items.count)…"
+
+        let group = overrideGroup.trimmingCharacters(in: .whitespacesAndNewlines)
+        let items = parsed.items
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let outcome = KeychainStore.importItems(items,
+                                                    overrideGroup: group.isEmpty ? nil : group,
+                                                    replaceExisting: replaceExisting) { done, total in
+                if done % 20 == 0 {
+                    DispatchQueue.main.async {
+                        self?.statusMessage = "正在导入 \(done)/\(total)…"
+                    }
+                }
+            }
+
+            DispatchQueue.main.async {
+                self?.finishImport(outcome)
+            }
+        }
+    }
+
+    private func finishImport(_ outcome: KeychainStore.ImportOutcome) {
+        isImporting = false
+
+        var parts = ["新增 \(outcome.added) 条"]
+        if outcome.replaced > 0 { parts.append("覆盖 \(outcome.replaced) 条") }
+        if !outcome.failures.isEmpty { parts.append("失败 \(outcome.failures.count) 条") }
+        statusMessage = parts.joined(separator: " · ")
+
+        if !outcome.failures.isEmpty {
+            importReport = outcome.failures.map {
+                "「\($0.title)」\(KeychainStore.message(for: $0.status))"
+            }
+        }
+
+        // 写入后必须重查：新条目的持久引用、系统补上的属性都只能从钥匙串拿
+        refresh()
+    }
+
     // MARK: - 修改元数据
 
     /// 改完立刻重查该条目的属性，让详情页显示的是系统里真实的值而不是我们以为写进去的值
