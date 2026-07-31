@@ -20,12 +20,20 @@ enum KeychainScope: Equatable, Hashable {
 
 struct KeychainClassError {
     let itemClass: KeychainItemClass
+    /// nil 表示这次是不限定 Access Group 的查询
+    let accessGroup: String?
     let status: OSStatus
+
+    var description: String {
+        let scope = accessGroup.map { "「\($0)」" } ?? ""
+        return "\(itemClass.displayName)\(scope)：\(KeychainStore.message(for: status))"
+    }
 }
 
 struct KeychainFetchResult {
     var items: [KeychainItem] = []
-    /// 按类别记录查询失败原因；只要有失败就不能把「查到 0 条」当成「确实没有」
+    /// 逐个类别 / Access Group 记录失败原因；
+    /// 只要有失败就不能把「查到 0 条」当成「确实没有」
     var classErrors: [KeychainClassError] = []
 }
 
@@ -52,44 +60,55 @@ enum KeychainStore {
     /// 2. 再逐条按持久引用取数据，单条失败不影响其它条目照常显示和删除。
     static func fetchItems(scope: KeychainScope,
                           classes: [KeychainItemClass],
+                          knownGroups: [String] = [],
                           loadData: Bool = true,
                           progress: ((String) -> Void)? = nil) -> KeychainFetchResult {
         var result = KeychainFetchResult()
         var rows: [(KeychainItemClass, [String: Any])] = []
 
+        // 逐组枚举而不是一次不限组的广查询。
+        //
+        // 不限组查询会横跨全部 entitlement 组，只要其中一个组出问题
+        // （实机上是 com.apple.token 触发验证），整个类别一起返回 errSecAuthFailed，
+        // 该类别的条目就全部看不到了。逐组之后单个组失败只影响它自己。
+        //
+        // 前提是拿得到完整的组列表 —— 通配符组在查询里是**字面匹配**，
+        // 用 `TEAMID.*` 查只会返回 agrp 恰好等于该字符串的条目，
+        // 不会展开命中 `TEAMID.foo.bar`，所以必须逐个真实组名去查。
+        let targets: [String?]
+        switch scope {
+        case .group(let group):
+            targets = [group]
+        case .allAccessible:
+            // 组列表为空时退回不限组查询，至少还能看到点东西
+            targets = knownGroups.isEmpty ? [nil] : knownGroups.map { Optional($0) }
+        }
+
+        let total = classes.count * targets.count
+        var completed = 0
+
         for itemClass in classes {
-            progress?("正在枚举\(itemClass.displayName)条目…")
-
-            var query: [String: Any] = [
-                kSecClass as String: itemClass.secClass,
-                kSecMatchLimit as String: kSecMatchLimitAll,
-                kSecReturnAttributes as String: true,
-                kSecReturnPersistentRef as String: true,
-                // 缺省只返回非同步条目，iCloud 同步的条目会整批隐身
-                kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
-            ]
-            if case .group(let group) = scope {
-                query[kSecAttrAccessGroup as String] = group
-            }
-
-            var output: AnyObject?
-            let status = SecItemCopyMatching(query as CFDictionary, &output)
-
-            switch status {
-            case errSecSuccess:
-                if let array = output as? [[String: Any]] {
-                    for attributes in array {
-                        rows.append((itemClass, attributes))
-                    }
-                } else if let single = output as? [String: Any] {
-                    rows.append((itemClass, single))
+            for target in targets {
+                completed += 1
+                if total <= 1 || completed % 10 == 0 || completed == total {
+                    progress?("正在枚举\(itemClass.displayName)条目 \(completed)/\(total)…")
                 }
-            case errSecItemNotFound:
-                break
-            default:
-                result.classErrors.append(KeychainClassError(itemClass: itemClass, status: status))
+
+                let outcome = enumerate(itemClass: itemClass, accessGroup: target)
+
+                switch outcome.status {
+                case errSecSuccess, errSecItemNotFound:
+                    rows.append(contentsOf: outcome.rows.map { (itemClass, $0) })
+                default:
+                    result.classErrors.append(KeychainClassError(itemClass: itemClass,
+                                                                 accessGroup: target,
+                                                                 status: outcome.status))
+                }
             }
         }
+
+        // 同一条目可能被多个组名命中（例如字面存在的通配符组），按持久引用去重
+        rows = deduplicate(rows)
 
         var items: [KeychainItem] = []
         items.reserveCapacity(rows.count)
@@ -125,6 +144,54 @@ enum KeychainStore {
 
     private static func classOrder(_ itemClass: KeychainItemClass) -> Int {
         KeychainItemClass.allCases.firstIndex(of: itemClass) ?? 0
+    }
+
+    /// 枚举单个类别。`accessGroup` 为 nil 表示不限定组。
+    ///
+    /// 这里**不**跳过需要验证的条目：keychain 只加密 `v_Data`，属性本身是明文，
+    /// 取属性不需要解密，因此受保护条目也能被列出来（数据留到 `copyData` 再处理，
+    /// 那里会跳过验证并如实报 errSecInteractionNotAllowed，界面标注「受保护」）。
+    private static func enumerate(itemClass: KeychainItemClass,
+                                 accessGroup: String?) -> (rows: [[String: Any]], status: OSStatus) {
+        var query: [String: Any] = [
+            kSecClass as String: itemClass.secClass,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnAttributes as String: true,
+            kSecReturnPersistentRef as String: true,
+            // 缺省只返回非同步条目，iCloud 同步的条目会整批隐身
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
+        ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+
+        var output: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &output)
+        guard status == errSecSuccess else { return ([], status) }
+
+        if let array = output as? [[String: Any]] { return (array, status) }
+        if let single = output as? [String: Any] { return ([single], status) }
+        return ([], status)
+    }
+
+    /// 按持久引用去重；拿不到持久引用的条目一律保留，宁可重复也不丢
+    private static func deduplicate(
+        _ rows: [(KeychainItemClass, [String: Any])]
+    ) -> [(KeychainItemClass, [String: Any])] {
+        var seen = Set<Data>()
+        var unique: [(KeychainItemClass, [String: Any])] = []
+        unique.reserveCapacity(rows.count)
+
+        for row in rows {
+            guard let reference = row.1[kSecValuePersistentRef as String] as? Data else {
+                unique.append(row)
+                continue
+            }
+            if seen.insert(reference).inserted {
+                unique.append(row)
+            }
+        }
+        return unique
     }
 
     /// 单条读取数据；返回的 status 用于向用户解释「为什么这条读不出来」。

@@ -408,14 +408,24 @@ struct KeychainItemRow: View {
 struct ScopeSettingsView: View {
     @ObservedObject var viewModel: KeychainViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var groupFilter = ""
+
+    /// 签名 entitlements 里动辄上百个组（LiveContainer 有 128 个 shared.N），需要筛选才能用
+    private var matchingGroups: [String] {
+        let keyword = groupFilter.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !keyword.isEmpty else { return viewModel.detectedGroups }
+        return viewModel.detectedGroups.filter { $0.lowercased().contains(keyword) }
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
                     Toggle("查询全部可访问条目", isOn: $viewModel.useAllGroups)
+                } header: {
+                    Text("查询范围")
                 } footer: {
-                    Text("开启时不限定 Access Group，返回本应用有权访问的所有条目。若通配符 Group 因缺少 entitlement 查不到数据，请保持开启。")
+                    Text("开启后遍历下方全部 \(viewModel.detectedGroups.count) 个 Access Group。逐组查询可以避免某个组出问题时整个类别一起查不到。")
                 }
 
                 if !viewModel.useAllGroups {
@@ -423,9 +433,17 @@ struct ScopeSettingsView: View {
                         TextField("例如 TEAMID.com.example.app", text: $viewModel.targetGroup)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
+                    }
 
-                        if !viewModel.detectedGroups.isEmpty {
-                            ForEach(viewModel.detectedGroups, id: \.self) { group in
+                    if !viewModel.detectedGroups.isEmpty {
+                        Section {
+                            if viewModel.detectedGroups.count > 8 {
+                                TextField("筛选组名", text: $groupFilter)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                            }
+
+                            ForEach(matchingGroups, id: \.self) { group in
                                 Button {
                                     viewModel.targetGroup = group
                                 } label: {
@@ -441,6 +459,8 @@ struct ScopeSettingsView: View {
                                     }
                                 }
                             }
+                        } header: {
+                            Text("已识别的组（\(matchingGroups.count)/\(viewModel.detectedGroups.count)）")
                         }
                     }
                 }
