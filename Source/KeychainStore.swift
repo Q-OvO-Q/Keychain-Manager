@@ -36,6 +36,8 @@ struct KeychainFetchResult {
     /// 逐个类别 / Access Group 记录失败原因；
     /// 只要有失败就不能把「查到 0 条」当成「确实没有」
     var classErrors: [KeychainClassError] = []
+    /// 探测到、但没能出现在 items 里的条目数。0 表示没有遗漏或探测未生效
+    var hiddenItemCount = 0
 }
 
 // MARK: - 操作结果
@@ -189,7 +191,44 @@ enum KeychainStore {
         }
 
         result.items = items
+
+        // 只在用户已经接受弹验证的模式下探测，猜错了也不会影响默认路径
+        if case .allAccessible = scope, includeProtected {
+            let listed = Set(items.compactMap(\.persistentRef))
+            var hidden = 0
+            for itemClass in classes {
+                guard let refs = probeReferences(itemClass: itemClass) else { continue }
+                hidden += refs.subtracting(listed).count
+            }
+            result.hiddenItemCount = hidden
+        }
+
         return result
+    }
+
+    /// 只要持久引用、不要属性的探测查询。
+    ///
+    /// 猜测：枚举时之所以要求验证，是因为要解密**元数据**才能返回属性。
+    /// 持久引用只是 class + rowid，不涉及解密，也许就不触发验证。
+    /// 若猜测成立，这里能数出「因为需要验证而没能列出」的条目 ——
+    /// 那是通配符 entitlement 下唯一补不上的缺口（组名未知、且组内条目全部受保护）。
+    ///
+    /// 纯诊断用途：失败就返回 nil，不影响任何已有结果。
+    private static func probeReferences(itemClass: KeychainItemClass) -> Set<Data>? {
+        // 刻意不设 kSecUseAuthenticationUI —— 要验的就是「不 skip 时能不能拿到」
+        let query: [String: Any] = [
+            kSecClass as String: itemClass.secClass,
+            kSecMatchLimit as String: kSecMatchLimitAll,
+            kSecReturnPersistentRef as String: true,
+            kSecAttrSynchronizable as String: kSecAttrSynchronizableAny
+        ]
+
+        var output: AnyObject?
+        guard SecItemCopyMatching(query as CFDictionary, &output) == errSecSuccess else { return nil }
+
+        if let array = output as? [Data] { return Set(array) }
+        if let single = output as? Data { return Set([single]) }
+        return nil
     }
 
     private static func classOrder(_ itemClass: KeychainItemClass) -> Int {
