@@ -432,14 +432,17 @@ enum KeychainStore {
 
     /// 可以改的元数据。
     ///
-    /// 主键属性（account / service / server / agrp / sync 等）不在此列：
-    /// 改它们等于把条目挪到另一个主键上，会和已存在的条目撞车返回
-    /// errSecDuplicateItem，风险远大于收益。这里只放纯描述性字段
-    /// 和保护级别。
+    /// 主键属性不在此列：改它们等于把条目挪到另一个主键上，会和已存在的条目
+    /// 撞车返回 errSecDuplicateItem，风险远大于收益。
+    ///
+    /// 网络密码看起来元数据更多（srvr / ptcl / atyp / port / path / sdmn），
+    /// 但那几项**全都是它的主键**，所以两类密码可改的其实是同一批非主键字段。
     enum EditableAttribute: String, CaseIterable, Identifiable {
         case label
         case comment
         case description
+        case creator
+        case type
         case accessible
         case invisible
         case negative
@@ -451,6 +454,8 @@ enum KeychainStore {
             case .label:       return kSecAttrLabel as String
             case .comment:     return kSecAttrComment as String
             case .description: return kSecAttrDescription as String
+            case .creator:     return kSecAttrCreator as String
+            case .type:        return kSecAttrType as String
             case .accessible:  return kSecAttrAccessible as String
             case .invisible:   return kSecAttrIsInvisible as String
             case .negative:    return kSecAttrIsNegative as String
@@ -462,19 +467,64 @@ enum KeychainStore {
             case .label:       return "标签 (labl)"
             case .comment:     return "备注 (icmt)"
             case .description: return "描述 (desc)"
+            case .creator:     return "创建者 (crtr)"
+            case .type:        return "类型码 (type)"
             case .accessible:  return "可访问性 (pdmn)"
             case .invisible:   return "隐藏 (invi)"
             case .negative:    return "占位条目 (nega)"
             }
         }
 
-        var isBoolean: Bool {
-            self == .invisible || self == .negative
+        enum Kind {
+            case text
+            case boolean
+            case accessibility
+            /// 四字符码：系统按 32 位整数存储，写成 'aapl' 这样四个字符更好认
+            case fourCharCode
+        }
+
+        var kind: Kind {
+            switch self {
+            case .invisible, .negative:  return .boolean
+            case .accessible:            return .accessibility
+            case .creator, .type:        return .fourCharCode
+            default:                     return .text
+            }
         }
 
         /// 证书 / 密钥的描述性字段由系统维护，只放开密码类
         static func available(for itemClass: KeychainItemClass) -> [EditableAttribute] {
             itemClass.supportsDataEditing ? allCases : []
+        }
+    }
+
+    /// `kSecAttrCreator` / `kSecAttrType` 存的是 32 位整数，
+    /// 但惯例是当成四个 ASCII 字符看（例如 'aapl'）。两种写法都接受。
+    enum FourCharCode {
+        static func text(from value: Any?) -> String {
+            guard let number = value as? NSNumber else { return "" }
+            let raw = number.uint32Value
+            let bytes = [UInt8(truncatingIfNeeded: raw >> 24),
+                         UInt8(truncatingIfNeeded: raw >> 16),
+                         UInt8(truncatingIfNeeded: raw >> 8),
+                         UInt8(truncatingIfNeeded: raw)]
+            // 四个字节都可打印才按字符显示，否则退回十进制
+            if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
+                return String(decoding: bytes, as: UTF8.self)
+            }
+            return String(raw)
+        }
+
+        static func number(from text: String) -> NSNumber? {
+            let trimmed = text.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty else { return nil }
+
+            if let decimal = UInt32(trimmed) { return NSNumber(value: decimal) }
+
+            let bytes = Array(trimmed.utf8)
+            guard bytes.count == 4 else { return nil }
+            let raw = bytes.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            return NSNumber(value: raw)
         }
     }
 
@@ -550,6 +600,9 @@ enum KeychainStore {
         var label: String = ""
         var itemDescription: String = ""
         var comment: String = ""
+        /// 四字符码文本，留空表示不设置
+        var creator: String = ""
+        var typeCode: String = ""
         var isInvisible = false
         var isNegative = false
     }
@@ -578,6 +631,12 @@ enum KeychainStore {
         }
         if !newItem.comment.isEmpty {
             attributes[kSecAttrComment as String] = newItem.comment
+        }
+        if let creator = FourCharCode.number(from: newItem.creator) {
+            attributes[kSecAttrCreator as String] = creator
+        }
+        if let typeCode = FourCharCode.number(from: newItem.typeCode) {
+            attributes[kSecAttrType as String] = typeCode
         }
         if newItem.isInvisible {
             attributes[kSecAttrIsInvisible as String] = true

@@ -310,6 +310,17 @@ enum KeychainAttributeFormatter {
         return key
     }
 
+    /// crtr / type 存的是 32 位整数，但惯例按四个 ASCII 字符看，
+    /// 直接显示数字（如 1634758764）没人认得出来
+    static func value(_ value: Any, forKey key: String) -> String {
+        let fourCharCodeKeys = [kSecAttrCreator as String, kSecAttrType as String]
+        if fourCharCodeKeys.contains(key), let number = value as? NSNumber {
+            let code = KeychainStore.FourCharCode.text(from: number)
+            return code == number.stringValue ? code : "\(code)  ·  \(number.stringValue)"
+        }
+        return self.value(value)
+    }
+
     static func value(_ value: Any) -> String {
         if let string = value as? String { return string.isEmpty ? "(空字符串)" : string }
         if let date = value as? Date { return dateFormatter.string(from: date) }

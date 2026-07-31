@@ -18,6 +18,8 @@ struct AddItemView: View {
     @State private var tagValue = ""
     @State private var itemDescription = ""
     @State private var comment = ""
+    @State private var creator = ""
+    @State private var typeCode = ""
     @State private var isInvisible = false
     @State private var isNegative = false
 
@@ -81,12 +83,20 @@ struct AddItemView: View {
                         .textInputAutocapitalization(.never)
                     TextField("备注 (icmt)", text: $comment)
                         .textInputAutocapitalization(.never)
+                    TextField("创建者 (crtr)，如 aapl 或十进制", text: $creator)
+                        .font(.system(.body, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("类型码 (type)，如 aapl 或十进制", text: $typeCode)
+                        .font(.system(.body, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
                     Toggle("隐藏 (invi)", isOn: $isInvisible)
                     Toggle("占位条目 (nega)", isOn: $isNegative)
                 } header: {
                     Text("元数据（可选）")
                 } footer: {
-                    Text("与详情页「可修改的元数据」一致，写入后仍可修改。")
+                    Text("与详情页「可修改的元数据」一致，写入后仍可修改。crtr / type 解析不出四字符码或十进制时会被忽略。")
                 }
 
                 tagSection
@@ -238,6 +248,8 @@ struct AddItemView: View {
         newItem.label = label
         newItem.itemDescription = itemDescription
         newItem.comment = comment
+        newItem.creator = creator
+        newItem.typeCode = typeCode
         newItem.isInvisible = isInvisible
         newItem.isNegative = isNegative
 
