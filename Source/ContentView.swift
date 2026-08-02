@@ -862,7 +862,7 @@ struct FailureDetailView: View {
         FailureDetailView(
             failures: failures,
             title: "导入失败",
-            explanation: "-25299 表示主键相同的条目已存在（可在导入选项里开启覆盖）；-34018 表示目标组没有权限；-50 表示属性组合不被接受。"
+            explanation: "安全隔区密钥无法导入是原理限制，不是错误。其余：条目已存在可在导入选项里开启覆盖；缺少权限说明目标组不可写。"
         )
     }
 
