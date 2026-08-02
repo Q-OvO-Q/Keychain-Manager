@@ -85,6 +85,7 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
         case .key:
             return [kSecAttrApplicationLabel, kSecAttrApplicationTag, kSecAttrKeyClass,
                     kSecAttrKeyType, kSecAttrKeySizeInBits, kSecAttrEffectiveKeySize,
+                    kSecAttrCreator,
                     kSecAttrIsPermanent, kSecAttrCanEncrypt, kSecAttrCanDecrypt,
                     kSecAttrCanDerive, kSecAttrCanSign, kSecAttrCanVerify,
                     kSecAttrCanWrap, kSecAttrCanUnwrap]

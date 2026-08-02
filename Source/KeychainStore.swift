@@ -544,7 +544,9 @@ enum KeychainStore {
                 return [.label, .description, .comment, .creator, .type,
                         .accessible, .invisible, .negative]
             case .key:
-                return [.label, .accessible, .isPermanent,
+                // crtr 在文档里只列在密码类下，但密钥表确实有这一列（导出文件里带着它），
+                // 且带 crtr 的密钥本来就能被 SecItemAdd 接受 —— 有实证就放开
+                return [.label, .accessible, .creator, .isPermanent,
                         .canEncrypt, .canDecrypt, .canDerive,
                         .canSign, .canVerify, .canWrap, .canUnwrap]
             case .certificate:
