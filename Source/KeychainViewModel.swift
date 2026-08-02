@@ -645,9 +645,7 @@ final class KeychainViewModel: ObservableObject {
         statusMessage = parts.joined(separator: " · ")
 
         if !outcome.failures.isEmpty {
-            importReport = outcome.failures.map {
-                "「\($0.title)」\(KeychainStore.message(for: $0.status))"
-            }
+            importReport = outcome.failures.map { "「\($0.title)」\($0.reason)" }
         }
 
         // 写入后必须重查：新条目的持久引用、系统补上的属性都只能从钥匙串拿

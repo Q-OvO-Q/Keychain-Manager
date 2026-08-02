@@ -851,12 +851,43 @@ enum KeychainStore {
 
     // MARK: - 导入
 
+    struct ImportFailure {
+        let title: String
+        /// 直接给原因，而不是甩一个错误码 —— 有些失败（安全隔区密钥）
+        /// 是原理上不可能成功的，光看 -50 会以为是程序出错
+        let reason: String
+    }
+
     struct ImportOutcome {
         var added = 0
         var replaced = 0
-        var failures: [(title: String, status: OSStatus)] = []
+        var failures: [ImportFailure] = []
 
         var attempted: Int { added + replaced + failures.count }
+    }
+
+    /// `SecItemAdd` 能接受的属性。
+    ///
+    /// **不能照搬「securityd 回传什么就送回什么」** —— 那条规则对查询成立，对添加不成立：
+    /// 添加时会校验属性集合，碰到 `tkid` / `priv` / `modi` / `next` / `extr`
+    /// 这类只读属性会整条返回 errSecParam，一个属性就废掉一整条。
+    ///
+    /// 白名单由已有定义推导（主键属性 + 可编辑属性 + 数据），不另立一套，
+    /// 以后增删类别或调整主键定义时会自动跟上。
+    private static func settableAttributes(for itemClass: KeychainItemClass) -> Set<String> {
+        // 证书的身份全部来自 DER，除标签和保护级别外一概不能手给
+        if itemClass == .certificate {
+            return [kSecAttrLabel, kSecAttrAccessible,
+                    kSecAttrAccessGroup, kSecAttrSynchronizable].map { $0 as String }
+                .reduce(into: Set<String>()) { $0.insert($1) }
+        }
+
+        var keys = Set(itemClass.primaryKeyAttributes)
+        for attribute in EditableAttribute.available(for: itemClass) {
+            keys.insert(attribute.key)
+        }
+        keys.insert(kSecValueData as String)
+        return keys
     }
 
     /// 按导入文件里的属性直接写入。
@@ -875,7 +906,13 @@ enum KeychainStore {
         for (index, item) in items.enumerated() {
             progress?(index, items.count)
 
-            var attributes = item.attributes
+            if let reason = unimportableReason(item) {
+                outcome.failures.append(ImportFailure(title: describe(item), reason: reason))
+                continue
+            }
+
+            let settable = settableAttributes(for: item.itemClass)
+            var attributes = item.attributes.filter { settable.contains($0.key) }
             attributes[kSecClass as String] = item.itemClass.secClass
 
             let group = overrideGroup?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -892,7 +929,8 @@ enum KeychainStore {
             if item.itemClass == .certificate {
                 guard let der = attributes[kSecValueData as String] as? Data,
                       let certificate = SecCertificateCreateWithData(nil, der as CFData) else {
-                    outcome.failures.append((describe(item), errSecDecode))
+                    outcome.failures.append(ImportFailure(title: describe(item),
+                                                        reason: "不是合法的 DER 证书"))
                     continue
                 }
                 attributes.removeValue(forKey: kSecValueData as String)
@@ -906,18 +944,21 @@ enum KeychainStore {
 
             case errSecDuplicateItem:
                 guard replaceExisting else {
-                    outcome.failures.append((describe(item), status))
+                    outcome.failures.append(ImportFailure(title: describe(item),
+                                                        reason: message(for: status)))
                     continue
                 }
                 let replaceStatus = replace(attributes: attributes, itemClass: item.itemClass)
                 if replaceStatus == errSecSuccess {
                     outcome.replaced += 1
                 } else {
-                    outcome.failures.append((describe(item), replaceStatus))
+                    outcome.failures.append(ImportFailure(title: describe(item),
+                                                        reason: message(for: replaceStatus)))
                 }
 
             default:
-                outcome.failures.append((describe(item), status))
+                outcome.failures.append(ImportFailure(title: describe(item),
+                                                        reason: message(for: status)))
             }
         }
 
@@ -946,6 +987,25 @@ enum KeychainStore {
         guard !changes.isEmpty else { return errSecSuccess }
 
         return SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+    }
+
+    /// 有些条目在原理上就导不进来，与其让它撞进 SecItemAdd 拿一个 -50，
+    /// 不如提前识别并说清楚为什么。
+    private static func unimportableReason(_ item: KeychainExport.ParsedItem) -> String? {
+        guard item.itemClass == .key else { return nil }
+
+        // 安全隔区里生成的密钥：材料从不离开芯片，导出文件里本来就没有 v_Data，
+        // 任何工具都无法重建
+        if let token = KeychainItem.stringValue(item.attributes["tkid"]), !token.isEmpty {
+            return "由安全隔区（\(token)）生成，密钥材料从不离开芯片，无法导入"
+        }
+
+        // 不可导出的密钥同理：导出时就没带出内容
+        if item.attributes[kSecValueData as String] == nil {
+            return "导出文件里没有密钥内容（该密钥不可导出），无法重建"
+        }
+
+        return nil
     }
 
     private static func describe(_ item: KeychainExport.ParsedItem) -> String {
