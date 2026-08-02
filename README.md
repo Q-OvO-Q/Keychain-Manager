@@ -1,6 +1,6 @@
 # Keychain Manager
 
-一个用于查看、编辑、标记和删除 iOS Keychain 条目的 SwiftUI 工具。
+一个用于查看、编辑、标记、删除、批量导入和导出 iOS Keychain 条目的 SwiftUI 工具。
 
 ## 功能
 
@@ -9,6 +9,7 @@
 - 按 App 打标签，支持标签筛选、批量打标签 / 取消标签 / 删除
 - 全文搜索（标题、账号、Access Group、标签、内容）
 - 从内嵌的 `embedded.mobileprovision` 自动识别可用的 Keychain Access Group
+- 以json格式批量导入和导出Keychain Items
 
 ## 构建
 
@@ -29,14 +30,5 @@ Keychain 的可见范围完全由**签名时的 entitlements** 决定，与本�
 - **指定 Access Group**：只有 entitlements 里已声明的组才查得到，否则返回
   `errSecMissingEntitlement (-34018)`，界面会直接显示该错误。
 - 通配符组 `TEAMID.*` 需要签名时确实授予了通配符 keychain-access-groups 权限；
-  它只是权限声明，**不能**作为新增条目的写入目标。
 
-要看到其它 App 的条目，需要用带相应 keychain-access-groups 的证书重签名。
-
-## 已知限制
-
-- 密钥与证书条目只支持查看和删除，`kSecValueData` 由系统管理，不支持修改。
-- 受保护的条目（如 `WhenPasscodeSetThisDeviceOnly`）在设备锁定时读不出数据，
-  列表会标注「受保护」，但仍然可以删除。
-- App 标签保存在本地 `UserDefaults`，不随条目同步；标签键由
-  `类别|||标题|||账号|||AccessGroup` 组成，理论上主键其余字段不同的条目会共用标签。
+要看到其它 App 的条目，需要用带相应 keychain-access-groups 的证书和entitlements文件重签名。
