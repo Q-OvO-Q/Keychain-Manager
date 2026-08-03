@@ -842,9 +842,10 @@ enum KeychainStore {
             }
         }
 
-        // 通配符 Group 只是权限声明，不是可写入的实际 Group
+        // 通配符组同样可以写入：钥匙串把它当成普通组名存下来，
+        // 查询时也只按字面匹配。之前按「它只是权限声明」把它剥掉是错的。
         let group = newItem.accessGroup.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !group.isEmpty && !isWildcardGroup(group) {
+        if !group.isEmpty {
             attributes[kSecAttrAccessGroup as String] = group
         }
 
@@ -920,11 +921,6 @@ enum KeychainStore {
             let group = overrideGroup?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !group.isEmpty {
                 attributes[kSecAttrAccessGroup as String] = group
-            }
-            // 通配符组只是权限声明，写不进去
-            if let target = attributes[kSecAttrAccessGroup as String] as? String,
-               isWildcardGroup(target) {
-                attributes.removeValue(forKey: kSecAttrAccessGroup as String)
             }
 
             // 证书由 DER 决定身份，必须还原成 SecCertificate 再交给 kSecValueRef
@@ -1019,11 +1015,6 @@ enum KeychainStore {
             }
         }
         return "(\(item.itemClass.displayName)条目)"
-    }
-
-    /// 通配符 Group（TEAMID.*）无法作为写入目标
-    static func isWildcardGroup(_ group: String) -> Bool {
-        group.trimmingCharacters(in: .whitespacesAndNewlines).hasSuffix("*")
     }
 
     // MARK: - 错误描述

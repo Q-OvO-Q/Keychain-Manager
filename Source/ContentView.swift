@@ -748,7 +748,7 @@ struct ImportOptionsView: View {
 
     private var matchingGroups: [String] {
         let keyword = groupOverride.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let writable = viewModel.detectedGroups.filter { !KeychainStore.isWildcardGroup($0) }
+        let writable = viewModel.detectedGroups
         guard !keyword.isEmpty else { return writable }
         if writable.contains(where: { $0.lowercased() == keyword }) { return writable }
         return writable.filter { $0.lowercased().contains(keyword) }
