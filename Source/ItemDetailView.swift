@@ -357,7 +357,8 @@ struct ItemDetailView: View {
 
     @ViewBuilder
     private func editableAttributesSection(_ item: KeychainItem) -> some View {
-        let editable = KeychainStore.EditableAttribute.available(for: item.itemClass)
+        // 按控件类型排序，文本 / 四字符码 / 选择器 / 开关各自成段
+        let editable = KeychainStore.EditableAttribute.ordered(for: item.itemClass)
 
         if !editable.isEmpty {
             Section {
