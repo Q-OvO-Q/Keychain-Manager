@@ -449,8 +449,8 @@ enum KeychainStore {
     /// 但那几项**全都是它的主键**，所以两类密码可改的其实是同一批非主键字段。
     enum EditableAttribute: String, CaseIterable, Identifiable {
         case label
-        case comment
         case description
+        case comment
         case creator
         case type
         case accessible
@@ -510,12 +510,14 @@ enum KeychainStore {
             }
         }
 
-        enum Kind {
-            case text
-            case boolean
-            case accessibility
-            /// 四字符码：系统按 32 位整数存储，写成 'aapl' 这样四个字符更好认
-            case fourCharCode
+        enum Kind: Int, Comparable {
+            // rawValue 就是界面上的排列次序：同类控件聚在一起，不互相穿插
+            case text = 0
+            case fourCharCode = 1
+            case accessibility = 2
+            case boolean = 3
+
+            static func < (lhs: Kind, rhs: Kind) -> Bool { lhs.rawValue < rhs.rawValue }
         }
 
         var kind: Kind {
@@ -530,6 +532,19 @@ enum KeychainStore {
                 return .fourCharCode
             case .label, .comment, .description:
                 return .text
+            }
+        }
+
+        /// 按控件类型排好序的可编辑属性，界面直接照这个顺序渲染。
+        /// 排序集中在这里，各页面就不必各自维护一份顺序 —— 之前新增页排了、
+        /// 详情页没排，同一批字段在两个界面上的次序就不一样了。
+        static func ordered(for itemClass: KeychainItemClass) -> [EditableAttribute] {
+            let declarationOrder = Dictionary(uniqueKeysWithValues:
+                allCases.enumerated().map { ($1, $0) })
+            return available(for: itemClass).sorted { lhs, rhs in
+                lhs.kind != rhs.kind
+                    ? lhs.kind < rhs.kind
+                    : (declarationOrder[lhs] ?? 0) < (declarationOrder[rhs] ?? 0)
             }
         }
 
@@ -820,26 +835,29 @@ enum KeychainStore {
             attributes[kSecAttrLabel as String] = newItem.label
         }
 
-        // 其余描述性字段只有密码类有对应的列
-        if newItem.itemClass.supportsDataEditing {
-            if !newItem.itemDescription.isEmpty {
-                attributes[kSecAttrDescription as String] = newItem.itemDescription
-            }
-            if !newItem.comment.isEmpty {
-                attributes[kSecAttrComment as String] = newItem.comment
-            }
-            if let creator = FourCharCode.number(from: newItem.creator) {
-                attributes[kSecAttrCreator as String] = creator
-            }
-            if let typeCode = FourCharCode.number(from: newItem.typeCode) {
-                attributes[kSecAttrType as String] = typeCode
-            }
-            if newItem.isInvisible {
-                attributes[kSecAttrIsInvisible as String] = true
-            }
-            if newItem.isNegative {
-                attributes[kSecAttrIsNegative as String] = true
-            }
+        // 描述性字段按该类别**实际可编辑**的集合来判断，而不是按「是不是密码类」
+        // 一刀切 —— crtr 对密钥也是可设的，一刀切会让界面填了却发不出去。
+        let editable = Set(EditableAttribute.available(for: newItem.itemClass).map(\.key))
+
+        if editable.contains(kSecAttrDescription as String), !newItem.itemDescription.isEmpty {
+            attributes[kSecAttrDescription as String] = newItem.itemDescription
+        }
+        if editable.contains(kSecAttrComment as String), !newItem.comment.isEmpty {
+            attributes[kSecAttrComment as String] = newItem.comment
+        }
+        if editable.contains(kSecAttrCreator as String),
+           let creator = FourCharCode.number(from: newItem.creator) {
+            attributes[kSecAttrCreator as String] = creator
+        }
+        if editable.contains(kSecAttrType as String),
+           let typeCode = FourCharCode.number(from: newItem.typeCode) {
+            attributes[kSecAttrType as String] = typeCode
+        }
+        if editable.contains(kSecAttrIsInvisible as String), newItem.isInvisible {
+            attributes[kSecAttrIsInvisible as String] = true
+        }
+        if editable.contains(kSecAttrIsNegative as String), newItem.isNegative {
+            attributes[kSecAttrIsNegative as String] = true
         }
 
         // 通配符组同样可以写入：钥匙串把它当成普通组名存下来，

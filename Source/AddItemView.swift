@@ -120,39 +120,60 @@ struct AddItemView: View {
 
     // MARK: - 分区
 
+    /// 该类别可编辑的属性键。与详情页共用同一份定义 ——
+    /// 之前这里按 supportsDataEditing 粗暴地一刀切，
+    /// 于是 crtr 对密钥「可编辑、可导入，却没法在新增时填」。
+    private var editableKeys: Set<String> {
+        Set(KeychainStore.EditableAttribute.available(for: itemClass).map(\.key))
+    }
+
+    private func canEdit(_ attribute: KeychainStore.EditableAttribute) -> Bool {
+        editableKeys.contains(attribute.key)
+    }
+
     /// 纯文本字段，不与开关、选择器混排
     @ViewBuilder
     private var metadataSection: some View {
         Section {
-            TextField("标签 (labl)", text: $label)
-                .textInputAutocapitalization(.never)
-
-            // 其余描述性字段只有密码类的表里才有对应的列
-            if itemClass.supportsDataEditing {
+            if canEdit(.label) {
+                TextField("标签 (labl)", text: $label)
+                    .textInputAutocapitalization(.never)
+            }
+            if canEdit(.description) {
                 TextField("描述 (desc)", text: $itemDescription)
                     .textInputAutocapitalization(.never)
+            }
+            if canEdit(.comment) {
                 TextField("备注 (icmt)", text: $comment)
                     .textInputAutocapitalization(.never)
+            }
+            if canEdit(.creator) {
                 TextField("创建者 (crtr) — aapl 或十进制", text: $creator)
                     .font(.system(.body, design: .monospaced))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+            }
+            if canEdit(.type) {
                 TextField("类型码 (type) — aapl 或十进制", text: $typeCode)
                     .font(.system(.body, design: .monospaced))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
+            }
 
-                // 开关放本节末尾：同类控件聚在一起，但不脱离「元数据」这个分组
+            // 开关放本节末尾：同类控件聚在一起，但不脱离「元数据」这个分组
+            if canEdit(.invisible) {
                 Toggle("隐藏 (invi)", isOn: $isInvisible)
+            }
+            if canEdit(.negative) {
                 Toggle("占位条目 (nega)", isOn: $isNegative)
             }
         } header: {
             Text("元数据（可选）")
         } footer: {
-            if itemClass.supportsDataEditing {
+            if canEdit(.creator) {
                 Text("这些写入后都还能改。crtr / type 填不出四字符码或十进制时会被忽略。")
             } else {
-                Text("\(itemClass.displayName)只有 labl 可设，其余属性由系统从数据中解析。")
+                Text("这些写入后都还能改。")
             }
         }
     }
