@@ -120,8 +120,6 @@ struct AddItemView: View {
 
     // MARK: - 分区
 
-    /// 纯文本字段，不与开关、选择器混排
-    @ViewBuilder
     /// 该类别可编辑的属性键。与详情页共用同一份定义 ——
     /// 之前这里按 supportsDataEditing 粗暴地一刀切，
     /// 于是 crtr 对密钥「可编辑、可导入，却没法在新增时填」。
@@ -133,6 +131,8 @@ struct AddItemView: View {
         editableKeys.contains(attribute.key)
     }
 
+    /// 纯文本字段，不与开关、选择器混排
+    @ViewBuilder
     private var metadataSection: some View {
         Section {
             if canEdit(.label) {
