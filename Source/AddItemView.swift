@@ -44,9 +44,9 @@ struct AddItemView: View {
     @State private var canWrap = false
     @State private var canUnwrap = false
 
-    /// 通配符 Group 只是权限声明，不能作为写入目标
+    /// 通配符组同样可以写入 —— 钥匙串把它当普通组名存，查询也只按字面匹配
     private var writableGroups: [String] {
-        viewModel.detectedGroups.filter { !KeychainStore.isWildcardGroup($0) }
+        viewModel.detectedGroups
     }
 
     /// 输入框内容直接当筛选词；已精确命中某个组时不再收窄，
@@ -93,53 +93,14 @@ struct AddItemView: View {
 
                 dataSection
 
-                Section {
-                    Picker("可访问性 (pdmn)", selection: $accessible) {
-                        ForEach(AccessibleOption.all) { option in
-                            Text(option.title).tag(option.value)
-                        }
-                    }
-                    Toggle("iCloud 同步 (sync)", isOn: $synchronizable)
-                } header: {
-                    Text("保护级别")
-                } footer: {
-                    Text("两项写入后都不可再改。")
-                }
+                metadataSection
 
-                accessGroupSection
-
-                Section {
-                    TextField("标签 (labl)", text: $label)
-                        .textInputAutocapitalization(.never)
-
-                    // 其余描述性字段只有密码类的表里才有对应的列
-                    if itemClass.supportsDataEditing {
-                        TextField("描述 (desc)", text: $itemDescription)
-                            .textInputAutocapitalization(.never)
-                        TextField("备注 (icmt)", text: $comment)
-                            .textInputAutocapitalization(.never)
-                        TextField("创建者 (crtr) — aapl 或十进制", text: $creator)
-                            .font(.system(.body, design: .monospaced))
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        TextField("类型码 (type) — aapl 或十进制", text: $typeCode)
-                            .font(.system(.body, design: .monospaced))
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                        Toggle("隐藏 (invi)", isOn: $isInvisible)
-                        Toggle("占位条目 (nega)", isOn: $isNegative)
-                    }
-                } header: {
-                    Text("元数据（可选）")
-                } footer: {
-                    if itemClass.supportsDataEditing {
-                        Text("这些写入后都还能改。crtr / type 填不出四字符码或十进制时会被忽略。")
-                    } else {
-                        Text("\(itemClass.displayName)只有 labl 可设，其余属性由系统从数据中解析。")
-                    }
-                }
+                protectionSection
 
                 tagSection
+
+                // 组列表最长，放最后 —— 放中间的话得滑过上百行才够到后面的字段
+                accessGroupSection
             }
             .navigationTitle("新增条目")
             .navigationBarTitleDisplayMode(.inline)
@@ -159,6 +120,59 @@ struct AddItemView: View {
 
     // MARK: - 分区
 
+    /// 纯文本字段，不与开关、选择器混排
+    @ViewBuilder
+    private var metadataSection: some View {
+        Section {
+            TextField("标签 (labl)", text: $label)
+                .textInputAutocapitalization(.never)
+
+            // 其余描述性字段只有密码类的表里才有对应的列
+            if itemClass.supportsDataEditing {
+                TextField("描述 (desc)", text: $itemDescription)
+                    .textInputAutocapitalization(.never)
+                TextField("备注 (icmt)", text: $comment)
+                    .textInputAutocapitalization(.never)
+                TextField("创建者 (crtr) — aapl 或十进制", text: $creator)
+                    .font(.system(.body, design: .monospaced))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                TextField("类型码 (type) — aapl 或十进制", text: $typeCode)
+                    .font(.system(.body, design: .monospaced))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                // 开关放本节末尾：同类控件聚在一起，但不脱离「元数据」这个分组
+                Toggle("隐藏 (invi)", isOn: $isInvisible)
+                Toggle("占位条目 (nega)", isOn: $isNegative)
+            }
+        } header: {
+            Text("元数据（可选）")
+        } footer: {
+            if itemClass.supportsDataEditing {
+                Text("这些写入后都还能改。crtr / type 填不出四字符码或十进制时会被忽略。")
+            } else {
+                Text("\(itemClass.displayName)只有 labl 可设，其余属性由系统从数据中解析。")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var protectionSection: some View {
+        Section {
+            Picker("可访问性 (pdmn)", selection: $accessible) {
+                ForEach(AccessibleOption.all) { option in
+                    Text(option.title).tag(option.value)
+                }
+            }
+            Toggle("iCloud 同步 (sync)", isOn: $synchronizable)
+        } header: {
+            Text("保护级别")
+        } footer: {
+            Text("两项写入后都不可再改。")
+        }
+    }
+
     /// 各类别构成主键的那些字段。它们只能在新增时定：
     /// 一旦写入，改动等于把条目挪到另一个主键上。
     @ViewBuilder
@@ -176,6 +190,11 @@ struct AddItemView: View {
                 labeledField("Server (srvr)", "如 example.com", $title)
                 labeledField("Account (acct)", "用户名 / Email，可留空", $account)
                 labeledField("Security Domain (sdmn)", "可留空", $securityDomain)
+                labeledField("Port (port)", "如 443，可留空", $port)
+                    .keyboardType(.numberPad)
+                labeledField("Path (path)", "如 /login，可留空", $path)
+
+                // 选择器放本节末尾，不夹在文本框中间
                 Picker("Protocol (ptcl)", selection: $networkProtocol) {
                     ForEach(KeychainStore.AttributeOption.protocols) { option in
                         Text(option.title).tag(option.value)
@@ -186,9 +205,6 @@ struct AddItemView: View {
                         Text(option.title).tag(option.value)
                     }
                 }
-                labeledField("Port (port)", "如 443，可留空", $port)
-                    .keyboardType(.numberPad)
-                labeledField("Path (path)", "如 /login，可留空", $path)
             } header: {
                 Text("主键字段")
             } footer: {
@@ -197,6 +213,14 @@ struct AddItemView: View {
 
         case .key:
             Section {
+                labeledField("Key Size (bsiz)", "位数，如 2048", $keySizeInBits)
+                    .keyboardType(.numberPad)
+                labeledField("Effective Size (esiz)", "位数，可留空", $effectiveKeySize)
+                    .keyboardType(.numberPad)
+                labeledField("Application Label (klbl)", "可留空", $applicationLabel)
+                labeledField("Application Tag (atag)", "可留空", $applicationTag)
+
+                // 选择器放本节末尾，不夹在文本框中间
                 Picker("Key Class (kcls)", selection: $keyClass) {
                     ForEach(KeychainStore.AttributeOption.keyClasses) { option in
                         Text(option.title).tag(option.value)
@@ -207,12 +231,6 @@ struct AddItemView: View {
                         Text(option.title).tag(option.value)
                     }
                 }
-                labeledField("Key Size (bsiz)", "位数，如 2048", $keySizeInBits)
-                    .keyboardType(.numberPad)
-                labeledField("Effective Size (esiz)", "位数，可留空", $effectiveKeySize)
-                    .keyboardType(.numberPad)
-                labeledField("Application Label (klbl)", "可留空", $applicationLabel)
-                labeledField("Application Tag (atag)", "可留空", $applicationTag)
             } header: {
                 Text("主键字段")
             } footer: {
@@ -324,10 +342,7 @@ struct AddItemView: View {
         } header: {
             Text("Access Group（\(matchingGroups.count)/\(writableGroups.count)）")
         } footer: {
-            if KeychainStore.isWildcardGroup(accessGroup) {
-                Text("通配符组不能写入，保存时会忽略它、改用应用默认组。")
-                    .foregroundStyle(.orange)
-            } else if accessGroup.isEmpty {
+            if accessGroup.isEmpty {
                 Text("留空则写入应用默认组。")
             } else {
                 Text("须是签名 entitlements 里声明过的组，否则保存时返回 -34018。")
@@ -378,7 +393,7 @@ struct AddItemView: View {
     /// 预填一个可写入的组：当前作用域指定的组若不是通配符就沿用，否则留空用应用默认组
     private func prepareDefaultGroup() {
         guard accessGroup.isEmpty, let scope = viewModel.currentScope else { return }
-        if case .group(let group) = scope, !KeychainStore.isWildcardGroup(group) {
+        if case .group(let group) = scope {
             accessGroup = group
         }
     }
