@@ -32,6 +32,9 @@ struct ItemDetailView: View {
     @State private var decoded: DecodedPayload?
     /// 解析视图里被改过的字段，key 是 DecodedField.id
     @State private var decodedEdits: [String: String] = [:]
+    /// 解析区自己的保存提示。放在数据区的 saveNotice 里用户看不到——
+    /// 按钮在这一段，提示却在上面那一段
+    @State private var decodedNotice: String?
 
     private var item: KeychainItem? { viewModel.item(withID: itemID) }
 
@@ -375,12 +378,27 @@ struct ItemDetailView: View {
                 }
 
                 if payload.isEditable {
-                    Button("按字段保存") { saveDecoded(item, payload: payload) }
-                        .frame(maxWidth: .infinity)
-                        .buttonStyle(.borderless)
-                        .disabled(!item.itemClass.supportsDataEditing
-                                  || !item.canBeTargeted
-                                  || decodedEdits.isEmpty)
+                    // 按钮和提示合并成同一个 Form 行，中间自己画 Divider：
+                    // 分开成两行的话系统分隔线又会被盖住
+                    VStack(spacing: 0) {
+                        Button("按字段保存") { saveDecoded(item, payload: payload) }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .buttonStyle(.borderless)
+                            .disabled(!item.itemClass.supportsDataEditing
+                                      || !item.canBeTargeted
+                                      || decodedEdits.isEmpty)
+
+                        if let decodedNotice {
+                            Divider()
+
+                            Text(decodedNotice)
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 6)
+                        }
+                    }
                 }
 
                 DisclosureGroup("完整结构") {
@@ -417,11 +435,19 @@ struct ItemDetailView: View {
     @ViewBuilder
     private func decodedFieldRow(_ field: DecodedField) -> some View {
         // 标签和输入框上下排：路径可能很长（a.b.c[0].d），并排会被挤没
+        let isEdited = decodedEdits[field.id].map { $0 != field.value } ?? false
+
         VStack(alignment: .leading, spacing: 4) {
             HStack(spacing: 6) {
+                // 条目多的能有上千个字段，不标出来根本找不到自己改过哪几个
+                if isEdited {
+                    Image(systemName: "pencil.circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
                 Text(field.label)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(isEdited ? .orange : .secondary)
                 Spacer()
                 Text(field.kind.hint)
                     .font(.caption2)
@@ -452,14 +478,21 @@ struct ItemDetailView: View {
     private func decodedBinding(_ field: DecodedField) -> Binding<String> {
         Binding(
             get: { decodedEdits[field.id] ?? field.value },
-            set: { decodedEdits[field.id] = $0 }
+            set: {
+                decodedEdits[field.id] = $0
+                // 又开始改了，上一次的「已写入」提示就不该再挂着
+                decodedNotice = nil
+            }
         )
     }
 
     private func decodedBoolBinding(_ field: DecodedField) -> Binding<Bool> {
         Binding(
             get: { (decodedEdits[field.id] ?? field.value) == "true" },
-            set: { decodedEdits[field.id] = $0 ? "true" : "false" }
+            set: {
+                decodedEdits[field.id] = $0 ? "true" : "false"
+                decodedNotice = nil
+            }
         )
     }
 
@@ -479,12 +512,12 @@ struct ItemDetailView: View {
         do {
             let data = try payload.encoded(with: decodedEdits)
             guard viewModel.updateData(item, to: data) else { return }
-            saveNotice = "已按字段写入 \(data.count) 字节"
-            decodedEdits.removeAll()
-            // 重新读一遍：原始数据区和解析结果都要跟着变
+            // 重新读一遍：原始数据区和解析结果都要跟着变。
+            // 这一步会清掉 decodedEdits，所以提示要在它之后再设。
             if let updated = viewModel.item(withID: itemID) {
                 loadContent(from: updated)
             }
+            decodedNotice = "已按字段写入 \(data.count) 字节"
         } catch {
             viewModel.alertMessage = error.localizedDescription
         }
@@ -691,6 +724,7 @@ struct ItemDetailView: View {
     /// 只刷新数据内容，不动标签输入框（解锁后复用）
     private func loadContent(from item: KeychainItem) {
         decodedEdits.removeAll()
+        decodedNotice = nil
 
         guard item.isDataReadable, let data = item.data else {
             content = ""

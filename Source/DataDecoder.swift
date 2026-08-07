@@ -82,6 +82,7 @@ enum DecodeEditError: LocalizedError {
     case badNumber(label: String, expected: String)
     case pathBroken(label: String)
     case encodingFailed(String)
+    case verificationFailed(String)
 
     var errorDescription: String? {
         switch self {
@@ -95,6 +96,8 @@ enum DecodeEditError: LocalizedError {
             return "「\(label)」在数据里的位置已失效，请重新打开该条目。"
         case .encodingFailed(let reason):
             return "重新编码失败：\(reason)"
+        case .verificationFailed(let reason):
+            return "重新编码后的数据没通过自检，已取消保存，原数据未改动。（\(reason)）"
         }
     }
 }
@@ -214,6 +217,9 @@ enum DataDecoder {
               let objects = exposed["$objects"] as? [Any],
               let top = exposed["$top"] as? [AnyHashable: Any] else { return nil }
 
+        // 路径是照着 exposed 记的、却要用到 original 上，两边的 $objects 必须一一对应
+        guard (archive["$objects"] as? [Any])?.count == objects.count else { return nil }
+
         // `archivedData(withRootObject:)` 用的是 root，但手写归档可以是任意键，
         // 写死 root 会白白解不出来
         let rootRef = top
@@ -221,6 +227,10 @@ enum DataDecoder {
             .sorted { $0.0 < $1.0 }
             .first?.1
         guard let rootRef else { return nil }
+
+        // $top 的值在真归档里一定是引用。取不出引用说明 XML 往返没按预期
+        // 把 UID 摊成 CF$UID 字典 —— 那样记下来的路径全是错的，宁可退回只读。
+        guard uidValue(rootRef) != nil else { return nil }
 
         var collected: [String: DecodedField] = [:]
         var order: [String] = []
@@ -512,6 +522,11 @@ enum DataDecoder {
                               plan: .protobuf(fields))
     }
 
+    /// 显式标类型：字面量里混着 Int 和 NSNumber / Data，让编译器去推会推出别的东西
+    private static func protoField(_ number: Int, _ wire: Int, _ value: Any) -> [String: Any] {
+        ["n": number, "w": wire, "v": value]
+    }
+
     private static func readVarint(_ bytes: [UInt8], _ index: inout Int, end: Int) -> UInt64? {
         var result: UInt64 = 0
         var shift: UInt64 = 0
@@ -544,7 +559,7 @@ enum DataDecoder {
             switch wire {
             case 0:
                 guard let value = readVarint(bytes, &index, end: end) else { return nil }
-                fields.append(["n": number, "w": wire, "v": NSNumber(value: value)])
+                fields.append(protoField(number, wire, NSNumber(value: value)))
 
             case 2:
                 guard let length = readVarint(bytes, &index, end: end),
@@ -562,16 +577,16 @@ enum DataDecoder {
                     value = Data(payload)
                 }
                 index = stop
-                fields.append(["n": number, "w": wire, "v": value])
+                fields.append(protoField(number, wire, value))
 
             case 5:
                 guard end - index >= 4 else { return nil }
-                fields.append(["n": number, "w": wire, "v": Data(bytes[index..<index + 4])])
+                fields.append(protoField(number, wire, Data(bytes[index..<index + 4])))
                 index += 4
 
             case 1:
                 guard end - index >= 8 else { return nil }
-                fields.append(["n": number, "w": wire, "v": Data(bytes[index..<index + 8])])
+                fields.append(protoField(number, wire, Data(bytes[index..<index + 8])))
                 index += 8
 
             default:
@@ -593,7 +608,7 @@ enum DataDecoder {
 
             let name = label.isEmpty ? "\(number)" : "\(label).\(number)"
             let valuePath = path + [.index(offset), .key("v")]
-            let value = field["v"]
+            guard let value = field["v"] else { return "\(pad)\(number): null" }
 
             if let nested = value as? [Any] {
                 let body = collectProtobuf(nested, path: valuePath, label: name,
@@ -601,14 +616,14 @@ enum DataDecoder {
                 return "\(pad)\(number) {\n\(body)\n\(pad)}"
             }
 
-            if let value, let kind = leafKind(of: value), kind != .null {
+            if let kind = leafKind(of: value), kind != .null {
                 collected.append(DecodedField(id: valuePath.map(\.token).joined(separator: "/"),
                                               label: name,
                                               kind: kind,
                                               value: leafValue(value),
                                               location: valuePath))
             }
-            return "\(pad)\(number): \(value.map(leafDisplay) ?? "null")"
+            return "\(pad)\(number): \(leafDisplay(value))"
         }
         return lines.joined(separator: "\n")
     }
@@ -693,13 +708,14 @@ extension DecodedPayload {
         }
         guard !changed.isEmpty else { throw DecodeEditError.noChanges }
 
+        let encoded: Data
         switch plan {
         case .propertyList(let root, let format):
             let updated = try apply(changed, edits: edits, to: root)
             do {
-                return try PropertyListSerialization.data(fromPropertyList: updated,
-                                                          format: format,
-                                                          options: 0)
+                encoded = try PropertyListSerialization.data(fromPropertyList: updated,
+                                                             format: format,
+                                                             options: 0)
             } catch {
                 throw DecodeEditError.encodingFailed(error.localizedDescription)
             }
@@ -707,8 +723,8 @@ extension DecodedPayload {
         case .json(let root):
             let updated = try apply(changed, edits: edits, to: root)
             do {
-                return try JSONSerialization.data(withJSONObject: updated,
-                                                  options: [.sortedKeys])
+                encoded = try JSONSerialization.data(withJSONObject: updated,
+                                                     options: [.sortedKeys])
             } catch {
                 throw DecodeEditError.encodingFailed(error.localizedDescription)
             }
@@ -717,7 +733,30 @@ extension DecodedPayload {
             guard let updated = try apply(changed, edits: edits, to: root) as? [Any] else {
                 throw DecodeEditError.encodingFailed("字段表结构损坏")
             }
-            return try Self.encodeProtobuf(updated)
+            encoded = try Self.encodeProtobuf(updated)
+        }
+
+        try verify(encoded, changed: changed)
+        return encoded
+    }
+
+    /// 编完立刻再解一遍，结构对不上就报错而不是写进钥匙串。
+    ///
+    /// 主要是为了兜住归档那条路径上一个没法在开发机上验证的假设：UID 在 Swift 里
+    /// 没有公开类型，写回时是把原始解析结果里的不透明 UID 对象原样交还给
+    /// `PropertyListSerialization`，赌它序列化时仍当 UID 处理。这个自检把
+    /// 「赌错了就默默写坏条目」变成「赌错了就明确报错、原数据不动」。
+    private func verify(_ data: Data, changed: [DecodedField]) throws {
+        guard let reparsed = DataDecoder.decode(data) else {
+            throw DecodeEditError.verificationFailed("重新编码后的数据解析不回来")
+        }
+        guard reparsed.formatName == formatName else {
+            throw DecodeEditError.verificationFailed(
+                "格式从「\(formatName)」变成了「\(reparsed.formatName)」")
+        }
+        let survivors = Set(reparsed.fields.map(\.id))
+        if let lost = changed.first(where: { !survivors.contains($0.id) }) {
+            throw DecodeEditError.verificationFailed("字段「\(lost.label)」不见了")
         }
     }
 
