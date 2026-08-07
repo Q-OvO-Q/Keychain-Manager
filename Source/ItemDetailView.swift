@@ -437,21 +437,22 @@ struct ItemDetailView: View {
         case .boolean:
             Toggle(isOn: decodedBoolBinding(field)) { label }
 
-        case .string, .integer, .real:
+        case .string, .integer, .real, .utf8Data, .binaryData:
             HStack {
                 label.frame(width: 116, alignment: .leading)
-                TextField("空", text: decodedBinding(field))
+                TextField(field.kind.editingHint ?? "空", text: decodedBinding(field))
                     .font(.system(.callout, design: .monospaced))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
             }
 
-        case .date, .data, .null:
+        case .date, .null, .opaqueData:
             HStack {
                 label.frame(width: 116, alignment: .leading)
                 Text(field.value)
                     .font(.system(.callout, design: .monospaced))
                     .foregroundStyle(.secondary)
+                    .lineLimit(3)
             }
         }
     }
