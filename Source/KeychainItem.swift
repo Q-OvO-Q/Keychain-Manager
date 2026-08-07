@@ -64,9 +64,11 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
     /// 详情页靠这份清单把「未设置」的属性也列出来，否则看起来就像这些属性不存在，
     /// 也会和「可修改的元数据」那一节对不上（那节是固定列出的）。
     var knownAttributes: [String] {
+        // alis 实测出现在 1385/1467 条上（每个 App 容器一个 UUID）。
+        // 它没有公开常量，但确实是这张表里的一列，缺了它没设过的条目就看不出「本可以有」
         let shared = [kSecAttrLabel, kSecAttrCreationDate, kSecAttrModificationDate,
                       kSecAttrAccessGroup, kSecAttrAccessible, kSecAttrSynchronizable]
-            .map { $0 as String } + ["accc"]
+            .map { $0 as String } + ["accc", "alis"]
 
         switch self {
         case .genericPassword:
@@ -89,7 +91,12 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
                     kSecAttrIsPermanent, kSecAttrCanEncrypt, kSecAttrCanDecrypt,
                     kSecAttrCanDerive, kSecAttrCanSign, kSecAttrCanVerify,
                     kSecAttrCanWrap, kSecAttrCanUnwrap]
-                .map { $0 as String } + shared
+                .map { $0 as String }
+                // 密钥这一类系统还会回传一批没有公开常量的列，实测 99 条密钥里
+                // 29～53 条带着它们。不列出来，没设过的那些看起来就像这些属性不存在
+                + ["sens", "asen", "extr", "next", "priv", "modi",
+                   "snrc", "vyrc", "sdat", "edat", "tkid"]
+                + shared
 
         case .certificate:
             return [kSecAttrCertificateType, kSecAttrCertificateEncoding,

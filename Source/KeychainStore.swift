@@ -298,9 +298,18 @@ enum KeychainStore {
         var unique: [(KeychainItemClass, [String: Any])] = []
         unique.reserveCapacity(rows.count)
 
+        // 没有持久引用的行按主键去重。「全部可访问」下同一条会被不限组扫描和
+        // 逐组枚举各返回一次，一律保留就会在列表里出现两份。
+        // 按主键去重是安全的：实测 1467 条导出里四个类别的主键组合都完全唯一
+        //（1347/1347、21/21、99/99），不存在两条不同条目共用一个主键。
+        var seenKeys = Set<String>()
+
         for row in rows {
             guard let reference = row.1[kSecValuePersistentRef as String] as? Data else {
-                unique.append(row)
+                let fingerprint = primaryKeyFingerprint(itemClass: row.0, attributes: row.1)
+                if seenKeys.insert(fingerprint).inserted {
+                    unique.append(row)
+                }
                 continue
             }
             if seen.insert(reference).inserted {
@@ -308,6 +317,22 @@ enum KeychainStore {
             }
         }
         return unique
+    }
+
+    /// 主键各字段拼成的指纹，仅用于给缺少持久引用的行去重
+    private static func primaryKeyFingerprint(itemClass: KeychainItemClass,
+                                              attributes: [String: Any]) -> String {
+        var parts = [itemClass.secClass as String]
+        for key in itemClass.primaryKeyAttributes.sorted() {
+            switch attributes[key] {
+            case let text as String:     parts.append("\(key)=s:\(text)")
+            case let data as Data:       parts.append("\(key)=d:\(data.base64EncodedString())")
+            case let number as NSNumber: parts.append("\(key)=n:\(number)")
+            case .none:                  parts.append("\(key)=nil")
+            case .some(let other):       parts.append("\(key)=?:\(other)")
+            }
+        }
+        return parts.joined(separator: "|")
     }
 
     /// 单条读取数据；返回的 status 用于向用户解释「为什么这条读不出来」。
