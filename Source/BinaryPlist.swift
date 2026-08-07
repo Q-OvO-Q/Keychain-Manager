@@ -67,18 +67,31 @@ enum BinaryPlist {
             offsets.append(Int(value))
         }
 
-        var reader = Reader(bytes: bytes, offsets: offsets, refSize: refSize, limit: trailer)
+        let reader = Reader(bytes: bytes, offsets: offsets, refSize: refSize, limit: trailer)
         return reader.object(at: top, depth: 0)
     }
 
-    private struct Reader {
+    private final class Reader {
         let bytes: [UInt8]
         let offsets: [Int]
         let refSize: Int
         let limit: Int
+        /// 解析是把引用图展开成树，同一个对象被引用多次就会展开多份。
+        /// 归档里的引用是 UID（叶子，不展开）所以没事，但坏掉或恶意构造的
+        /// plist 可以靠层层共享撑爆内存，给个总量上限兜底。
+        private var budget = 2_000_000
+
+        init(bytes: [UInt8], offsets: [Int], refSize: Int, limit: Int) {
+            self.bytes = bytes
+            self.offsets = offsets
+            self.refSize = refSize
+            self.limit = limit
+        }
 
         func object(at index: Int, depth: Int) -> Any? {
             guard depth < 64, index >= 0, index < offsets.count else { return nil }
+            budget -= 1
+            guard budget > 0 else { return nil }
             let start = offsets[index]
             guard start < limit else { return nil }
 
@@ -265,9 +278,17 @@ enum BinaryPlist {
         }
 
         if let dictionary = value as? [AnyHashable: Any] {
-            // 键顺序在 plist 里不影响语义，排一下让输出稳定可比
-            let pairs = dictionary
-                .map { (String(describing: $0.key), $0.value) }
+            // 显式取 String 而不是 String(describing:)：后者对 AnyHashable 的行为
+            // 依赖 description 的实现，写键名这种事不能靠它。取不出来就报错，
+            // 总比把键写成别的东西、悄悄改掉归档内容强。
+            let pairs = try dictionary
+                .map { pair -> (String, Any) in
+                    guard let key = pair.key as? String else {
+                        throw Failure.unsupported("非字符串的字典键")
+                    }
+                    return (key, pair.value)
+                }
+                // 键顺序在 plist 里不影响语义，排一下让输出稳定可比
                 .sorted { $0.0 < $1.0 }
             var keyRefs = [Int]()
             var valueRefs = [Int]()
