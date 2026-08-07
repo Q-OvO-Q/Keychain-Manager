@@ -437,22 +437,22 @@ struct ItemDetailView: View {
         case .boolean:
             Toggle(isOn: decodedBoolBinding(field)) { label }
 
-        case .string, .integer, .real, .utf8Data, .binaryData:
-            HStack {
-                label.frame(width: 116, alignment: .leading)
-                TextField(field.kind.editingHint ?? "空", text: decodedBinding(field))
-                    .font(.system(.callout, design: .monospaced))
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-            }
-
-        case .date, .null, .opaqueData:
+        case .opaqueData:
             HStack {
                 label.frame(width: 116, alignment: .leading)
                 Text(field.value)
                     .font(.system(.callout, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
+            }
+
+        default:
+            HStack {
+                label.frame(width: 116, alignment: .leading)
+                TextField(field.kind.editingHint ?? "空", text: decodedBinding(field))
+                    .font(.system(.callout, design: .monospaced))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
             }
         }
     }
@@ -490,7 +490,9 @@ struct ItemDetailView: View {
             Text("\(item.itemClass.displayName)的数据不可改。")
         } else {
             Text("保存会按原格式重新编码，只替换改过的字段。"
-                 + "标签里出现「/」表示这一处被多条路径共用，改一次会同时生效。")
+                 + "标签里出现「/」表示这一处被多条路径共用，改一次会同时生效；"
+                 + "标着「空引用」的填上内容后会新增一个对象再把引用指过去；"
+                 + "路径里出现「→」的是嵌套负载内部的字段，保存时内外两层都会重新编码。")
         }
     }
 
