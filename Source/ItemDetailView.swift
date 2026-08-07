@@ -378,7 +378,7 @@ struct ItemDetailView: View {
                 // 操作放在字段前面：绝大多数条目只有几个字段，但实测最大的一条
                 // 解出 1443 个，保存按钮沉在那么多行底下等于找不到
                 NavigationLink {
-                    decodedStructurePage(payload)
+                    DecodedStructurePage(payload: payload)
                 } label: {
                     Text("完整结构")
                 }
@@ -404,25 +404,6 @@ struct ItemDetailView: View {
                 Text("数据解析（\(payload.formatName)）")
             } footer: {
                 decodedFooter(payload, item: item)
-            }
-        }
-    }
-
-    /// 全文是一大段等宽文本，塞进 Form 的行里怎么排都难看，单独开一页
-    private func decodedStructurePage(_ payload: DecodedPayload) -> some View {
-        ScrollView([.horizontal, .vertical]) {
-            Text(payload.text)
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .padding()
-        }
-        .navigationTitle(payload.formatName)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            Button {
-                copy(payload.text)
-            } label: {
-                Label("复制", systemImage: "doc.on.doc")
             }
         }
     }
@@ -810,6 +791,43 @@ struct ItemDetailView: View {
                         .font(.caption)
                 }
                 .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+/// 解析结果的全文。单独开一页是因为这是一大段等宽文本，塞进 Form 的行里怎么排都难看。
+///
+/// 按行惰性渲染，不是丢一个大 `Text` 进去：实测最长的一条归档展开有 62000 多字符，
+/// 而 `Text` 不是惰性的，一次性排这么多版会明显卡顿。
+///
+/// 单独做成一个 View 而不是父视图里的方法，是为了让拆行只在真正进入这一页时才做 ——
+/// `NavigationLink` 的目标闭包在 List 里有可能被提前求值。
+private struct DecodedStructurePage: View {
+
+    let payload: DecodedPayload
+
+    var body: some View {
+        let lines = payload.text.split(separator: "\n", omittingEmptySubsequences: false)
+
+        ScrollView([.horizontal, .vertical]) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    // 空行给个空格，否则高度塌成 0，缩进关系就看不出来了
+                    Text(line.isEmpty ? " " : String(line))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+            .padding()
+        }
+        .navigationTitle(payload.formatName)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            Button {
+                UIPasteboard.general.string = payload.text
+            } label: {
+                Label("复制全文", systemImage: "doc.on.doc")
             }
         }
     }
