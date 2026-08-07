@@ -64,10 +64,12 @@ fileprivate enum PathComponent {
     /// 这一处的字节串本身又是一份负载：解开它，路径的后半截作用在里面，写回时重新编码
     case into
 
+    /// 字段 id 由路径拼成，是 ForEach 的身份标识，重了会让列表串行。
+    /// 带上类型前缀，键名 "5" 和下标 5、键名 "→" 和 .into 就不会撞。
     var token: String {
         switch self {
-        case .key(let name): return name
-        case .index(let offset): return String(offset)
+        case .key(let name): return "k\(name)"
+        case .index(let offset): return "i\(offset)"
         case .into: return "→"
         }
     }
@@ -145,8 +147,9 @@ enum DecodeEditError: LocalizedError {
 /// 另外也试过 UTF-16：整份导出 0 条命中。
 enum DataDecoder {
 
-    /// 只读全文的长度上限：详情页塞不下更多，还会拖慢滚动
-    private static let renderLimit = 20_000
+    /// 全文渲染的长度上限。全文已经挪到单独一页了，不再受表单行的限制，
+    /// 所以放宽到实测最大那条归档（26 KB）展开后也不会被截断
+    private static let renderLimit = 200_000
     private static let maxDepth = 24
 
     static func decode(_ data: Data) -> DecodedPayload? {
@@ -683,6 +686,20 @@ enum DataDecoder {
                 return "\(pad)\(number) {\n\(body)\n\(pad)}"
             }
 
+            // 和 resolve / collect 保持一致：字节字段里嵌着完整负载的，
+            // 展开成内层字段而不是只显示一句「N 字节二进制」
+            if let bytes = value as? Data, let inner = nestedPayload(in: bytes) {
+                for field in inner.fields {
+                    collected.append(DecodedField(id: (valuePath + [.into] + field.location)
+                                                     .map(\.token).joined(separator: "/"),
+                                                  label: join(name, field.label),
+                                                  kind: field.kind,
+                                                  value: field.value,
+                                                  location: valuePath + [.into] + field.location))
+                }
+                return "\(pad)\(number): \(bytes.count) 字节 · \(inner.formatName)\n\(inner.text)"
+            }
+
             if let kind = leafKind(of: value) {
                 collected.append(DecodedField(id: valuePath.map(\.token).joined(separator: "/"),
                                               label: name,
@@ -919,23 +936,11 @@ extension DecodedPayload {
                        edits: [String: String],
                        to root: Any) throws -> Any {
         var result = root
-        let isArchive = (result as? [AnyHashable: Any])?["$archiver"] != nil
-
         for field in changed {
             guard let text = edits[field.id] else { continue }
 
-            // 归档里的空引用：整份归档共用同一个 "$null"，不能就地改。
-            // 在 $objects 末尾新增一项，再把这处引用指向它。
-            if field.kind == .nullReference, isArchive {
-                guard var archive = result as? [AnyHashable: Any],
-                      var objects = archive["$objects"] as? [Any] else {
-                    throw DecodeEditError.notEditable
-                }
-                objects.append(text)
-                archive["$objects"] = objects
-                result = archive
-                result = try Self.setValue(ArchiveUID(value: UInt64(objects.count - 1)),
-                                           at: field.location, in: result, label: field.label)
+            if field.kind == .nullReference {
+                result = try Self.fillNull(text, at: field.location, in: result, label: field.label)
                 continue
             }
 
@@ -943,6 +948,41 @@ extension DecodedPayload {
             result = try Self.setValue(value, at: field.location, in: result, label: field.label)
         }
         return result
+    }
+
+    /// 填上一个空引用。
+    ///
+    /// 归档里所有空值共用 `$objects` 里同一个 `"$null"`，改那一格会把整份归档的空值
+    /// 一起改掉，所以只能新增一项再把这处引用指过去 —— 这要在**引用所在的那一层归档**上做。
+    /// 路径可能穿过嵌套负载，那就先解到最内层再动手，否则会把字符串直接写进内层归档的
+    /// 引用位上，把内层写坏。
+    fileprivate static func fillNull(_ text: String,
+                                     at path: FieldLocation,
+                                     in container: Any,
+                                     label: String) throws -> Any {
+        let boundary = path.lastIndex {
+            if case .into = $0 { return true }
+            return false
+        }
+
+        if let boundary {
+            // 先走到（含）那个 .into，拿到解开后的内层根，再在内层递归处理
+            return try mutate(at: Array(path[...boundary]), in: container, label: label) { inner in
+                try fillNull(text, at: Array(path[(boundary + 1)...]), in: inner, label: label)
+            }
+        }
+
+        guard var archive = container as? [AnyHashable: Any],
+              var objects = archive["$objects"] as? [Any],
+              archive["$archiver"] != nil else {
+            // JSON / 普通 plist 没有这层间接，直接把值写进去就行
+            return try setValue(text, at: path, in: container, label: label)
+        }
+
+        objects.append(text)
+        archive["$objects"] = objects
+        return try setValue(ArchiveUID(value: UInt64(objects.count - 1)),
+                            at: path, in: archive, label: label)
     }
 
     fileprivate static func converted(_ text: String,
@@ -998,7 +1038,16 @@ extension DecodedPayload {
                                      at path: FieldLocation,
                                      in container: Any,
                                      label: String) throws -> Any {
-        guard let head = path.first else { return newValue }
+        try mutate(at: path, in: container, label: label) { _ in newValue }
+    }
+
+    /// 沿路径走到底，把末端的值交给 `transform` 换成新的。
+    /// 单独抽出来是因为「填空引用」要拿到的不是叶子而是那一层的归档根。
+    fileprivate static func mutate(at path: FieldLocation,
+                                   in container: Any,
+                                   label: String,
+                                   using transform: (Any) throws -> Any) throws -> Any {
+        guard let head = path.first else { return try transform(container) }
         let rest = Array(path.dropFirst())
 
         switch head {
@@ -1007,14 +1056,14 @@ extension DecodedPayload {
                   let child = dictionary[name] else {
                 throw DecodeEditError.pathBroken(label: label)
             }
-            dictionary[name] = try setValue(newValue, at: rest, in: child, label: label)
+            dictionary[name] = try mutate(at: rest, in: child, label: label, using: transform)
             return dictionary
 
         case .index(let offset):
             guard var array = container as? [Any], offset >= 0, offset < array.count else {
                 throw DecodeEditError.pathBroken(label: label)
             }
-            array[offset] = try setValue(newValue, at: rest, in: array[offset], label: label)
+            array[offset] = try mutate(at: rest, in: array[offset], label: label, using: transform)
             return array
 
         case .into:
@@ -1024,7 +1073,7 @@ extension DecodedPayload {
                   let innerRoot = inner.planRoot else {
                 throw DecodeEditError.pathBroken(label: label)
             }
-            let updated = try setValue(newValue, at: rest, in: innerRoot, label: label)
+            let updated = try mutate(at: rest, in: innerRoot, label: label, using: transform)
             return try inner.encodeRoot(updated)
         }
     }

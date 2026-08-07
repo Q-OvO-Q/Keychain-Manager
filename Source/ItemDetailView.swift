@@ -374,15 +374,17 @@ struct ItemDetailView: View {
                 // 行的写法一律跟着本文件既有的 attributeRow 走：单层 HStack、
                 // 固定宽标签、不加 padding、不套 VStack。自己发明的写法
                 // 会把系统分隔线盖住，这个坑踩过好几次了。
+                // 密钥和证书不支持改数据。这时字段还摆成可输入的样子、
+                // 保存按钮却是灰的，等于骗人——直接按只读渲染
+                let writable = item.itemClass.supportsDataEditing && item.canBeTargeted
+
                 ForEach(payload.fields) { field in
-                    decodedFieldRow(field)
+                    decodedFieldRow(field, writable: writable)
                 }
 
-                if payload.isEditable {
+                if payload.isEditable && writable {
                     Button("按字段保存") { saveDecoded(item, payload: payload) }
-                        .disabled(!item.itemClass.supportsDataEditing
-                                  || !item.canBeTargeted
-                                  || decodedEdits.isEmpty)
+                        .disabled(decodedEdits.isEmpty)
                 }
 
                 if let decodedNotice {
@@ -424,7 +426,7 @@ struct ItemDetailView: View {
     }
 
     @ViewBuilder
-    private func decodedFieldRow(_ field: DecodedField) -> some View {
+    private func decodedFieldRow(_ field: DecodedField, writable: Bool) -> some View {
         // 路径可能很长（a.b.c[0].d），从头部截断，保留最具体的那一段；
         // 改过的标成橙色——一条归档能解出上千个字段，不标根本找不到改过哪几个
         let label = Text(field.label)
@@ -433,20 +435,17 @@ struct ItemDetailView: View {
             .lineLimit(1)
             .truncationMode(.head)
 
-        switch field.kind {
-        case .boolean:
-            Toggle(isOn: decodedBoolBinding(field)) { label }
-
-        case .opaqueData:
+        if !writable || !field.kind.isEditable {
             HStack {
                 label.frame(width: 116, alignment: .leading)
-                Text(field.value)
+                Text(field.value.isEmpty ? "空" : field.value)
                     .font(.system(.callout, design: .monospaced))
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
             }
-
-        default:
+        } else if field.kind == .boolean {
+            Toggle(isOn: decodedBoolBinding(field)) { label }
+        } else {
             HStack {
                 label.frame(width: 116, alignment: .leading)
                 TextField(field.kind.editingHint ?? "空", text: decodedBinding(field))
@@ -484,10 +483,12 @@ struct ItemDetailView: View {
 
     @ViewBuilder
     private func decodedFooter(_ payload: DecodedPayload, item: KeychainItem) -> some View {
-        if !payload.isEditable {
+        if !item.itemClass.supportsDataEditing {
+            Text("\(item.itemClass.displayName)的数据不可改，这里只能查看。")
+        } else if !item.canBeTargeted {
+            Text("这条缺少可用于精确定位的主键，改不了，只能查看。")
+        } else if !payload.isEditable {
             Text("这段数据没有可改的字段，只能查看。")
-        } else if !item.itemClass.supportsDataEditing {
-            Text("\(item.itemClass.displayName)的数据不可改。")
         } else {
             Text("保存会按原格式重新编码，只替换改过的字段。"
                  + "标签里出现「/」表示这一处被多条路径共用，改一次会同时生效；"
