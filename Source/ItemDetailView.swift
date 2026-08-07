@@ -28,6 +28,13 @@ struct ItemDetailView: View {
     @State private var didRequestDelete = false
     /// 只存被改动过的属性，未改动的直接读条目当前值
     @State private var editedAttributes: [String: Any] = [:]
+    /// 数据解析结果。解析要跑一遍引用图，不放进 computed property 里每帧重算
+    @State private var decoded: DecodedPayload?
+    /// 解析视图里被改过的字段，key 是 DecodedField.id
+    @State private var decodedEdits: [String: String] = [:]
+    /// 解析区自己的保存提示。放在数据区的 saveNotice 里用户看不到——
+    /// 按钮在这一段，提示却在上面那一段
+    @State private var decodedNotice: String?
 
     private var item: KeychainItem? { viewModel.item(withID: itemID) }
 
@@ -55,11 +62,13 @@ struct ItemDetailView: View {
             certificateSection(item)
             tagSection(item)
             dataSection(item)
+            decodedDataSection(item)
             editableAttributesSection(item)
             attributesSection(item)
             deleteSection(item)
         }
         .onAppear { load(item) }
+        .onChange(of: content) { _, _ in refreshDecoded() }
         .confirmationDialog("删除这条条目？", isPresented: $confirmDelete, titleVisibility: .visible) {
             Button("删除", role: .destructive) {
                 didRequestDelete = true
@@ -353,6 +362,167 @@ struct ItemDetailView: View {
         return "\(data.count) 字节"
     }
 
+    // MARK: 数据解析
+
+    /// 大量条目的数据其实是 binary plist（多数还是 NSKeyedArchiver 归档），
+    /// 在上面的数据区只能看见十六进制，根本无从下手改。这里把它解开成一个个
+    /// 字段直接编辑，保存时按原格式重新编码 —— 引用图不动，只替换改过的那几处。
+    @ViewBuilder
+    private func decodedDataSection(_ item: KeychainItem) -> some View {
+        if let payload = decoded {
+            Section {
+                decodedHeaderRow(payload)
+
+                ForEach(payload.fields) { field in
+                    decodedFieldRow(field)
+                }
+
+                if payload.isEditable {
+                    // 按钮和提示合并成同一个 Form 行，中间自己画 Divider：
+                    // 分开成两行的话系统分隔线又会被盖住
+                    VStack(spacing: 0) {
+                        Button("按字段保存") { saveDecoded(item, payload: payload) }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .buttonStyle(.borderless)
+                            .disabled(!item.itemClass.supportsDataEditing
+                                      || !item.canBeTargeted
+                                      || decodedEdits.isEmpty)
+
+                        if let decodedNotice {
+                            Divider()
+
+                            Text(decodedNotice)
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 6)
+                        }
+                    }
+                }
+
+                DisclosureGroup("完整结构") {
+                    Text(payload.text)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
+                }
+            } header: {
+                Text("数据解析")
+            } footer: {
+                decodedFooter(payload, item: item)
+            }
+        }
+    }
+
+    private func decodedHeaderRow(_ payload: DecodedPayload) -> some View {
+        HStack {
+            Text(payload.formatName)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button {
+                copy(payload.text)
+            } label: {
+                Label("复制", systemImage: "doc.on.doc")
+                    .font(.caption)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    @ViewBuilder
+    private func decodedFieldRow(_ field: DecodedField) -> some View {
+        // 标签和输入框上下排：路径可能很长（a.b.c[0].d），并排会被挤没
+        let isEdited = decodedEdits[field.id].map { $0 != field.value } ?? false
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                // 条目多的能有上千个字段，不标出来根本找不到自己改过哪几个
+                if isEdited {
+                    Image(systemName: "pencil.circle.fill")
+                        .font(.caption2)
+                        .foregroundStyle(.orange)
+                }
+                Text(field.label)
+                    .font(.caption)
+                    .foregroundStyle(isEdited ? .orange : .secondary)
+                Spacer()
+                Text(field.kind.hint)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+
+            switch field.kind {
+            case .boolean:
+                Toggle(isOn: decodedBoolBinding(field)) {
+                    Text(decodedEdits[field.id] ?? field.value)
+                        .font(.system(.caption, design: .monospaced))
+                }
+            case .string, .integer, .real:
+                TextField(field.label, text: decodedBinding(field), axis: .vertical)
+                    .font(.system(.body, design: .monospaced))
+                    .autocorrectionDisabled()
+                    .textInputAutocapitalization(.never)
+                    .lineLimit(1...6)
+            case .date, .data, .null:
+                Text(field.value)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func decodedBinding(_ field: DecodedField) -> Binding<String> {
+        Binding(
+            get: { decodedEdits[field.id] ?? field.value },
+            set: {
+                decodedEdits[field.id] = $0
+                // 又开始改了，上一次的「已写入」提示就不该再挂着
+                decodedNotice = nil
+            }
+        )
+    }
+
+    private func decodedBoolBinding(_ field: DecodedField) -> Binding<Bool> {
+        Binding(
+            get: { (decodedEdits[field.id] ?? field.value) == "true" },
+            set: {
+                decodedEdits[field.id] = $0 ? "true" : "false"
+                decodedNotice = nil
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func decodedFooter(_ payload: DecodedPayload, item: KeychainItem) -> some View {
+        if !payload.isEditable {
+            Text("这段数据没有可改的字段，只能查看。")
+        } else if !item.itemClass.supportsDataEditing {
+            Text("\(item.itemClass.displayName)的数据不可改。")
+        } else {
+            Text("保存会按原格式重新编码，只替换改过的字段。"
+                 + "标签里出现「/」表示这一处被多条路径共用，改一次会同时生效。")
+        }
+    }
+
+    private func saveDecoded(_ item: KeychainItem, payload: DecodedPayload) {
+        do {
+            let data = try payload.encoded(with: decodedEdits)
+            guard viewModel.updateData(item, to: data) else { return }
+            // 重新读一遍：原始数据区和解析结果都要跟着变。
+            // 这一步会清掉 decodedEdits，所以提示要在它之后再设。
+            if let updated = viewModel.item(withID: itemID) {
+                loadContent(from: updated)
+            }
+            decodedNotice = "已按字段写入 \(data.count) 字节"
+        } catch {
+            viewModel.alertMessage = error.localizedDescription
+        }
+    }
+
     // MARK: 可修改的元数据
 
     @ViewBuilder
@@ -553,9 +723,13 @@ struct ItemDetailView: View {
 
     /// 只刷新数据内容，不动标签输入框（解锁后复用）
     private func loadContent(from item: KeychainItem) {
+        decodedEdits.removeAll()
+        decodedNotice = nil
+
         guard item.isDataReadable, let data = item.data else {
             content = ""
             isHexMode = false
+            decoded = nil
             return
         }
 
@@ -566,6 +740,17 @@ struct ItemDetailView: View {
             content = data.hexString
             isHexMode = true
         }
+        decoded = DataDecoder.decode(data)
+    }
+
+    /// 用户在原始数据区改过之后，解析结果就对不上了，得跟着重算
+    private func refreshDecoded() {
+        guard let data = isHexMode ? content.hexData : content.data(using: .utf8) else {
+            decoded = nil
+            return
+        }
+        decoded = DataDecoder.decode(data)
+        decodedEdits.removeAll()
     }
 
     private func unlock(_ item: KeychainItem) {
