@@ -717,10 +717,20 @@ enum DataDecoder {
             }
 
             if let kind = leafKind(of: value) {
+                // fixed32 / fixed64 的字节数是固定的。leafKind 只看内容，碰上恰好
+                // 可打印的 4 / 8 字节会判成文本，于是放出一个能随便改长度的输入框，
+                // 而编码时长度对不上只能报错。定长字段一律按十六进制编辑 ——
+                // 注意值也要一并换成十六进制，否则框里显示的是文本、解析却按十六进制。
+                let fixedWidth = (field["w"] as? Int).map { $0 == 1 || $0 == 5 } ?? false
+                let raw = value as? Data
+                let resolved: (DecodedField.Kind, String) = (fixedWidth && raw != nil)
+                    ? (.binaryData, raw!.hexString)
+                    : (kind, leafValue(value))
+
                 collected.append(DecodedField(id: valuePath.map(\.token).joined(separator: "/"),
                                               label: name,
-                                              kind: kind,
-                                              value: leafValue(value),
+                                              kind: resolved.0,
+                                              value: resolved.1,
                                               location: valuePath))
             }
             return "\(pad)\(number): \(leafDisplay(value))"
@@ -931,8 +941,13 @@ extension DecodedPayload {
                 out.append(payload)
 
             case 1, 5:
-                guard let raw = field["v"] as? Data, raw.count == (wire == 1 ? 8 : 4) else {
-                    throw DecodeEditError.encodingFailed("字段 \(number) 定长内容损坏")
+                let expected = wire == 1 ? 8 : 4
+                guard let raw = field["v"] as? Data else {
+                    throw DecodeEditError.encodingFailed("字段 \(number) 内容无法编码")
+                }
+                guard raw.count == expected else {
+                    throw DecodeEditError.encodingFailed(
+                        "字段 \(number) 是定长 \(expected) 字节，填了 \(raw.count) 字节")
                 }
                 out.append(raw)
 
