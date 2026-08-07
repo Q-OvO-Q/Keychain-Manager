@@ -1,25 +1,122 @@
 import Foundation
 import Security
 
+// MARK: - 模型
+
+/// 解析出来的一个可编辑叶子
+struct DecodedField: Identifiable {
+
+    enum Kind {
+        case string, integer, real, boolean, date, data, null
+
+        var isEditable: Bool {
+            switch self {
+            case .string, .integer, .real, .boolean: return true
+            case .date, .data, .null: return false
+            }
+        }
+
+        var hint: String {
+            switch self {
+            case .string: return "文本"
+            case .integer: return "整数"
+            case .real: return "小数"
+            case .boolean: return "开关"
+            case .date: return "日期"
+            case .data: return "二进制"
+            case .null: return "空"
+            }
+        }
+    }
+
+    let id: String
+    let label: String
+    let kind: Kind
+    let value: String
+    fileprivate let location: FieldLocation
+}
+
+/// 叶子在整份 plist / JSON 里的存放位置。归档也用同一套：
+/// 一个被引用的对象就在 `$objects[i]`，路径写成 `.key("$objects"), .index(i), …`。
+///
+/// 不能只记 `$objects` 下标 —— 归档里有大量值是**内联**存的而不是单独占一格：
+/// `NSMutableString` 是 `{$class: UID, NS.string: "…"}`，自定义类的小整数也直接
+/// 写在实例字典里（`{gracePeriod: 0, …}`）。只认下标会漏掉这些，实测 309 条归档
+/// 里可编辑字段会从 2110 个掉到 1068 个，72 条整条都解不出可改的东西。
+fileprivate typealias FieldLocation = [PathComponent]
+
+fileprivate enum PathComponent {
+    case key(String)
+    case index(Int)
+
+    var token: String {
+        switch self {
+        case .key(let name): return name
+        case .index(let offset): return String(offset)
+        }
+    }
+}
+
+fileprivate enum EditPlan {
+    /// 存的是**原始**解析结果，里面的 UID 仍是不透明对象，原样交回序列化器
+    case propertyList(Any, PropertyListSerialization.PropertyListFormat)
+    case json(Any)
+}
+
 struct DecodedPayload {
     let formatName: String
     let text: String
+    let fields: [DecodedField]
+    fileprivate let plan: EditPlan?
+
+    var isEditable: Bool {
+        plan != nil && fields.contains { $0.kind.isEditable }
+    }
 }
 
-/// 把条目数据里那些「看着是二进制、其实有结构」的内容解析成可读文本。
+enum DecodeEditError: LocalizedError {
+    case notEditable
+    case noChanges
+    case badNumber(label: String, expected: String)
+    case pathBroken(label: String)
+    case encodingFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .notEditable:
+            return "这段数据的格式不支持按字段保存。"
+        case .noChanges:
+            return "没有改动需要保存。"
+        case .badNumber(let label, let expected):
+            return "「\(label)」需要填\(expected)。"
+        case .pathBroken(let label):
+            return "「\(label)」在数据里的位置已失效，请重新打开该条目。"
+        case .encodingFailed(let reason):
+            return "重新编码失败：\(reason)"
+        }
+    }
+}
+
+// MARK: - 解析
+
+/// 把条目数据里那些「看着是二进制、其实有结构」的内容解析成可读、可改的形式。
 ///
-/// 实测样本里，`type: data` 的条目绝大多数是 **binary plist**，而且几乎都是
-/// `NSKeyedArchiver` 归档 —— 后者只解成 plist 仍然不可读，因为内容是
-/// `$objects` 数组加一堆 `CF$UID` 引用，必须把对象图还原回来才有意义。
+/// 对着一份 1447 条的完整导出统计过：binary plist 309 条（其中 78 条含第三方类）、
+/// JSON 191 条、DER 53 条、纯文本 576 条，其余是空值和无结构的密钥/哈希。
+///
+/// 归档必须**自己解 UID 引用图**，不能交给 `NSKeyedUnarchiver`：那 78 条里的
+/// `FIRInstallationsStoredItem`、`OIDAuthState`、`EMMLoginInfo` 等类本 App 里
+/// 根本不存在，`NSKeyedUnarchiver` 一律解不出来。自己解还有个附带好处 ——
+/// 能记下每个叶子的存放路径，写回时只改那一处，引用图原封不动。
 ///
 /// 不做的事：按 Windows-1252 之类的单字节编码硬解。那不是「解析」——
-/// 256 个字节里只有 5 个未定义，随机数据也有 ~98% 能「解码成功」，
+/// 256 个字节值里只有 5 个未定义，实测 97.9% 的随机字节都能「解码成功」，
 /// 因此它既不能用来判断格式，解出来的也是乱码而不是信息。
 enum DataDecoder {
 
-    /// 超过这个长度的渲染结果会被截断：详情页是只读预览，
-    /// 塞进 Form 的一整屏文本再长也没人看，还会拖慢滚动
+    /// 只读全文的长度上限：详情页塞不下更多，还会拖慢滚动
     private static let renderLimit = 20_000
+    private static let maxDepth = 24
 
     static func decode(_ data: Data) -> DecodedPayload? {
         guard !data.isEmpty else { return nil }
@@ -27,12 +124,13 @@ enum DataDecoder {
             return nil
         }
         guard payload.text.count > renderLimit else { return payload }
-        let truncated = payload.text.prefix(renderLimit)
         return DecodedPayload(formatName: payload.formatName,
-                              text: truncated + "\n…（内容过长，已截断）")
+                              text: payload.text.prefix(renderLimit) + "\n…（内容过长，已截断）",
+                              fields: payload.fields,
+                              plan: payload.plan)
     }
 
-    // MARK: - plist / NSKeyedArchiver
+    // MARK: plist
 
     private static func decodePropertyList(_ data: Data) -> DecodedPayload? {
         // 必须先按魔数筛一遍。PropertyListSerialization 连 OpenStep 老格式也认，
@@ -41,25 +139,33 @@ enum DataDecoder {
         guard let base = plistFormatName(data) else { return nil }
 
         var format = PropertyListSerialization.PropertyListFormat.binary
-        guard let object = try? PropertyListSerialization.propertyList(from: data,
-                                                                      options: [],
-                                                                      format: &format) else {
+        guard let original = try? PropertyListSerialization.propertyList(from: data,
+                                                                        options: [],
+                                                                        format: &format) else {
             return nil
         }
 
-        // 归档的 plist 直接渲染出来是 $objects + CF$UID 的引用汤，
-        // 交给 NSKeyedUnarchiver 还原成真正的对象图
-        if let dictionary = object as? [AnyHashable: Any], dictionary["$archiver"] != nil {
-            if let root = unarchive(data, topKey: topKey(in: dictionary)) {
+        if let dictionary = original as? [AnyHashable: Any], dictionary["$archiver"] != nil {
+            if let resolved = resolveArchive(dictionary) {
                 return DecodedPayload(formatName: "\(base) · NSKeyedArchiver",
-                                      text: render(root))
+                                      text: resolved.text,
+                                      fields: resolved.fields,
+                                      plan: .propertyList(original, format))
             }
-            // 含无法实例化的自定义类时还原会失败，退回原始结构总比什么都不给强
-            return DecodedPayload(formatName: "\(base) · NSKeyedArchiver（对象图未能还原）",
-                                  text: render(object))
+            // 解不开引用图时至少把原始结构摆出来，但不能让它可编辑：
+            // 下标对不上，改了会写坏归档
+            return DecodedPayload(formatName: "\(base) · NSKeyedArchiver（引用图未能还原）",
+                                  text: renderPlain(original, indent: 0),
+                                  fields: [],
+                                  plan: nil)
         }
 
-        return DecodedPayload(formatName: base, text: render(object))
+        var fields: [DecodedField] = []
+        let text = collect(original, path: [], label: "", indent: 0, fields: &fields)
+        return DecodedPayload(formatName: base,
+                              text: text,
+                              fields: fields,
+                              plan: .propertyList(original, format))
     }
 
     private static func plistFormatName(_ data: Data) -> String? {
@@ -73,66 +179,203 @@ enum DataDecoder {
         return nil
     }
 
-    /// `archivedData(withRootObject:)` 存的键是 `root`，但用 `encode(_:forKey:)`
-    /// 手写的归档可以是任意键，写死 `root` 会白白解不出来。`$top` 里就有真正的键名。
-    private static func topKey(in archive: [AnyHashable: Any]) -> String {
-        guard let top = archive["$top"] as? [AnyHashable: Any],
-              let key = top.keys.map({ String(describing: $0) }).sorted().first else {
-            return NSKeyedArchiveRootObjectKey
+    // MARK: NSKeyedArchiver 引用图
+
+    /// UID 在 Swift 里没有公开类型，取不到里面的整数。但把 plist 转成 XML 再读回来，
+    /// UID 就会变成 `{"CF$UID": n}` 这样的普通字典 —— `plutil -convert xml1`
+    /// 看到的就是这个。**只用于读**：写回时用的是原始那份，UID 仍是不透明对象，
+    /// 原样交给序列化器，绝不能拿这份转换过的去写，否则 UID 会被当成真字典存进去。
+    private static func exposingUIDs(_ object: Any) -> Any? {
+        guard let xml = try? PropertyListSerialization.data(fromPropertyList: object,
+                                                            format: .xml,
+                                                            options: 0) else { return nil }
+        return try? PropertyListSerialization.propertyList(from: xml, options: [], format: nil)
+    }
+
+    private static func uidValue(_ any: Any) -> Int? {
+        guard let dictionary = any as? [AnyHashable: Any],
+              dictionary.count == 1,
+              let number = dictionary["CF$UID"] as? NSNumber else { return nil }
+        return number.intValue
+    }
+
+    private static func resolveArchive(
+        _ archive: [AnyHashable: Any]
+    ) -> (text: String, fields: [DecodedField])? {
+        guard let exposed = exposingUIDs(archive) as? [AnyHashable: Any],
+              let objects = exposed["$objects"] as? [Any],
+              let top = exposed["$top"] as? [AnyHashable: Any] else { return nil }
+
+        // `archivedData(withRootObject:)` 用的是 root，但手写归档可以是任意键，
+        // 写死 root 会白白解不出来
+        let rootRef = top
+            .map { (String(describing: $0.key), $0.value) }
+            .sorted { $0.0 < $1.0 }
+            .first?.1
+        guard let rootRef else { return nil }
+
+        var collected: [String: DecodedField] = [:]
+        var order: [String] = []
+        let text = resolve(rootRef, objects: objects, label: "", path: [], indent: 0,
+                           visiting: [], fields: &collected, order: &order)
+
+        return (text, order.compactMap { collected[$0] })
+    }
+
+    /// `path` 指向 `node` 这个值在整份 plist 里的存放位置，写回时照着它改。
+    private static func resolve(_ node: Any,
+                                objects: [Any],
+                                label: String,
+                                path: FieldLocation,
+                                indent: Int,
+                                visiting: Set<Int>,
+                                fields: inout [String: DecodedField],
+                                order: inout [String]) -> String {
+        guard indent < maxDepth else { return "…" }
+
+        if let index = uidValue(node) {
+            guard index >= 0, index < objects.count else { return "<引用越界 \(index)>" }
+            // 归档里出现环是合法的，不挡住就会无限递归
+            guard !visiting.contains(index) else { return "<循环引用>" }
+            // 被引用的对象就存在 $objects[index]，路径从这里重新起算
+            return resolve(objects[index], objects: objects, label: label,
+                           path: [.key("$objects"), .index(index)], indent: indent,
+                           visiting: visiting.union([index]),
+                           fields: &fields, order: &order)
         }
-        return key
-    }
 
-    private static func unarchive(_ data: Data, topKey: String) -> Any? {
-        guard let unarchiver = try? NSKeyedUnarchiver(forReadingFrom: data) else { return nil }
-        // 归档里多是 NSDictionary / NSString / NSNumber，但也可能有自定义类；
-        // 关掉安全编码要求才能尽量还原，失败时下面会退回原始结构
-        unarchiver.requiresSecureCoding = false
-        defer { unarchiver.finishDecoding() }
-        return try? unarchiver.decodeTopLevelObject(forKey: topKey)
-    }
-
-    // MARK: - JSON
-
-    private static func decodeJSON(_ data: Data) -> DecodedPayload? {
-        guard let first = data.first,
-              first == UInt8(ascii: "{") || first == UInt8(ascii: "[") else { return nil }
-        guard let object = try? JSONSerialization.jsonObject(with: data),
-              let pretty = try? JSONSerialization.data(withJSONObject: object,
-                                                       options: [.prettyPrinted, .sortedKeys]),
-              let text = String(data: pretty, encoding: .utf8) else {
-            return nil
-        }
-        return DecodedPayload(formatName: "JSON", text: text)
-    }
-
-    // MARK: - DER / ASN.1
-
-    private static func decodeDER(_ data: Data) -> DecodedPayload? {
-        // ASN.1 SEQUENCE + 长格式长度，是证书和 RSA/EC 公钥的开头
-        guard data.count > 2, data[data.startIndex] == 0x30 else { return nil }
-
-        if let certificate = SecCertificateCreateWithData(nil, data as CFData) {
-            var lines = ["X.509 证书，\(data.count) 字节"]
-            if let summary = SecCertificateCopySubjectSummary(certificate) as String?, !summary.isEmpty {
-                lines.append("主体：\(summary)")
-            }
-            return DecodedPayload(formatName: "DER 证书", text: lines.joined(separator: "\n"))
+        // 叶子可能是单独占一格的，也可能内联在上层字典里，两种都要收
+        if let kind = leafKind(of: node) {
+            record(path: path, label: label, kind: kind, value: leafValue(node),
+                   into: &fields, order: &order)
+            return leafDisplay(node)
         }
 
-        return DecodedPayload(
-            formatName: "DER / ASN.1",
-            text: "以 SEQUENCE 开头的 ASN.1 结构，\(data.count) 字节。\n"
-                + "常见于 RSA / EC 公钥。本工具只做识别，不展开完整 ASN.1。"
-        )
+        guard let dictionary = node as? [AnyHashable: Any] else {
+            return leafDisplay(node)
+        }
+
+        let pad = String(repeating: "  ", count: indent)
+
+        // NSDictionary / NSMutableDictionary：键和值分成两个平行数组
+        if let keys = dictionary["NS.keys"] as? [Any],
+           let values = dictionary["NS.objects"] as? [Any] {
+            guard !keys.isEmpty else { return "{}" }
+            let body = zip(keys, values).enumerated().map { offset, pair -> String in
+                let name = keyName(pair.0, objects: objects)
+                let child = resolve(pair.1, objects: objects, label: join(label, name),
+                                    path: path + [.key("NS.objects"), .index(offset)],
+                                    indent: indent + 1, visiting: visiting,
+                                    fields: &fields, order: &order)
+                return "\(pad)  \(name): \(child)"
+            }.joined(separator: "\n")
+            return "{\n\(body)\n\(pad)}"
+        }
+
+        // NSArray / NSSet
+        if let values = dictionary["NS.objects"] as? [Any] {
+            guard !values.isEmpty else { return "[]" }
+            let body = values.enumerated().map { offset, value in
+                let child = resolve(value, objects: objects, label: "\(label)[\(offset)]",
+                                    path: path + [.key("NS.objects"), .index(offset)],
+                                    indent: indent + 1, visiting: visiting,
+                                    fields: &fields, order: &order)
+                return "\(pad)  \(child)"
+            }.joined(separator: "\n")
+            return "[\n\(body)\n\(pad)]"
+        }
+
+        // NSString / NSMutableString：文本直接内联在这里，不单独占格
+        if let string = dictionary["NS.string"] {
+            return resolve(string, objects: objects, label: label,
+                           path: path + [.key("NS.string")], indent: indent,
+                           visiting: visiting, fields: &fields, order: &order)
+        }
+        if let bytes = dictionary["NS.data"] as? Data {
+            return "<\(bytes.count) 字节二进制>"
+        }
+        if let time = dictionary["NS.time"] as? NSNumber {
+            // NSDate 存的是相对 2001-01-01 的秒数
+            return dateFormatter.string(from: Date(timeIntervalSinceReferenceDate: time.doubleValue))
+        }
+
+        // 自定义类的实例：键就是字段名。本 App 里没有这些类，
+        // 但归档里带了 $classname，照样能展开成可读的东西
+        let className = classNameOf(dictionary, objects: objects)
+        let entries = dictionary
+            .map { (String(describing: $0.key), $0.value) }
+            .filter { $0.0 != "$class" }
+            .sorted { $0.0 < $1.0 }
+        guard !entries.isEmpty else { return className.map { "\($0) {}" } ?? "{}" }
+
+        let body = entries.map { name, value -> String in
+            let child = resolve(value, objects: objects, label: join(label, name),
+                                path: path + [.key(name)], indent: indent + 1,
+                                visiting: visiting, fields: &fields, order: &order)
+            return "\(pad)  \(name): \(child)"
+        }.joined(separator: "\n")
+        let prefix = className.map { "\($0) " } ?? ""
+        return "\(prefix){\n\(body)\n\(pad)}"
     }
 
-    // MARK: - 渲染
+    private static func classNameOf(_ dictionary: [AnyHashable: Any], objects: [Any]) -> String? {
+        guard let reference = dictionary["$class"],
+              let index = uidValue(reference),
+              index >= 0, index < objects.count,
+              let entry = objects[index] as? [AnyHashable: Any] else { return nil }
+        return entry["$classname"] as? String
+    }
 
-    private static func render(_ value: Any, indent: Int = 0) -> String {
-        // 归档还原出来的对象图可能有环（自定义类互相引用），必须封顶
-        guard indent < 32 else { return "…" }
+    /// 字典的键本身也是引用，几乎总是字符串
+    private static func keyName(_ reference: Any, objects: [Any]) -> String {
+        if let index = uidValue(reference), index >= 0, index < objects.count {
+            if let text = objects[index] as? String { return text }
+            if let number = objects[index] as? NSNumber { return number.stringValue }
+        }
+        return String(describing: reference)
+    }
 
+    private static func join(_ path: String, _ name: String) -> String {
+        path.isEmpty ? name : "\(path).\(name)"
+    }
+
+    /// 归档会把相同的字符串合并成同一格，所以一处存储可能对应多条引用路径。
+    /// 合并标签而不是覆盖，用户才知道改这一格会同时影响哪几处。
+    private static func record(path: FieldLocation,
+                               label: String,
+                               kind: DecodedField.Kind,
+                               value: String,
+                               into fields: inout [String: DecodedField],
+                               order: inout [String]) {
+        guard kind != .null else { return }
+
+        let id = path.map(\.token).joined(separator: "/")
+        let name = label.isEmpty ? "(根)" : label
+
+        guard let existing = fields[id] else {
+            fields[id] = DecodedField(id: id, label: name, kind: kind,
+                                      value: value, location: path)
+            order.append(id)
+            return
+        }
+
+        let parts = existing.label.components(separatedBy: " / ")
+        guard !parts.contains(name), parts.count < 6 else { return }
+        fields[id] = DecodedField(id: id,
+                                  label: existing.label + " / " + name,
+                                  kind: existing.kind,
+                                  value: existing.value,
+                                  location: existing.location)
+    }
+
+    // MARK: 普通 plist / JSON：按路径定位
+
+    private static func collect(_ value: Any,
+                                path: [PathComponent],
+                                label: String,
+                                indent: Int,
+                                fields: inout [DecodedField]) -> String {
+        guard indent < maxDepth else { return "…" }
         let pad = String(repeating: "  ", count: indent)
 
         // 字典要排在数组前面判断：NSDictionary 桥接过来也能匹配序列
@@ -141,36 +384,148 @@ enum DataDecoder {
             let body = dictionary
                 .map { (String(describing: $0.key), $0.value) }
                 .sorted { $0.0 < $1.0 }
-                .map { "\(pad)  \($0.0): \(render($0.1, indent: indent + 1))" }
+                .map { name, child -> String in
+                    let rendered = collect(child, path: path + [.key(name)],
+                                           label: join(label, name),
+                                           indent: indent + 1, fields: &fields)
+                    return "\(pad)  \(name): \(rendered)"
+                }
                 .joined(separator: "\n")
             return "{\n\(body)\n\(pad)}"
         }
 
         if let array = value as? [Any] {
             guard !array.isEmpty else { return "[]" }
-            let body = array
-                .map { "\(pad)  \(render($0, indent: indent + 1))" }
-                .joined(separator: "\n")
+            let body = array.enumerated().map { offset, child in
+                let rendered = collect(child, path: path + [.index(offset)],
+                                       label: "\(label)[\(offset)]",
+                                       indent: indent + 1, fields: &fields)
+                return "\(pad)  \(rendered)"
+            }.joined(separator: "\n")
             return "[\n\(body)\n\(pad)]"
         }
 
-        if let data = value as? Data {
-            // 嵌套的 Data 常常又是一层归档，能读成文本就直接显示
-            if let text = String(data: data, encoding: .utf8), isPrintable(text) {
-                return "\"\(text)\"  (\(data.count) 字节)"
+        if let kind = leafKind(of: value), kind != .null {
+            fields.append(DecodedField(id: path.map(\.token).joined(separator: "/"),
+                                       label: label.isEmpty ? "(根)" : label,
+                                       kind: kind,
+                                       value: leafValue(value),
+                                       location: path))
+        }
+        return leafDisplay(value)
+    }
+
+    /// 引用图解不开时的兜底渲染，只读
+    private static func renderPlain(_ value: Any, indent: Int) -> String {
+        var ignored: [DecodedField] = []
+        return collect(value, path: [], label: "", indent: indent, fields: &ignored)
+    }
+
+    // MARK: JSON
+
+    private static func decodeJSON(_ data: Data) -> DecodedPayload? {
+        guard let first = data.first,
+              first == UInt8(ascii: "{") || first == UInt8(ascii: "[") else { return nil }
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+
+        var fields: [DecodedField] = []
+        let text = collect(object, path: [], label: "", indent: 0, fields: &fields)
+        return DecodedPayload(formatName: "JSON", text: text, fields: fields, plan: .json(object))
+    }
+
+    // MARK: DER / ASN.1
+
+    private static func decodeDER(_ data: Data) -> DecodedPayload? {
+        guard isDER(data) else { return nil }
+
+        if let certificate = SecCertificateCreateWithData(nil, data as CFData) {
+            var lines = ["X.509 证书，\(data.count) 字节"]
+            if let summary = SecCertificateCopySubjectSummary(certificate) as String?, !summary.isEmpty {
+                lines.append("主体：\(summary)")
             }
-            return "<\(data.count) 字节二进制>"
+            return DecodedPayload(formatName: "DER 证书",
+                                  text: lines.joined(separator: "\n"),
+                                  fields: [], plan: nil)
         }
 
-        if let date = value as? Date {
-            return dateFormatter.string(from: date)
+        return DecodedPayload(
+            formatName: "DER / ASN.1",
+            text: "以 SEQUENCE 开头的 ASN.1 结构，\(data.count) 字节。\n"
+                + "常见于 RSA / EC 公钥。本工具只做识别，不展开完整 ASN.1。",
+            fields: [], plan: nil
+        )
+    }
+
+    /// 光看首字节是 0x30 不够 —— 那也是 ASCII 的 "0"。在实测的 1447 条里，
+    /// 只判首字节会把 87 条算成 DER，而其中 34 条其实是以 "0" 开头的普通文本。
+    /// 必须连长度字段一起校验，看它和数据实际长度对不对得上。
+    private static func isDER(_ data: Data) -> Bool {
+        let head = [UInt8](data.prefix(6))
+        guard head.count >= 2, head[0] == 0x30 else { return false }
+
+        let marker = head[1]
+        if marker & 0x80 == 0 {
+            return 2 + Int(marker) == data.count
         }
 
-        if let string = value as? String {
-            return "\"\(string)\""
+        let byteCount = Int(marker & 0x7F)
+        guard byteCount >= 1, byteCount <= 4, head.count >= 2 + byteCount else { return false }
+        var length = 0
+        for offset in 0..<byteCount {
+            length = (length << 8) | Int(head[2 + offset])
         }
+        return 2 + byteCount + length == data.count
+    }
 
-        return "\(value)"
+    // MARK: 叶子
+
+    private static func leafKind(of value: Any) -> DecodedField.Kind? {
+        if let text = value as? String {
+            // 归档用 "$null" 这个字符串表示空引用，不是真的内容
+            return text == "$null" ? .null : .string
+        }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() { return .boolean }
+            return CFNumberIsFloatType(number as CFNumber) ? .real : .integer
+        }
+        if value is Date { return .date }
+        if value is Data { return .data }
+        if value is NSNull { return .null }
+        return nil
+    }
+
+    /// 用于编辑框的原值
+    private static func leafValue(_ value: Any) -> String {
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
+                return number.boolValue ? "true" : "false"
+            }
+            return number.stringValue
+        }
+        if let text = value as? String { return text }
+        return leafDisplay(value)
+    }
+
+    /// 用于只读全文的显示值
+    private static func leafDisplay(_ value: Any) -> String {
+        if let text = value as? String {
+            return text == "$null" ? "null" : "\"\(text)\""
+        }
+        if let number = value as? NSNumber {
+            if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
+                return number.boolValue ? "true" : "false"
+            }
+            return number.stringValue
+        }
+        if let bytes = value as? Data {
+            if let text = String(data: bytes, encoding: .utf8), isPrintable(text) {
+                return "\"\(text)\"  (\(bytes.count) 字节)"
+            }
+            return "<\(bytes.count) 字节二进制>"
+        }
+        if let date = value as? Date { return dateFormatter.string(from: date) }
+        if value is NSNull { return "null" }
+        return String(describing: value)
     }
 
     /// 换行和制表符也算控制字符，但它们出现在文本里是正常的，不能据此判成二进制
@@ -186,4 +541,106 @@ enum DataDecoder {
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
         return formatter
     }()
+}
+
+// MARK: - 写回
+
+extension DecodedPayload {
+
+    /// `edits` 是 field.id -> 新文本，只包含用户实际改过的字段
+    func encoded(with edits: [String: String]) throws -> Data {
+        guard let plan else { throw DecodeEditError.notEditable }
+
+        let changed = fields.filter {
+            guard let text = edits[$0.id] else { return false }
+            return text != $0.value
+        }
+        guard !changed.isEmpty else { throw DecodeEditError.noChanges }
+
+        switch plan {
+        case .propertyList(let root, let format):
+            let updated = try apply(changed, edits: edits, to: root)
+            do {
+                return try PropertyListSerialization.data(fromPropertyList: updated,
+                                                          format: format,
+                                                          options: 0)
+            } catch {
+                throw DecodeEditError.encodingFailed(error.localizedDescription)
+            }
+
+        case .json(let root):
+            let updated = try apply(changed, edits: edits, to: root)
+            do {
+                return try JSONSerialization.data(withJSONObject: updated,
+                                                  options: [.sortedKeys])
+            } catch {
+                throw DecodeEditError.encodingFailed(error.localizedDescription)
+            }
+        }
+    }
+
+    private func apply(_ changed: [DecodedField],
+                       edits: [String: String],
+                       to root: Any) throws -> Any {
+        var result = root
+        for field in changed {
+            guard let text = edits[field.id] else { continue }
+            let value = try Self.converted(text, to: field.kind, label: field.label)
+            result = try Self.setValue(value, at: field.location, in: result, label: field.label)
+        }
+        return result
+    }
+
+    fileprivate static func converted(_ text: String,
+                                      to kind: DecodedField.Kind,
+                                      label: String) throws -> Any {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch kind {
+        case .string:
+            return text
+        case .integer:
+            guard let value = Int(trimmed) else {
+                throw DecodeEditError.badNumber(label: label, expected: "整数")
+            }
+            return NSNumber(value: value)
+        case .real:
+            guard let value = Double(trimmed) else {
+                throw DecodeEditError.badNumber(label: label, expected: "小数")
+            }
+            return NSNumber(value: value)
+        case .boolean:
+            switch trimmed.lowercased() {
+            case "true", "1", "yes": return NSNumber(value: true)
+            case "false", "0", "no": return NSNumber(value: false)
+            default: throw DecodeEditError.badNumber(label: label, expected: "true 或 false")
+            }
+        case .date, .data, .null:
+            throw DecodeEditError.notEditable
+        }
+    }
+
+    fileprivate static func setValue(_ newValue: Any,
+                                     at path: FieldLocation,
+                                     in container: Any,
+                                     label: String) throws -> Any {
+        guard let head = path.first else { return newValue }
+        let rest = Array(path.dropFirst())
+
+        switch head {
+        case .key(let name):
+            guard var dictionary = container as? [AnyHashable: Any],
+                  let child = dictionary[name] else {
+                throw DecodeEditError.pathBroken(label: label)
+            }
+            dictionary[name] = try setValue(newValue, at: rest, in: child, label: label)
+            return dictionary
+
+        case .index(let offset):
+            guard var array = container as? [Any], offset >= 0, offset < array.count else {
+                throw DecodeEditError.pathBroken(label: label)
+            }
+            array[offset] = try setValue(newValue, at: rest, in: array[offset], label: label)
+            return array
+        }
+    }
 }
