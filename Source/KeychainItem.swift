@@ -108,7 +108,11 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
         case .internetPassword:
             return [kSecAttrAccount, kSecAttrServer].map { $0 as String }
         case .key:
-            return [kSecAttrApplicationLabel, kSecAttrApplicationTag].map { $0 as String }
+            // kcls 必须带上：klbl 是公钥的 SHA-1，**一对密钥的公私钥共用同一个值**，
+            // 加上 atag 也一样。只按 klbl+atag 删会把另一半一起删掉 ——
+            // 实测导出里就有这样一对，除 kcls 和用途标志外完全相同。
+            return [kSecAttrApplicationLabel, kSecAttrApplicationTag, kSecAttrKeyClass]
+                .map { $0 as String }
         case .certificate:
             return [kSecAttrIssuer, kSecAttrSerialNumber, kSecAttrLabel].map { $0 as String }
         }
@@ -346,6 +350,8 @@ enum KeychainAttributeFormatter {
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        // 固定格式串配 POSIX 区域：设备用非公历日历时，年份会按那套纪年输出
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         return formatter
     }()
 

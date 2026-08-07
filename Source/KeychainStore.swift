@@ -411,8 +411,13 @@ enum KeychainStore {
         if byPrimaryKey == errSecSuccess { return errSecSuccess }
         if byPrimaryKey != errSecItemNotFound { lastStatus = byPrimaryKey }
 
-        // 3. 退化主键，应对系统回传属性类型异常导致 errSecParam 的情况
-        if let minimal = item.minimalPrimaryKeyQuery {
+        // 3. 退化主键，应对系统回传属性类型异常导致 errSecParam 的情况。
+        //
+        //    但 SecItemDelete 会删掉**所有**命中项，而退化查询按定义比主键更宽，
+        //    所以动手前先数一遍：只要可能命中不止一条就不删，宁可报失败。
+        //    这不是假想 —— 一对密钥的公私钥共用同一个 klbl（公钥的 SHA-1）和 atag，
+        //    只差 kcls，实测导出里就有这么一对。
+        if let minimal = item.minimalPrimaryKeyQuery, matchCount(for: minimal) <= 1 {
             let byMinimal = SecItemDelete(minimal as CFDictionary)
             if byMinimal == errSecSuccess { return errSecSuccess }
             if byMinimal != errSecItemNotFound { lastStatus = byMinimal }
@@ -422,6 +427,20 @@ enum KeychainStore {
         if !exists(item) { return errSecSuccess }
 
         return lastStatus
+    }
+
+    /// 该查询会命中多少条。数不清时返回 `Int.max`，让调用方按「可能很多」处理。
+    private static func matchCount(for query: [String: Any]) -> Int {
+        var counting = query
+        counting[kSecMatchLimit as String] = kSecMatchLimitAll
+        counting[kSecReturnPersistentRef as String] = true
+
+        var output: AnyObject?
+        let status = SecItemCopyMatching(counting as CFDictionary, &output)
+        if status == errSecItemNotFound { return 0 }
+        guard status == errSecSuccess else { return .max }
+        if let rows = output as? [Any] { return rows.count }
+        return output == nil ? 0 : 1
     }
 
     /// 条目是否仍然存在。无法判定时一律按「还在」处理，绝不谎报删除成功。
@@ -929,12 +948,14 @@ enum KeychainStore {
     /// app 认领。但它是不是 `SecItemAdd` 允许手给的属性，只有真机说了算 ——
     /// 之前密钥的 `priv`/`modi`/`extr` 就是写了直接 -50。
     ///
-    /// iOS SDK 里**没有** `kSecAttrAlias` 这个常量（编译验证过：cannot find in scope），
-    /// 但 SecItem 的查询字典本来就是字符串键，直接用 "alis" 是能送进去的 ——
-    /// securityd 收不收只有真机知道。
+    /// 苹果没把它开放给 SecItem。两边证据一致：iOS SDK 里没有 `kSecAttrAlias`
+    /// 这个常量（编译报 cannot find in scope），而 Security 源码
+    /// `libsecurity_keychain/lib/SecItem.cpp` 的属性映射表里那一行是注释掉的：
+    /// `//  { kSecKeyAlias, /* not yet exposed by SecItem */, ... }`。
     ///
-    /// 所以先带上写，真被拒了（errSecParam）再摘掉重试一次：
-    /// 能保真就保真，不能也只是退回原来的行为，不会因此整批导入失败。
+    /// 但 SecItem 的字典就是字符串键，`"alis"` 仍然送得进去，收不收只有真机知道。
+    /// 所以先带上写，被拒（errSecParam）就摘掉重试 —— 能保真就保真，
+    /// 不能也只是退回原来的行为，不会因此整批失败。
     private static let bestEffortAttributes: Set<String> = ["alis"]
 
     /// 按导入文件里的属性直接写入。
@@ -949,6 +970,7 @@ enum KeychainStore {
                            replaceExisting: Bool,
                            progress: ((Int, Int) -> Void)? = nil) -> ImportOutcome {
         var outcome = ImportOutcome()
+        var bestEffortRejected = false
 
         for (index, item) in items.enumerated() {
             progress?(index, items.count)
@@ -979,6 +1001,12 @@ enum KeychainStore {
                 attributes[kSecValueRef as String] = certificate
             }
 
+            // 一旦确认系统不收，后面的就别再白试一次了 ——
+            // 否则整批每条都要发两次 SecItemAdd
+            if bestEffortRejected {
+                for key in bestEffortAttributes { attributes.removeValue(forKey: key) }
+            }
+
             var status = SecItemAdd(attributes as CFDictionary, nil)
 
             // 系统不认这些「尽量保真」的属性时，摘掉再试一次，
@@ -987,7 +1015,12 @@ enum KeychainStore {
                attributes.keys.contains(where: { bestEffortAttributes.contains($0) }) {
                 for key in bestEffortAttributes { attributes.removeValue(forKey: key) }
                 status = SecItemAdd(attributes as CFDictionary, nil)
-                if status == errSecSuccess { outcome.degraded += 1 }
+                if status == errSecSuccess {
+                    bestEffortRejected = true
+                    outcome.degraded += 1
+                }
+            } else if bestEffortRejected {
+                outcome.degraded += 1
             }
 
             switch status {
