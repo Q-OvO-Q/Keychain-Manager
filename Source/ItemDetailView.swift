@@ -55,6 +55,7 @@ struct ItemDetailView: View {
             certificateSection(item)
             tagSection(item)
             dataSection(item)
+            decodedDataSection()
             editableAttributesSection(item)
             attributesSection(item)
             deleteSection(item)
@@ -351,6 +352,54 @@ struct ItemDetailView: View {
         let data = isHexMode ? content.hexData : content.data(using: .utf8)
         guard let data else { return "内容不合法" }
         return "\(data.count) 字节"
+    }
+
+    // MARK: 数据解析
+
+    /// 大量条目的数据其实是 binary plist（多数还是 NSKeyedArchiver 归档），
+    /// 十六进制模式下完全没法读。这里额外给一个只读的解析视图，
+    /// 编辑仍然在上面的数据区进行，避免解析结果被误当成可保存的内容。
+    @ViewBuilder
+    private func decodedDataSection() -> some View {
+        if let payload = decodedPayload {
+            Section {
+                // 和数据区同样的处理：多行合并成一个 Form 行，中间自己画 Divider，
+                // 否则系统分隔线会被内容盖住
+                VStack(spacing: 0) {
+                    HStack {
+                        Text(payload.formatName)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            copy(payload.text)
+                        } label: {
+                            Label("复制", systemImage: "doc.on.doc")
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.vertical, 6)
+
+                    Divider()
+
+                    Text(payload.text)
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 6)
+                }
+            } header: {
+                Text("数据解析")
+            } footer: {
+                Text("只读预览，按数据的实际格式还原。")
+            }
+        }
+    }
+
+    private var decodedPayload: DecodedPayload? {
+        guard let data = isHexMode ? content.hexData : content.data(using: .utf8) else { return nil }
+        return DataDecoder.decode(data)
     }
 
     // MARK: 可修改的元数据
