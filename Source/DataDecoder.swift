@@ -16,17 +16,6 @@ struct DecodedField: Identifiable {
             }
         }
 
-        var hint: String {
-            switch self {
-            case .string: return "文本"
-            case .integer: return "整数"
-            case .real: return "小数"
-            case .boolean: return "开关"
-            case .date: return "日期"
-            case .data: return "二进制"
-            case .null: return "空"
-            }
-        }
     }
 
     let id: String
@@ -58,8 +47,10 @@ fileprivate enum PathComponent {
 }
 
 fileprivate enum EditPlan {
-    /// 存的是**原始**解析结果，里面的 UID 仍是不透明对象，原样交回序列化器
-    case propertyList(Any, PropertyListSerialization.PropertyListFormat)
+    /// 二进制 plist：读写都走自己实现的 `BinaryPlist`，UID 是 `ArchiveUID`
+    case binaryPlist(Any)
+    /// XML plist：交给 `PropertyListSerialization`
+    case xmlPlist(Any)
     case json(Any)
     /// 字段表：每项是 ["n": 字段号, "w": 线型, "v": 值]
     case protobuf([Any])
@@ -115,6 +106,10 @@ enum DecodeEditError: LocalizedError {
 /// 根本不存在，`NSKeyedUnarchiver` 一律解不出来。自己解还有个附带好处 ——
 /// 能记下每个叶子的存放路径，写回时只改那一处，引用图原封不动。
 ///
+/// 连 binary plist 本身的编解码也是自己实现的（见 [BinaryPlist]）：UID 在 Swift 里
+/// 没有能读写的公开类型，绕不开。曾经试过「转 XML 再读回来把 UID 摊成 CF$UID 字典」，
+/// 实机上整份归档全都解不开，已废弃。
+///
 /// 不做的事：按 Windows-1252 之类的单字节编码硬解。这条查过实据，不是想当然：
 /// 整份导出 83 万字节里 cp1252 未定义的只有 0.45%，随机字节的「解码成功率」97.9% ——
 /// 什么都能解，就等于什么都没判。而且它解出来的不是信息：那 12 条「按 cp1252 看
@@ -144,81 +139,68 @@ enum DataDecoder {
     // MARK: plist
 
     private static func decodePropertyList(_ data: Data) -> DecodedPayload? {
-        // 必须先按魔数筛一遍。PropertyListSerialization 连 OpenStep 老格式也认，
-        // 而在那套语法里一个裸词就是合法的字符串 plist——不筛的话，
-        // 每条普通文本密码都会被「解析」成它自己，白白多出一段。
-        guard let base = plistFormatName(data) else { return nil }
+        // 必须先按魔数筛。二进制的交给自己的实现，XML 的才走 Foundation ——
+        // 后者连 OpenStep 老格式也认，而在那套语法里一个裸词就是合法的字符串 plist，
+        // 不筛的话每条普通文本密码都会被「解析」成它自己，白白多出一段。
+        let parsed: Any
+        let base: String
+        let plan: (Any) -> EditPlan
 
-        var format = PropertyListSerialization.PropertyListFormat.binary
-        guard let original = try? PropertyListSerialization.propertyList(from: data,
+        if data.starts(with: BinaryPlist.magic) {
+            guard let root = BinaryPlist.parse(data) else { return nil }
+            parsed = root
+            base = "binary plist"
+            plan = EditPlan.binaryPlist
+        } else if isXMLPlist(data) {
+            guard let root = try? PropertyListSerialization.propertyList(from: data,
                                                                         options: [],
-                                                                        format: &format) else {
+                                                                        format: nil) else {
+                return nil
+            }
+            parsed = root
+            base = "XML plist"
+            plan = EditPlan.xmlPlist
+        } else {
             return nil
         }
 
-        if let dictionary = original as? [AnyHashable: Any], dictionary["$archiver"] != nil {
+        if let dictionary = parsed as? [AnyHashable: Any], dictionary["$archiver"] != nil {
             if let resolved = resolveArchive(dictionary) {
                 return DecodedPayload(formatName: "\(base) · NSKeyedArchiver",
                                       text: resolved.text,
                                       fields: resolved.fields,
-                                      plan: .propertyList(original, format))
+                                      plan: plan(parsed))
             }
-            // 解不开引用图时至少把原始结构摆出来，但不能让它可编辑：
-            // 下标对不上，改了会写坏归档
+            // 引用图解不开时至少把原始结构摆出来，但不能让它可编辑
             return DecodedPayload(formatName: "\(base) · NSKeyedArchiver（引用图未能还原）",
-                                  text: renderPlain(original, indent: 0),
+                                  text: renderPlain(parsed, indent: 0),
                                   fields: [],
                                   plan: nil)
         }
 
         var fields: [DecodedField] = []
-        let text = collect(original, path: [], label: "", indent: 0, fields: &fields)
-        return DecodedPayload(formatName: base,
-                              text: text,
-                              fields: fields,
-                              plan: .propertyList(original, format))
+        let text = collect(parsed, path: [], label: "", indent: 0, fields: &fields)
+        return DecodedPayload(formatName: base, text: text, fields: fields, plan: plan(parsed))
     }
 
-    private static func plistFormatName(_ data: Data) -> String? {
-        if data.starts(with: Array("bplist".utf8)) { return "binary plist" }
-
+    private static func isXMLPlist(_ data: Data) -> Bool {
         // XML plist 前面可能有空白
         let head = data.prefix(512).drop { $0 == 0x20 || $0 == 0x09 || $0 == 0x0a || $0 == 0x0d }
-        if head.starts(with: Array("<?xml".utf8)) || head.starts(with: Array("<plist".utf8)) {
-            return "XML plist"
-        }
-        return nil
+        return head.starts(with: Array("<?xml".utf8)) || head.starts(with: Array("<plist".utf8))
     }
 
     // MARK: NSKeyedArchiver 引用图
 
-    /// UID 在 Swift 里没有公开类型，取不到里面的整数。但把 plist 转成 XML 再读回来，
-    /// UID 就会变成 `{"CF$UID": n}` 这样的普通字典 —— `plutil -convert xml1`
-    /// 看到的就是这个。**只用于读**：写回时用的是原始那份，UID 仍是不透明对象，
-    /// 原样交给序列化器，绝不能拿这份转换过的去写，否则 UID 会被当成真字典存进去。
-    private static func exposingUIDs(_ object: Any) -> Any? {
-        guard let xml = try? PropertyListSerialization.data(fromPropertyList: object,
-                                                            format: .xml,
-                                                            options: 0) else { return nil }
-        return try? PropertyListSerialization.propertyList(from: xml, options: [], format: nil)
-    }
-
     private static func uidValue(_ any: Any) -> Int? {
-        guard let dictionary = any as? [AnyHashable: Any],
-              dictionary.count == 1,
-              let number = dictionary["CF$UID"] as? NSNumber else { return nil }
-        return number.intValue
+        guard let uid = any as? ArchiveUID else { return nil }
+        return Int(clamping: uid.value)
     }
 
     private static func resolveArchive(
         _ archive: [AnyHashable: Any]
     ) -> (text: String, fields: [DecodedField])? {
-        guard let exposed = exposingUIDs(archive) as? [AnyHashable: Any],
-              let objects = exposed["$objects"] as? [Any],
-              let top = exposed["$top"] as? [AnyHashable: Any] else { return nil }
-
-        // 路径是照着 exposed 记的、却要用到 original 上，两边的 $objects 必须一一对应
-        guard (archive["$objects"] as? [Any])?.count == objects.count else { return nil }
+        guard let objects = archive["$objects"] as? [Any],
+              let top = archive["$top"] as? [AnyHashable: Any] else { return nil }
 
         // `archivedData(withRootObject:)` 用的是 root，但手写归档可以是任意键，
         // 写死 root 会白白解不出来
@@ -226,11 +208,7 @@ enum DataDecoder {
             .map { (String(describing: $0.key), $0.value) }
             .sorted { $0.0 < $1.0 }
             .first?.1
-        guard let rootRef else { return nil }
-
-        // $top 的值在真归档里一定是引用。取不出引用说明 XML 往返没按预期
-        // 把 UID 摊成 CF$UID 字典 —— 那样记下来的路径全是错的，宁可退回只读。
-        guard uidValue(rootRef) != nil else { return nil }
+        guard let rootRef, uidValue(rootRef) != nil else { return nil }
 
         var collected: [String: DecodedField] = [:]
         var order: [String] = []
@@ -716,11 +694,19 @@ extension DecodedPayload {
 
         let encoded: Data
         switch plan {
-        case .propertyList(let root, let format):
+        case .binaryPlist(let root):
+            let updated = try apply(changed, edits: edits, to: root)
+            do {
+                encoded = try BinaryPlist.serialize(updated)
+            } catch {
+                throw DecodeEditError.encodingFailed(error.localizedDescription)
+            }
+
+        case .xmlPlist(let root):
             let updated = try apply(changed, edits: edits, to: root)
             do {
                 encoded = try PropertyListSerialization.data(fromPropertyList: updated,
-                                                             format: format,
+                                                             format: .xml,
                                                              options: 0)
             } catch {
                 throw DecodeEditError.encodingFailed(error.localizedDescription)
@@ -748,10 +734,8 @@ extension DecodedPayload {
 
     /// 编完立刻再解一遍，结构对不上就报错而不是写进钥匙串。
     ///
-    /// 主要是为了兜住归档那条路径上一个没法在开发机上验证的假设：UID 在 Swift 里
-    /// 没有公开类型，写回时是把原始解析结果里的不透明 UID 对象原样交还给
-    /// `PropertyListSerialization`，赌它序列化时仍当 UID 处理。这个自检把
-    /// 「赌错了就默默写坏条目」变成「赌错了就明确报错、原数据不动」。
+    /// binary plist 的编码是本项目自己实现的，没法在开发机上跑真机验证，
+    /// 这一步就是它的安全网：把「编错了默默写坏条目」变成「编错了明确报错、原数据不动」。
     private func verify(_ data: Data, changed: [DecodedField]) throws {
         guard let reparsed = reparse(data) else {
             throw DecodeEditError.verificationFailed("重新编码后的数据解析不回来")
