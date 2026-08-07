@@ -847,14 +847,17 @@ enum KeychainStore {
             if let appLabel = newItem.applicationLabel.data(using: .utf8), !appLabel.isEmpty {
                 attributes[kSecAttrApplicationLabel as String] = appLabel
             }
-            if newItem.isPermanent { attributes[kSecAttrIsPermanent as String] = true }
-            if newItem.canEncrypt { attributes[kSecAttrCanEncrypt as String] = true }
-            if newItem.canDecrypt { attributes[kSecAttrCanDecrypt as String] = true }
-            if newItem.canDerive { attributes[kSecAttrCanDerive as String] = true }
-            if newItem.canSign { attributes[kSecAttrCanSign as String] = true }
-            if newItem.canVerify { attributes[kSecAttrCanVerify as String] = true }
-            if newItem.canWrap { attributes[kSecAttrCanWrap as String] = true }
-            if newItem.canUnwrap { attributes[kSecAttrCanUnwrap as String] = true }
+            // 显式写 true / false，不能「只在 true 时写」：这些标志省略时系统会
+            // 按密钥类型自行推断，而不是当成 false —— 那样界面上关掉的开关根本不起作用。
+            // 详情页一直是这么写的（SecItemUpdate 带显式 false），所以这条路是通的。
+            attributes[kSecAttrIsPermanent as String] = newItem.isPermanent
+            attributes[kSecAttrCanEncrypt as String] = newItem.canEncrypt
+            attributes[kSecAttrCanDecrypt as String] = newItem.canDecrypt
+            attributes[kSecAttrCanDerive as String] = newItem.canDerive
+            attributes[kSecAttrCanSign as String] = newItem.canSign
+            attributes[kSecAttrCanVerify as String] = newItem.canVerify
+            attributes[kSecAttrCanWrap as String] = newItem.canWrap
+            attributes[kSecAttrCanUnwrap as String] = newItem.canUnwrap
         }
 
         if !newItem.label.isEmpty {
@@ -879,11 +882,11 @@ enum KeychainStore {
            let typeCode = FourCharCode.number(from: newItem.typeCode) {
             attributes[kSecAttrType as String] = typeCode
         }
-        if editable.contains(kSecAttrIsInvisible as String), newItem.isInvisible {
-            attributes[kSecAttrIsInvisible as String] = true
+        if editable.contains(kSecAttrIsInvisible as String) {
+            attributes[kSecAttrIsInvisible as String] = newItem.isInvisible
         }
-        if editable.contains(kSecAttrIsNegative as String), newItem.isNegative {
-            attributes[kSecAttrIsNegative as String] = true
+        if editable.contains(kSecAttrIsNegative as String) {
+            attributes[kSecAttrIsNegative as String] = newItem.isNegative
         }
 
         // 通配符组同样可以写入：钥匙串把它当成普通组名存下来，
@@ -893,7 +896,17 @@ enum KeychainStore {
             attributes[kSecAttrAccessGroup as String] = group
         }
 
-        return SecItemAdd(attributes as CFDictionary, nil)
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        guard status == errSecParam else { return status }
+
+        // 万一某个类别不接受显式 false，退回「只写 true」再试一次：
+        // 开关失效总比整条建不出来强，而且失败会明确报给用户
+        var relaxed = attributes
+        for (key, value) in attributes where (value as? Bool) == false {
+            relaxed.removeValue(forKey: key)
+        }
+        guard relaxed.count != attributes.count else { return status }
+        return SecItemAdd(relaxed as CFDictionary, nil)
     }
 
     // MARK: - 导入
