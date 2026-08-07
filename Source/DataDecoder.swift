@@ -993,10 +993,11 @@ extension DecodedPayload {
         case .string:
             return text
         case .integer:
-            guard let value = Int(trimmed) else {
-                throw DecodeEditError.badNumber(label: label, expected: "整数")
-            }
-            return NSNumber(value: value)
+            // protobuf 的 varint 是 64 位无符号，能超过 Int64.max。
+            // 只用 Int 解析的话，这类值显示得出来却改不回去。
+            if let value = Int(trimmed) { return NSNumber(value: value) }
+            if let value = UInt64(trimmed) { return NSNumber(value: value) }
+            throw DecodeEditError.badNumber(label: label, expected: "整数")
         case .real:
             guard let value = Double(trimmed) else {
                 throw DecodeEditError.badNumber(label: label, expected: "小数")

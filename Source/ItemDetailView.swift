@@ -371,15 +371,16 @@ struct ItemDetailView: View {
     private func decodedDataSection(_ item: KeychainItem) -> some View {
         if let payload = decoded {
             Section {
-                // 行的写法一律跟着本文件既有的 attributeRow 走：单层 HStack、
-                // 固定宽标签、不加 padding、不套 VStack。自己发明的写法
-                // 会把系统分隔线盖住，这个坑踩过好几次了。
                 // 密钥和证书不支持改数据。这时字段还摆成可输入的样子、
-                // 保存按钮却是灰的，等于骗人——直接按只读渲染
+                // 保存按钮却是灰的，等于骗人——那种情况直接按只读渲染
                 let writable = item.itemClass.supportsDataEditing && item.canBeTargeted
 
-                ForEach(payload.fields) { field in
-                    decodedFieldRow(field, writable: writable)
+                // 操作放在字段前面：绝大多数条目只有几个字段，但实测最大的一条
+                // 解出 1443 个，保存按钮沉在那么多行底下等于找不到
+                NavigationLink {
+                    decodedStructurePage(payload)
+                } label: {
+                    Text("完整结构")
                 }
 
                 if payload.isEditable && writable {
@@ -393,10 +394,11 @@ struct ItemDetailView: View {
                         .foregroundStyle(.green)
                 }
 
-                NavigationLink {
-                    decodedStructurePage(payload)
-                } label: {
-                    Text("完整结构")
+                // 行的写法一律跟着本文件既有的 attributeRow 走：单层 HStack、
+                // 固定宽标签、不加 padding、不套 VStack。自己发明的写法
+                // 会把系统分隔线盖住，这个坑踩过好几次了。
+                ForEach(payload.fields) { field in
+                    decodedFieldRow(field, writable: writable)
                 }
             } header: {
                 Text("数据解析（\(payload.formatName)）")
@@ -432,7 +434,9 @@ struct ItemDetailView: View {
         let label = Text(field.label)
             .font(.caption)
             .foregroundStyle(isEdited(field) ? Color.orange : Color.secondary)
-            .lineLimit(1)
+            // 路径能有 a.b.c[0].d 这么长，只给一行会截得只剩尾巴几个字。
+            // 允许折两行，仍然从头部截断，保留最具体的那一段
+            .lineLimit(2)
             .truncationMode(.head)
 
         if !writable || !field.kind.isEditable {
@@ -734,12 +738,19 @@ struct ItemDetailView: View {
 
     /// 用户在原始数据区改过之后，解析结果就对不上了，得跟着重算
     private func refreshDecoded() {
+        // 原始数据一变，解析区那些还没保存的修改就作废了。默默清掉的话
+        // 用户会以为改动还在，回头点保存才发现什么都没了
+        if !decodedEdits.isEmpty {
+            decodedEdits.removeAll()
+            decodedNotice = nil
+            viewModel.alertMessage = "原始数据已改动，解析区里还没保存的字段修改已作废。"
+        }
+
         guard let data = isHexMode ? content.hexData : content.data(using: .utf8) else {
             decoded = nil
             return
         }
         decoded = DataDecoder.decode(data)
-        decodedEdits.removeAll()
     }
 
     private func unlock(_ item: KeychainItem) {

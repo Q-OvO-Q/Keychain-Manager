@@ -244,8 +244,15 @@ enum KeychainStore {
             }
         }
 
-        if item.isDataReadable, let text = item.data?.utf8Text {
-            parts.append(text)
+        if item.isDataReadable, let data = item.data {
+            if let text = data.utf8Text {
+                parts.append(text)
+            } else if let decoded = DataDecoder.decode(data) {
+                // bplist、protobuf 这些解不成 UTF-8 的，详情页里内容看得清清楚楚，
+                // 不一起索引就成了「看得到却搜不到」。实测有 336 条属于这种。
+                // 枚举本来就在后台线程上跑，多这点解析开销无所谓。
+                parts.append(decoded.text)
+            }
         }
         return parts.joined(separator: "\n").lowercased()
     }
