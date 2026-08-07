@@ -290,7 +290,7 @@ enum KeychainStore {
         return ([], status)
     }
 
-    /// 按持久引用去重；拿不到持久引用的条目一律保留，宁可重复也不丢
+    /// 去重：有持久引用的按引用，没有的按主键
     private static func deduplicate(
         _ rows: [(KeychainItemClass, [String: Any])]
     ) -> [(KeychainItemClass, [String: Any])] {
@@ -1071,12 +1071,16 @@ enum KeychainStore {
                                                         reason: message(for: status)))
                     continue
                 }
-                let replaceStatus = replace(attributes: attributes, itemClass: item.itemClass)
-                if replaceStatus == errSecSuccess {
+                switch replace(attributes: attributes, itemClass: item.itemClass) {
+                case .done:
                     outcome.replaced += 1
-                } else {
+                case .failed(let replaceStatus):
                     outcome.failures.append(ImportFailure(title: describe(item),
                                                         reason: message(for: replaceStatus)))
+                case .ambiguous:
+                    outcome.failures.append(ImportFailure(
+                        title: describe(item),
+                        reason: "文件里的属性不足以唯一定位这条，覆盖会波及同组其它条目，已跳过"))
                 }
 
             default:
@@ -1090,8 +1094,21 @@ enum KeychainStore {
     }
 
     /// 条目已存在时改为更新：用主键定位，只写非主键的部分。
+    ///
+    /// 定位查询是从**文件里有的**主键属性拼出来的，文件缺哪个就少哪个 ——
+    /// 证书尤其明显：它的可写属性只有 labl/pdmn/agrp/sync，`ctyp`/`issr`/`slnr`
+    /// 一个都不在其中，查询会退化成「这个组里的所有证书」。
+    /// 而 `SecItemUpdate` 改的是**全部命中项**，那样一次导入就会把整组证书的
+    /// 标签和保护级别一起改掉。所以动手前先数一遍，超过一条就不改。
+    private enum ReplaceOutcome {
+        case done
+        case failed(OSStatus)
+        /// 定位查询会命中不止一条，改下去等于批量改写别人的条目
+        case ambiguous
+    }
+
     private static func replace(attributes: [String: Any],
-                               itemClass: KeychainItemClass) -> OSStatus {
+                               itemClass: KeychainItemClass) -> ReplaceOutcome {
         var query: [String: Any] = [kSecClass as String: itemClass.secClass]
         let primaryKeys = Set(itemClass.primaryKeyAttributes)
         for key in primaryKeys {
@@ -1102,14 +1119,20 @@ enum KeychainStore {
             query[kSecAttrSynchronizable as String] = false
         }
 
+        guard matchCount(for: query) <= 1 else { return .ambiguous }
+
         var changes: [String: Any] = [:]
         for (key, value) in attributes
         where !primaryKeys.contains(key) && key != (kSecClass as String) {
             changes[key] = value
         }
-        guard !changes.isEmpty else { return errSecSuccess }
+        // 证书的身份就是那份 DER：主键既然对上了，就是同一张证书，
+        // 没有「更新内容」可言。而 kSecValueRef 也不是 SecItemUpdate 能收的东西。
+        changes.removeValue(forKey: kSecValueRef as String)
+        guard !changes.isEmpty else { return .done }
 
-        return SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+        let status = SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+        return status == errSecSuccess ? .done : .failed(status)
     }
 
     /// 有些条目在原理上就导不进来，与其让它撞进 SecItemAdd 拿一个 -50，
