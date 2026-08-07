@@ -54,8 +54,8 @@ struct DecodedField: Identifiable {
 ///
 /// 不能只记 `$objects` 下标 —— 归档里有大量值是**内联**存的而不是单独占一格：
 /// `NSMutableString` 是 `{$class: UID, NS.string: "…"}`，自定义类的小整数也直接
-/// 写在实例字典里（`{gracePeriod: 0, …}`）。只认下标会漏掉这些，实测 309 条归档
-/// 里可编辑字段会从 2110 个掉到 1068 个，72 条整条都解不出可改的东西。
+/// 写在实例字典里（`{gracePeriod: 0, …}`）。只认下标会漏掉这些：同一份导出上实测，
+/// 按路径能解出 2999 个可编辑字段，只认下标只剩 1374 个，还有 72 条归档一个都解不出。
 fileprivate typealias FieldLocation = [PathComponent]
 
 fileprivate enum PathComponent {
@@ -126,9 +126,9 @@ enum DecodeEditError: LocalizedError {
 
 /// 把条目数据里那些「看着是二进制、其实有结构」的内容解析成可读、可改的形式。
 ///
-/// 对着一份 1447 条的完整导出统计过：binary plist 313 条（其中 309 条是归档、
-/// 78 条含第三方类）、JSON 191 条、DER 53 条、protobuf 22 条、纯文本 576 条，
-/// 其余是空值和无结构的密钥/哈希（40 条正好 32 字节，就是 AES 密钥本身）。
+/// 对着一份 1467 条的完整导出统计过：纯文本 627 条、binary plist 314 条（其中
+/// 310 条是归档，78 条含本 App 里根本没有的第三方类）、JSON 191 条、DER 56 条、
+/// protobuf 25 条、空值 120 条，剩下 134 条是没有结构的密钥和哈希本身。
 ///
 /// 归档必须**自己解 UID 引用图**，不能交给 `NSKeyedUnarchiver`：那 78 条里的
 /// `FIRInstallationsStoredItem`、`OIDAuthState`、`EMMLoginInfo` 等类本 App 里
@@ -140,7 +140,7 @@ enum DecodeEditError: LocalizedError {
 /// 实机上整份归档全都解不开，已废弃。
 ///
 /// 不做的事：按 Windows-1252 之类的单字节编码硬解。这条查过实据，不是想当然：
-/// 整份导出 83 万字节里 cp1252 未定义的只有 0.45%，随机字节的「解码成功率」97.9% ——
+/// 整份导出 81 万字节里 cp1252 未定义的只有 0.47%，随机字节的「解码成功率」98.0% ——
 /// 什么都能解，就等于什么都没判。而且它解出来的不是信息：那 12 条「按 cp1252 看
 /// 像文本」的条目实际是 protobuf，cp1252 只是把长度前缀 `f0`、`c3` 涂成了 `ð`、`Ã`。
 /// 真正该做的是认出 protobuf，那 12 条里装的是 JWT 和 Tink 密钥集。
@@ -289,7 +289,11 @@ enum DataDecoder {
 
         // 字节串里还嵌着一份完整负载：展开它，并把内层字段的路径接到 .into 后面，
         // 这样内层也能改 —— 写回时先重编码内层，再重编码外层
-        if let bytes = node as? Data, let inner = nestedPayload(in: bytes) {
+        // 内层解出来没有可读字段的（例如 DER，只能识别不能展开）不走这条：
+        // 那样这段字节既进不了字段列表也改不了，只剩全文里一行描述。
+        // 落回下面的叶子处理，仍然可编辑，显示上照样带出内层是什么。
+        if let bytes = node as? Data, let inner = nestedPayload(in: bytes),
+           !inner.fields.isEmpty {
             for field in inner.fields {
                 record(path: path + [.into] + field.location,
                        label: join(label, field.label), kind: field.kind,
@@ -475,7 +479,8 @@ enum DataDecoder {
         }
 
         // 和 resolve 一样：字节串里嵌着完整负载的，展开成内层字段而不是当成叶子
-        if let bytes = value as? Data, let inner = nestedPayload(in: bytes) {
+        if let bytes = value as? Data, let inner = nestedPayload(in: bytes),
+           !inner.fields.isEmpty {
             for field in inner.fields {
                 fields.append(DecodedField(id: (path + [.into] + field.location)
                                               .map(\.token).joined(separator: "/"),
@@ -538,8 +543,8 @@ enum DataDecoder {
         )
     }
 
-    /// 光看首字节是 0x30 不够 —— 那也是 ASCII 的 "0"。在实测的 1447 条里，
-    /// 只判首字节会把 87 条算成 DER，而其中 34 条其实是以 "0" 开头的普通文本。
+    /// 光看首字节是 0x30 不够 —— 那也是 ASCII 的 "0"。在实测的 1467 条里，
+    /// 只判首字节会把 91 条算成 DER，而其中 35 条其实是以 "0" 开头的普通文本。
     /// 必须连长度字段一起校验，看它和数据实际长度对不对得上。
     private static func isDER(_ data: Data) -> Bool {
         let head = [UInt8](data.prefix(6))
@@ -564,12 +569,13 @@ enum DataDecoder {
     /// 残余数据里唯一还能可靠识别的结构。判据是「严格全量解析」：必须正好吃完
     /// 所有字节、字段号合法、线型只认 0/1/2/5，少一个字节多一个字节都判否。
     ///
-    /// 实测（1447 条导出 + 随机数据）：非 UTF-8 的 149 条残余里命中 22 条，
-    /// 随机数据误报率随长度从 1% 降到 0.1%。作为对照，cp1252 的「解码成功率」
-    /// 是 98% —— 差两个数量级，那个数字大到根本不能当判据用。
+    /// 实测（1467 条导出 + 随机数据）：非 UTF-8 的 159 条残余里命中 25 条，
+    /// 随机数据误报率 0.05%–0.17%。作为对照，cp1252 的「解码成功率」是 98% ——
+    /// 差三个数量级，那个数字大到根本不能当判据用。
     ///
-    /// 必须先排除合法 UTF-8 再试：621 条纯文本里有 8 条能被 protobuf 解析成功，
-    /// 不挡住就会把好端端的文本显示成一堆字段号。
+    /// 合法 UTF-8 一律先排除。这条现在是双保险：判据收紧之前，818 条能读成文本的
+    /// 条目里有 8 条会被 protobuf 解析成功，收紧之后是 0 条。但文本就该按文本显示，
+    /// 不该摆成一堆字段号，所以闸留着。
     ///
     /// `skippingTextGate` 只给保存后的自检用：那时格式已经确定就是 protobuf，
     /// 再走一遍「排除 UTF-8」的发现逻辑会把改完恰好变成合法 UTF-8 的内容判成非
@@ -586,7 +592,8 @@ enum DataDecoder {
 
         // 至少得有一个长度分隔字段（字符串 / 字节串 / 嵌套消息）。真实消息几乎总有，
         // 而随机字节恰好凑出来的基本是纯 varint。这一条把 20 字节随机数据的误报率
-        // 从 0.60% 压到 0.03%；实测导出里 1520 条 SHA-1 哈希属性的误报从 10 条降到 0 条，
+        // 把随机短数据的误报率压到约十分之一（16 字节 1.12% -> 0.10%）；实测导出里
+        // 1520 条 SHA-1 哈希属性的误报从 10 条降到 0 条，818 条文本条目的误报从 8 条降到 0 条。
         // 代价是漏掉 1 条 8 字节、字段号 4329229 的「消息」—— 那个本来也是误报。
         guard fields.contains(where: { ($0 as? [AnyHashable: Any])?["w"] as? Int == 2 }) else {
             return nil
@@ -696,7 +703,8 @@ enum DataDecoder {
 
             // 和 resolve / collect 保持一致：字节字段里嵌着完整负载的，
             // 展开成内层字段而不是只显示一句「N 字节二进制」
-            if let bytes = value as? Data, let inner = nestedPayload(in: bytes) {
+            if let bytes = value as? Data, let inner = nestedPayload(in: bytes),
+               !inner.fields.isEmpty {
                 for field in inner.fields {
                     collected.append(DecodedField(id: (valuePath + [.into] + field.location)
                                                      .map(\.token).joined(separator: "/"),
@@ -792,6 +800,7 @@ enum DataDecoder {
             if let text = String(data: bytes, encoding: .utf8), !text.isEmpty, isPrintable(text) {
                 return "\"\(text)\"  (\(bytes.count) 字节)"
             }
+            // 这里是纯显示，不要求内层有可读字段：认出是 DER 也比甩一串十六进制强
             if let inner = nestedPayload(in: bytes) {
                 return "\(bytes.count) 字节 · \(inner.formatName)\n\(inner.text)"
             }
@@ -884,7 +893,7 @@ extension DecodedPayload {
         return DataDecoder.decode(data)
     }
 
-    /// 原样重编码在实测的 22 条 protobuf 上字节完全一致，改字段后往返也全部通过，
+    /// 原样重编码在实测的 25 条 protobuf 上字节完全一致，改字段后往返也全部通过，
     /// 所以这里可以放心写回。
     fileprivate static func encodeProtobuf(_ fields: [Any]) throws -> Data {
         var out = Data()
