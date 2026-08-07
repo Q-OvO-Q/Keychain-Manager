@@ -889,6 +889,9 @@ enum KeychainStore {
     struct ImportOutcome {
         var added = 0
         var replaced = 0
+        /// 系统拒收「尽量保真」的属性、摘掉后才写进去的条数。
+        /// 不算失败，但要让用户知道这些条目不是原样还原的
+        var degraded = 0
         var failures: [ImportFailure] = []
 
         var attempted: Int { added + replaced + failures.count }
@@ -915,8 +918,24 @@ enum KeychainStore {
             keys.insert(attribute.key)
         }
         keys.insert(kSecValueData as String)
+        keys.formUnion(bestEffortAttributes)
         return keys
     }
+
+    /// 尽量保真、但不确定系统一定接受的属性。
+    ///
+    /// `alis` 出现在实测导出的 1385/1467 条上，值是每个 App 容器一个的 UUID
+    /// （同一个 app 的多条共用同一个值）。丢掉它，导入回去的条目未必还能被原来的
+    /// app 认领。但它是不是 `SecItemAdd` 允许手给的属性，只有真机说了算 ——
+    /// 之前密钥的 `priv`/`modi`/`extr` 就是写了直接 -50。
+    ///
+    /// iOS SDK 里**没有** `kSecAttrAlias` 这个常量（编译验证过：cannot find in scope），
+    /// 但 SecItem 的查询字典本来就是字符串键，直接用 "alis" 是能送进去的 ——
+    /// securityd 收不收只有真机知道。
+    ///
+    /// 所以先带上写，真被拒了（errSecParam）再摘掉重试一次：
+    /// 能保真就保真，不能也只是退回原来的行为，不会因此整批导入失败。
+    private static let bestEffortAttributes: Set<String> = ["alis"]
 
     /// 按导入文件里的属性直接写入。
     ///
@@ -960,7 +979,17 @@ enum KeychainStore {
                 attributes[kSecValueRef as String] = certificate
             }
 
-            let status = SecItemAdd(attributes as CFDictionary, nil)
+            var status = SecItemAdd(attributes as CFDictionary, nil)
+
+            // 系统不认这些「尽量保真」的属性时，摘掉再试一次，
+            // 别让一个可选属性把整条条目挡在外面
+            if status == errSecParam,
+               attributes.keys.contains(where: { bestEffortAttributes.contains($0) }) {
+                for key in bestEffortAttributes { attributes.removeValue(forKey: key) }
+                status = SecItemAdd(attributes as CFDictionary, nil)
+                if status == errSecSuccess { outcome.degraded += 1 }
+            }
+
             switch status {
             case errSecSuccess:
                 outcome.added += 1
@@ -1015,6 +1044,9 @@ enum KeychainStore {
     /// 有些条目在原理上就导不进来，与其让它撞进 SecItemAdd 拿一个 -50，
     /// 不如提前识别并说清楚为什么。
     private static func unimportableReason(_ item: KeychainExport.ParsedItem) -> String? {
+        // 文件里的值就解不出来，写进去只会造出一条内容不对的条目
+        if let failure = item.decodeFailure { return "文件内容有误：\(failure)" }
+
         guard item.itemClass == .key else { return nil }
 
         // 安全隔区里生成的密钥：材料从不离开芯片，导出文件里本来就没有 v_Data，

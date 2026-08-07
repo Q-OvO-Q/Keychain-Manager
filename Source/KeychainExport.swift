@@ -101,6 +101,10 @@ enum KeychainExport {
         let itemClass: KeychainItemClass
         /// 已按上面的规则还原成 String / NSNumber / Data
         let attributes: [String: Any]
+        /// 有属性解不出来时记下原因。整条跳过并如实报告，
+        /// 而不是拿个空值顶上去 —— 那会在钥匙串里造出一条内容为空、
+        /// 看上去却导入成功的条目
+        var decodeFailure: String?
     }
 
     struct ParsedFile {
@@ -135,14 +139,22 @@ enum KeychainExport {
             guard let bucket = root[jsonKey(for: itemClass)] as? [[String: Any]] else { continue }
             for entry in bucket {
                 var attributes: [String: Any] = [:]
+                var failure: String?
                 for (key, value) in entry {
                     guard !ignoredOnImport.contains(key) else { continue }
-                    if let decoded = decode(value) {
+                    switch decode(value) {
+                    case .success(let decoded):
                         attributes[key] = decoded
+                    case .skip:
+                        continue
+                    case .broken(let reason):
+                        failure = failure ?? "「\(key)」\(reason)"
                     }
                 }
                 guard !attributes.isEmpty else { continue }
-                items.append(ParsedItem(itemClass: itemClass, attributes: attributes))
+                items.append(ParsedItem(itemClass: itemClass,
+                                        attributes: attributes,
+                                        decodeFailure: failure))
             }
         }
 
@@ -150,22 +162,37 @@ enum KeychainExport {
         return ParsedFile(accessGroup: accessGroup, items: items)
     }
 
-    private static func decode(_ value: Any) -> Any? {
+    fileprivate enum Decoded {
+        case success(Any)
+        /// 这一项没法用，但不足以判整条不可导入（例如无法识别的包装类型）
+        case skip
+        /// 值明显坏了。整条条目要跳过并报告，不能拿空值顶替
+        case broken(String)
+    }
+
+    private static func decode(_ value: Any) -> Decoded {
         guard let wrapper = value as? [String: Any], let type = wrapper["type"] as? String else {
             // 普通字符串 / 数字：原样保留类型
-            return value
+            return .success(value)
         }
 
         switch type {
         case "text":
             // 带类型标记说明原值是 Data，不能还原成 String
-            guard let text = wrapper["value"] as? String else { return nil }
-            return text.data(using: .utf8)
+            guard let text = wrapper["value"] as? String else {
+                return .broken("标为 text 却没有 value 字段")
+            }
+            return .success(Data(text.utf8))
         case "data":
-            guard let base64 = wrapper["base64"] as? String else { return nil }
-            return Data(base64Encoded: base64) ?? Data()
+            guard let base64 = wrapper["base64"] as? String else {
+                return .broken("标为 data 却没有 base64 字段")
+            }
+            guard let bytes = Data(base64Encoded: base64) else {
+                return .broken("base64 解不开")
+            }
+            return .success(bytes)
         default:
-            return nil
+            return .skip
         }
     }
 

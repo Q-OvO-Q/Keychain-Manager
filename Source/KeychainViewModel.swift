@@ -641,6 +641,8 @@ final class KeychainViewModel: ObservableObject {
 
         var parts = ["新增 \(outcome.added) 条"]
         if outcome.replaced > 0 { parts.append("覆盖 \(outcome.replaced) 条") }
+        // 系统拒收了某些可选属性、摘掉才写进去的：没失败，但不是原样还原
+        if outcome.degraded > 0 { parts.append("\(outcome.degraded) 条未能完整还原") }
         if !outcome.failures.isEmpty { parts.append("失败 \(outcome.failures.count) 条") }
         statusMessage = parts.joined(separator: " · ")
 
