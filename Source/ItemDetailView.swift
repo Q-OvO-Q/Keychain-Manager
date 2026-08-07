@@ -371,108 +371,93 @@ struct ItemDetailView: View {
     private func decodedDataSection(_ item: KeychainItem) -> some View {
         if let payload = decoded {
             Section {
-                decodedHeaderRow(payload)
-
+                // 行的写法一律跟着本文件既有的 attributeRow 走：单层 HStack、
+                // 固定宽标签、不加 padding、不套 VStack。自己发明的写法
+                // 会把系统分隔线盖住，这个坑踩过好几次了。
                 ForEach(payload.fields) { field in
                     decodedFieldRow(field)
                 }
 
                 if payload.isEditable {
-                    // 按钮和提示合并成同一个 Form 行，中间自己画 Divider：
-                    // 分开成两行的话系统分隔线又会被盖住
-                    VStack(spacing: 0) {
-                        Button("按字段保存") { saveDecoded(item, payload: payload) }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 8)
-                            .buttonStyle(.borderless)
-                            .disabled(!item.itemClass.supportsDataEditing
-                                      || !item.canBeTargeted
-                                      || decodedEdits.isEmpty)
-
-                        if let decodedNotice {
-                            Divider()
-
-                            Text(decodedNotice)
-                                .font(.caption)
-                                .foregroundStyle(.green)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.vertical, 6)
-                        }
-                    }
+                    Button("按字段保存") { saveDecoded(item, payload: payload) }
+                        .disabled(!item.itemClass.supportsDataEditing
+                                  || !item.canBeTargeted
+                                  || decodedEdits.isEmpty)
                 }
 
-                DisclosureGroup("完整结构") {
-                    Text(payload.text)
-                        .font(.system(.caption, design: .monospaced))
-                        .textSelection(.enabled)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 4)
+                if let decodedNotice {
+                    Text(decodedNotice)
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+
+                NavigationLink {
+                    decodedStructurePage(payload)
+                } label: {
+                    Text("完整结构")
                 }
             } header: {
-                Text("数据解析")
+                Text("数据解析（\(payload.formatName)）")
             } footer: {
                 decodedFooter(payload, item: item)
             }
         }
     }
 
-    private func decodedHeaderRow(_ payload: DecodedPayload) -> some View {
-        HStack {
-            Text(payload.formatName)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Spacer()
+    /// 全文是一大段等宽文本，塞进 Form 的行里怎么排都难看，单独开一页
+    private func decodedStructurePage(_ payload: DecodedPayload) -> some View {
+        ScrollView([.horizontal, .vertical]) {
+            Text(payload.text)
+                .font(.system(.caption, design: .monospaced))
+                .textSelection(.enabled)
+                .padding()
+        }
+        .navigationTitle(payload.formatName)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
             Button {
                 copy(payload.text)
             } label: {
                 Label("复制", systemImage: "doc.on.doc")
-                    .font(.caption)
             }
-            .buttonStyle(.plain)
         }
     }
 
     @ViewBuilder
     private func decodedFieldRow(_ field: DecodedField) -> some View {
-        // 标签和输入框上下排：路径可能很长（a.b.c[0].d），并排会被挤没
-        let isEdited = decodedEdits[field.id].map { $0 != field.value } ?? false
+        // 路径可能很长（a.b.c[0].d），从头部截断，保留最具体的那一段；
+        // 改过的标成橙色——一条归档能解出上千个字段，不标根本找不到改过哪几个
+        let label = Text(field.label)
+            .font(.caption)
+            .foregroundStyle(isEdited(field) ? Color.orange : Color.secondary)
+            .lineLimit(1)
+            .truncationMode(.head)
 
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                // 条目多的能有上千个字段，不标出来根本找不到自己改过哪几个
-                if isEdited {
-                    Image(systemName: "pencil.circle.fill")
-                        .font(.caption2)
-                        .foregroundStyle(.orange)
-                }
-                Text(field.label)
-                    .font(.caption)
-                    .foregroundStyle(isEdited ? .orange : .secondary)
-                Spacer()
-                Text(field.kind.hint)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
+        switch field.kind {
+        case .boolean:
+            Toggle(isOn: decodedBoolBinding(field)) { label }
+
+        case .string, .integer, .real:
+            HStack {
+                label.frame(width: 116, alignment: .leading)
+                TextField("空", text: decodedBinding(field))
+                    .font(.system(.callout, design: .monospaced))
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
             }
 
-            switch field.kind {
-            case .boolean:
-                Toggle(isOn: decodedBoolBinding(field)) {
-                    Text(decodedEdits[field.id] ?? field.value)
-                        .font(.system(.caption, design: .monospaced))
-                }
-            case .string, .integer, .real:
-                TextField(field.label, text: decodedBinding(field), axis: .vertical)
-                    .font(.system(.body, design: .monospaced))
-                    .autocorrectionDisabled()
-                    .textInputAutocapitalization(.never)
-                    .lineLimit(1...6)
-            case .date, .data, .null:
+        case .date, .data, .null:
+            HStack {
+                label.frame(width: 116, alignment: .leading)
                 Text(field.value)
-                    .font(.system(.caption, design: .monospaced))
+                    .font(.system(.callout, design: .monospaced))
                     .foregroundStyle(.secondary)
             }
         }
-        .padding(.vertical, 2)
+    }
+
+    private func isEdited(_ field: DecodedField) -> Bool {
+        decodedEdits[field.id].map { $0 != field.value } ?? false
     }
 
     private func decodedBinding(_ field: DecodedField) -> Binding<String> {
