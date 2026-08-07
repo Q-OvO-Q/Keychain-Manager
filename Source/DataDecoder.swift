@@ -7,15 +7,30 @@ import Security
 struct DecodedField: Identifiable {
 
     enum Kind {
-        case string, integer, real, boolean, date, data, null
+        case string, integer, real, boolean, date, null
+        /// 内容是可读 UTF-8 的字节串。归档里存 UUID、token、指纹很常用这种，
+        /// 按文本编辑，写回时再转成字节
+        case utf8Data
+        /// 真二进制，按十六进制编辑
+        case binaryData
+        /// 太大、或者本身还嵌着一层结构，就地编辑没意义，只读
+        case opaqueData
 
         var isEditable: Bool {
             switch self {
-            case .string, .integer, .real, .boolean: return true
-            case .date, .data, .null: return false
+            case .string, .integer, .real, .boolean, .utf8Data, .binaryData: return true
+            case .date, .null, .opaqueData: return false
             }
         }
 
+        /// 编辑框上方的提示，光看值看不出该按什么格式填
+        var editingHint: String? {
+            switch self {
+            case .utf8Data: return "字节串（按文本编辑）"
+            case .binaryData: return "字节串（按十六进制编辑）"
+            default: return nil
+            }
+        }
     }
 
     let id: String
@@ -212,8 +227,14 @@ enum DataDecoder {
 
         var collected: [String: DecodedField] = [:]
         var order: [String] = []
-        let text = resolve(rootRef, objects: objects, label: "", path: [], indent: 0,
+        var text = resolve(rootRef, objects: objects, label: "", path: [], indent: 0,
                            visiting: [], fields: &collected, order: &order)
+
+        // 整条归档的根就是 $null 的，实测有 6 条。光甩一个「null」出来
+        // 谁也看不懂是解析失败还是内容本来就空
+        if text == "null" && collected.isEmpty {
+            text = "这条归档的内容是空的（根对象是 $null），不是解析失败。"
+        }
 
         return (text, order.compactMap { collected[$0] })
     }
@@ -287,8 +308,13 @@ enum DataDecoder {
                            path: path + [.key("NS.string")], indent: indent,
                            visiting: visiting, fields: &fields, order: &order)
         }
+        // NSData 包装。以前这里直接返回字节数就完事，可实测 36 个二进制叶子里
+        // 有 15 个其实是纯可读文本（UUID、token、指纹），还有 2 个里面嵌着
+        // 完整的归档 / protobuf —— 一律显示成「N 字节二进制」等于把内容藏了
         if let bytes = dictionary["NS.data"] as? Data {
-            return "<\(bytes.count) 字节二进制>"
+            return resolve(bytes, objects: objects, label: label,
+                           path: path + [.key("NS.data")], indent: indent,
+                           visiting: visiting, fields: &fields, order: &order)
         }
         if let time = dictionary["NS.time"] as? NSNumber {
             // NSDate 存的是相对 2001-01-01 的秒数
@@ -614,6 +640,9 @@ enum DataDecoder {
 
     // MARK: 叶子
 
+    /// 十六进制编辑框的上限。再大就不是人能手改的了，也会把 Form 撑爆
+    private static let hexEditLimit = 512
+
     private static func leafKind(of value: Any) -> DecodedField.Kind? {
         if let text = value as? String {
             // 归档用 "$null" 这个字符串表示空引用，不是真的内容
@@ -624,9 +653,32 @@ enum DataDecoder {
             return CFNumberIsFloatType(number as CFNumber) ? .real : .integer
         }
         if value is Date { return .date }
-        if value is Data { return .data }
+        if let bytes = value as? Data {
+            // 顺序要和 leafDisplay 一致：能当文本读就是文本（也就能直接编辑），
+            // 读不成文本再看里面是不是嵌着一层结构——那种展开给人看，但不给编辑，
+            // 改内层得先重编码内层，这里不做
+            if let text = String(data: bytes, encoding: .utf8), !text.isEmpty, isPrintable(text) {
+                return .utf8Data
+            }
+            if nested(in: bytes) != nil { return .opaqueData }
+            return bytes.count <= hexEditLimit ? .binaryData : .opaqueData
+        }
         if value is NSNull { return .null }
         return nil
+    }
+
+    /// 字节串里是不是还套着一层能解的东西。归档里套归档、套 protobuf 都实际见过。
+    private static func nested(in bytes: Data) -> DecodedPayload? {
+        // 只认有明确魔数 / 强判据的，别把普通字节猜成结构
+        guard bytes.count >= 4 else { return nil }
+        if bytes.starts(with: BinaryPlist.magic) || isXMLPlist(bytes) {
+            return decodePropertyList(bytes)
+        }
+        if bytes.first == UInt8(ascii: "{") || bytes.first == UInt8(ascii: "[") {
+            return decodeJSON(bytes)
+        }
+        if isDER(bytes) { return decodeDER(bytes) }
+        return decodeProtobuf(bytes)
     }
 
     /// 用于编辑框的原值
@@ -638,6 +690,13 @@ enum DataDecoder {
             return number.stringValue
         }
         if let text = value as? String { return text }
+        if let bytes = value as? Data {
+            switch leafKind(of: bytes) {
+            case .utf8Data: return String(data: bytes, encoding: .utf8) ?? ""
+            case .binaryData: return bytes.hexString
+            default: break
+            }
+        }
         return leafDisplay(value)
     }
 
@@ -653,10 +712,15 @@ enum DataDecoder {
             return number.stringValue
         }
         if let bytes = value as? Data {
-            if let text = String(data: bytes, encoding: .utf8), isPrintable(text) {
+            if let text = String(data: bytes, encoding: .utf8), !text.isEmpty, isPrintable(text) {
                 return "\"\(text)\"  (\(bytes.count) 字节)"
             }
-            return "<\(bytes.count) 字节二进制>"
+            if let inner = nested(in: bytes) {
+                return "\(bytes.count) 字节 · \(inner.formatName)\n\(inner.text)"
+            }
+            // 短的直接把十六进制摆出来，别让人还得回原始数据区自己数
+            if bytes.count <= 64 { return "\(bytes.hexString)  (\(bytes.count) 字节)" }
+            return "\(bytes.prefix(32).hexString)…  (\(bytes.count) 字节)"
         }
         if let date = value as? Date { return dateFormatter.string(from: date) }
         if value is NSNull { return "null" }
@@ -849,7 +913,15 @@ extension DecodedPayload {
             case "false", "0", "no": return NSNumber(value: false)
             default: throw DecodeEditError.badNumber(label: label, expected: "true 或 false")
             }
-        case .date, .data, .null:
+        case .utf8Data:
+            return Data(text.utf8)
+        case .binaryData:
+            guard let bytes = trimmed.hexData else {
+                throw DecodeEditError.badNumber(label: label,
+                                                expected: "十六进制（长度为偶数，只含 0-9 / a-f）")
+            }
+            return bytes
+        case .date, .null, .opaqueData:
             throw DecodeEditError.notEditable
         }
     }
