@@ -740,6 +740,8 @@ enum DataDecoder {
             return CFNumberIsFloatType(number as CFNumber) ? .real : .integer
         }
         if value is Date { return .date }
+        // 128 位整数：Swift 侧没有能装下的数值类型，编辑框转不回去，所以只读
+        if value is WideInteger { return .opaqueData }
         if let bytes = value as? Data {
             // 顺序要和 leafDisplay 一致：能当文本读就按文本，读不成再按十六进制。
             // 嵌套结构在 resolve / collect 里已经先一步展开成内层字段了，走不到这
@@ -768,6 +770,7 @@ enum DataDecoder {
 
     /// 用于编辑框的原值
     private static func leafValue(_ value: Any) -> String {
+        if let wide = value as? WideInteger { return wide.decimalDescription }
         if let number = value as? NSNumber {
             if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
                 return number.boolValue ? "true" : "false"
@@ -787,6 +790,7 @@ enum DataDecoder {
 
     /// 用于只读全文的显示值
     private static func leafDisplay(_ value: Any) -> String {
+        if let wide = value as? WideInteger { return wide.decimalDescription }
         if let text = value as? String {
             return text == "$null" ? "null" : "\"\(text)\""
         }
