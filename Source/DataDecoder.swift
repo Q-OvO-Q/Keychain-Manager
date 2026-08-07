@@ -506,8 +506,14 @@ enum DataDecoder {
     ///
     /// 必须先排除合法 UTF-8 再试：621 条纯文本里有 8 条能被 protobuf 解析成功，
     /// 不挡住就会把好端端的文本显示成一堆字段号。
-    private static func decodeProtobuf(_ data: Data) -> DecodedPayload? {
-        guard data.count >= 2, String(data: data, encoding: .utf8) == nil else { return nil }
+    ///
+    /// `skippingTextGate` 只给保存后的自检用：那时格式已经确定就是 protobuf，
+    /// 再走一遍「排除 UTF-8」的发现逻辑会把改完恰好变成合法 UTF-8 的内容判成非
+    /// protobuf，于是自检失败、一次本来合法的保存被拦下来。
+    fileprivate static func decodeProtobuf(_ data: Data,
+                                           skippingTextGate: Bool = false) -> DecodedPayload? {
+        guard data.count >= 2 else { return nil }
+        guard skippingTextGate || String(data: data, encoding: .utf8) == nil else { return nil }
 
         let bytes = [UInt8](data)
         guard let fields = parseProtobuf(bytes, from: 0, to: bytes.count, depth: 0) else {
@@ -747,7 +753,7 @@ extension DecodedPayload {
     /// `PropertyListSerialization`，赌它序列化时仍当 UID 处理。这个自检把
     /// 「赌错了就默默写坏条目」变成「赌错了就明确报错、原数据不动」。
     private func verify(_ data: Data, changed: [DecodedField]) throws {
-        guard let reparsed = DataDecoder.decode(data) else {
+        guard let reparsed = reparse(data) else {
             throw DecodeEditError.verificationFailed("重新编码后的数据解析不回来")
         }
         guard reparsed.formatName == formatName else {
@@ -758,6 +764,14 @@ extension DecodedPayload {
         if let lost = changed.first(where: { !survivors.contains($0.id) }) {
             throw DecodeEditError.verificationFailed("字段「\(lost.label)」不见了")
         }
+    }
+
+    /// 自检要按原本的格式重解，而不是重走一遍发现流程
+    private func reparse(_ data: Data) -> DecodedPayload? {
+        if case .protobuf = plan {
+            return DataDecoder.decodeProtobuf(data, skippingTextGate: true)
+        }
+        return DataDecoder.decode(data)
     }
 
     /// 原样重编码在实测的 22 条 protobuf 上字节完全一致，改字段后往返也全部通过，
