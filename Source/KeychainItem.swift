@@ -325,7 +325,27 @@ enum KeychainAttributeFormatter {
 
     /// crtr / type 存的是 32 位整数，但惯例按四个 ASCII 字符看，
     /// 直接显示数字（如 1634758764）没人认得出来
-    static func value(_ value: Any, forKey key: String) -> String {
+    static func value(_ value: Any, forKey key: String,
+                      itemClass: KeychainItemClass? = nil) -> String {
+        // 保护级别是「这条为什么读不出来」的关键线索，却一直只显示 ak / ck / dku
+        // 这样的短码。accessibilityDescription 早就知道它们的含义，只是没接上来。
+        if key == kSecAttrAccessible as String, let raw = KeychainItem.stringValue(value) {
+            let name = accessibilityDescription(raw)
+            return name == raw ? raw : "\(name)  ·  \(raw)"
+        }
+
+        // 密钥类别只显示 0 / 1，看不出是公钥还是私钥 —— 而删除定位正是靠它区分密钥对
+        if key == kSecAttrKeyClass as String, let raw = KeychainItem.stringValue(value) {
+            if let name = keyClassNames[raw] { return "\(name)  ·  \(raw)" }
+        }
+
+        // type 这一列在密码类里是四字符码，在密钥里却是算法编号（RSA=42、EC=73）
+        if key == kSecAttrKeyType as String, itemClass == .key,
+           let raw = KeychainItem.stringValue(value) {
+            if let name = keyTypeNames[raw] { return "\(name)  ·  \(raw)" }
+            return raw
+        }
+
         let fourCharCodeKeys = [kSecAttrCreator as String, kSecAttrType as String]
         if fourCharCodeKeys.contains(key), let number = value as? NSNumber {
             let code = KeychainStore.FourCharCode.text(from: number)
@@ -333,6 +353,15 @@ enum KeychainAttributeFormatter {
         }
         return self.value(value)
     }
+
+    /// 取值是 Security 框架的常量，但系统按数字回传
+    private static let keyClassNames: [String: String] = [
+        "0": "公钥", "1": "私钥", "2": "对称密钥"
+    ]
+
+    private static let keyTypeNames: [String: String] = [
+        "42": "RSA", "73": "椭圆曲线 EC", "0": "未指定"
+    ]
 
     static func value(_ value: Any) -> String {
         if let string = value as? String { return string.isEmpty ? "(空字符串)" : string }

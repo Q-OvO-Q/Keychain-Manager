@@ -115,7 +115,8 @@ struct ItemDetailView: View {
             return item.isSynchronizable ? "是" : "否"
         }
         guard let value = item.rawAttributes[key] else { return "未设置" }
-        return KeychainAttributeFormatter.value(value, forKey: key)
+        return KeychainAttributeFormatter.value(value, forKey: key,
+                                                itemClass: item.itemClass)
     }
 
     // MARK: 证书解析
@@ -641,11 +642,12 @@ struct ItemDetailView: View {
                         NavigationLink {
                             DecodedStructurePage(payload: payload)
                         } label: {
-                            rawAttributeRow(key, value, format: payload.formatName,
-                                            selectable: false)
+                            rawAttributeRow(key, value, itemClass: item.itemClass,
+                                            format: payload.formatName, selectable: false)
                         }
                     } else {
-                        rawAttributeRow(key, value, format: nil, selectable: true)
+                        rawAttributeRow(key, value, itemClass: item.itemClass,
+                                        format: nil, selectable: true)
                     }
                 }
             }
@@ -679,7 +681,7 @@ struct ItemDetailView: View {
 
     /// `selectable` 在整行是 NavigationLink 时要关掉：可选中的文本会和点击手势打架
     @ViewBuilder
-    private func rawAttributeRow(_ key: String, _ value: Any,
+    private func rawAttributeRow(_ key: String, _ value: Any, itemClass: KeychainItemClass,
                                  format: String?, selectable: Bool) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack(spacing: 6) {
@@ -692,7 +694,8 @@ struct ItemDetailView: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            let text = Text(KeychainAttributeFormatter.value(value, forKey: key))
+            let text = Text(KeychainAttributeFormatter.value(value, forKey: key,
+                                                             itemClass: itemClass))
                 .font(.system(size: 12, design: .monospaced))
                 .foregroundStyle(.secondary)
 
