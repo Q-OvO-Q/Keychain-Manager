@@ -584,6 +584,14 @@ enum DataDecoder {
             return nil
         }
 
+        // 至少得有一个长度分隔字段（字符串 / 字节串 / 嵌套消息）。真实消息几乎总有，
+        // 而随机字节恰好凑出来的基本是纯 varint。这一条把 20 字节随机数据的误报率
+        // 从 0.60% 压到 0.03%；实测导出里 1520 条 SHA-1 哈希属性的误报从 10 条降到 0 条，
+        // 代价是漏掉 1 条 8 字节、字段号 4329229 的「消息」—— 那个本来也是误报。
+        guard fields.contains(where: { ($0 as? [AnyHashable: Any])?["w"] as? Int == 2 }) else {
+            return nil
+        }
+
         var collected: [DecodedField] = []
         let text = collectProtobuf(fields, path: [], label: "", indent: 0, fields: &collected)
         return DecodedPayload(formatName: "Protocol Buffers",

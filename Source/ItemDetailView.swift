@@ -635,16 +635,18 @@ struct ItemDetailView: View {
         Section {
             ForEach(item.rawAttributes.keys.sorted(), id: \.self) { key in
                 if let value = item.rawAttributes[key] {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(KeychainAttributeFormatter.label(for: key))
-                            .font(.caption)
-                            .foregroundStyle(Color.accentColor)
-                        Text(KeychainAttributeFormatter.value(value, forKey: key))
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                    // 属性值本身也可能是结构化的：实测 gena 里就有一条 3234 字节的
+                    // bplist，按十六进制显示就是 6468 个字符，等于没显示
+                    if let payload = decodedAttribute(value) {
+                        NavigationLink {
+                            DecodedStructurePage(payload: payload)
+                        } label: {
+                            rawAttributeRow(key, value, format: payload.formatName,
+                                            selectable: false)
+                        }
+                    } else {
+                        rawAttributeRow(key, value, format: nil, selectable: true)
                     }
-                    .padding(.vertical, 2)
                 }
             }
         } header: {
@@ -673,6 +675,42 @@ struct ItemDetailView: View {
                 Text("这些属性在本条目上没有值。系统只回传有值的键，所以它们不在上一节里。")
             }
         }
+    }
+
+    /// `selectable` 在整行是 NavigationLink 时要关掉：可选中的文本会和点击手势打架
+    @ViewBuilder
+    private func rawAttributeRow(_ key: String, _ value: Any,
+                                 format: String?, selectable: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(KeychainAttributeFormatter.label(for: key))
+                    .font(.caption)
+                    .foregroundStyle(Color.accentColor)
+                if let format {
+                    Text(format)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            let text = Text(KeychainAttributeFormatter.value(value, forKey: key))
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            // enabled / disabled 是两个不同的类型，只能分支，不能三元
+            if selectable {
+                text.textSelection(.enabled).lineLimit(6)
+            } else {
+                text.lineLimit(6)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// 属性值本身能不能解析。只对二进制值尝试——文本属性本来就看得懂
+    private func decodedAttribute(_ value: Any) -> DecodedPayload? {
+        guard let data = value as? Data, data.count >= 8,
+              data.utf8Text == nil else { return nil }
+        return DataDecoder.decode(data)
     }
 
     // MARK: 删除
