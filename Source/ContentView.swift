@@ -104,7 +104,13 @@ struct ContentView: View {
             }
             Button("取消", role: .cancel) {}
         } message: {
-            Text("此操作不可撤销。")
+            // 选中集不随筛选收窄（那会把刻意的选择悄悄清掉），
+            // 所以这里必须点明有多少条不在眼前 —— 删除不可撤销
+            if viewModel.selectedButHiddenCount > 0 {
+                Text("其中 \(viewModel.selectedButHiddenCount) 条不在当前筛选结果里，一并删除。此操作不可撤销。")
+            } else {
+                Text("此操作不可撤销。")
+            }
         }
         .onAppear { viewModel.bootstrap() }
     }

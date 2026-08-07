@@ -219,6 +219,16 @@ final class KeychainViewModel: ObservableObject {
         items.filter { selectedIDs.contains($0.id) }
     }
 
+    /// 选中但当前筛选条件下看不见的条数。
+    ///
+    /// 选择是刻意的操作，改筛选条件不该把它悄悄清掉；但「删除」不可撤销，
+    /// 用户盯着 99 条的列表按下去、实际删掉 1467 条，只给一个总数是不够的。
+    var selectedButHiddenCount: Int {
+        guard !selectedIDs.isEmpty else { return 0 }
+        let visible = Set(filteredItems.map(\.id))
+        return selectedIDs.subtracting(visible).count
+    }
+
     func item(withID id: String) -> KeychainItem? {
         items.first { $0.id == id }
     }
