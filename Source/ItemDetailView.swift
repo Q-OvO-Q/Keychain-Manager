@@ -28,6 +28,12 @@ struct ItemDetailView: View {
     @State private var didRequestDelete = false
     /// 只存被改动过的属性，未改动的直接读条目当前值
     @State private var editedAttributes: [String: Any] = [:]
+    /// 四字符码输入过程中的原文。
+    ///
+    /// 这类字段只有凑满 4 个字符（或是一个十进制数）才解析得出来，而中间状态
+    /// 解析失败。若直接以「解析结果」为准，敲第一个字符就会因为解析不出来被当成
+    /// 「无改动」，输入框立刻弹回原值 —— 逐字输入根本进行不下去。
+    @State private var fourCharDrafts: [String: String] = [:]
     /// 数据解析结果。解析要跑一遍引用图，不放进 computed property 里每帧重算
     @State private var decoded: DecodedPayload?
     /// 解析视图里被改过的字段，key 是 DecodedField.id
@@ -564,6 +570,7 @@ struct ItemDetailView: View {
     private func fourCharCodeBinding(_ attribute: KeychainStore.EditableAttribute) -> Binding<String> {
         Binding(
             get: {
+                if let draft = fourCharDrafts[attribute.key] { return draft }
                 if let edited = editedAttributes[attribute.key] {
                     return KeychainStore.FourCharCode.text(from: edited)
                 }
@@ -571,7 +578,9 @@ struct ItemDetailView: View {
                 return KeychainStore.FourCharCode.text(from: item.rawAttributes[attribute.key])
             },
             set: { text in
-                // 解析不出来就不写进改动集，避免把非法值发给 SecItemUpdate
+                // 原文照收，输入过程才不会被打断；只有解析得出来的才进改动集，
+                // 免得把半截内容发给 SecItemUpdate
+                fourCharDrafts[attribute.key] = text
                 if let number = KeychainStore.FourCharCode.number(from: text) {
                     editedAttributes[attribute.key] = number
                 } else {
@@ -618,6 +627,8 @@ struct ItemDetailView: View {
     private func saveAttributes(_ item: KeychainItem) {
         if viewModel.updateAttributes(item, changes: editedAttributes) {
             editedAttributes.removeAll()
+            // 草稿留着就会盖住刚写回来的真实值
+            fourCharDrafts.removeAll()
             saveNotice = "元数据已更新"
         }
     }
@@ -739,6 +750,7 @@ struct ItemDetailView: View {
     /// 只刷新数据内容，不动标签输入框（解锁后复用）
     private func loadContent(from item: KeychainItem) {
         decodedEdits.removeAll()
+        fourCharDrafts.removeAll()
         decodedNotice = nil
 
         guard item.isDataReadable, let data = item.data else {

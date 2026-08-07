@@ -674,9 +674,15 @@ enum KeychainStore {
                          UInt8(truncatingIfNeeded: raw >> 16),
                          UInt8(truncatingIfNeeded: raw >> 8),
                          UInt8(truncatingIfNeeded: raw)]
-            // 四个字节都可打印才按字符显示，否则退回十进制
-            if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
-                return String(decoding: bytes, as: UTF8.self)
+            // 四个字节都可打印才按字符显示，否则退回十进制。
+            //
+            // 全是数字的除外（例如 "1234"）：那样显示出来和十进制写法长得一模一样，
+            // 而 number(from:) 会优先按十进制解析 —— 于是「看一眼再保存」就把
+            // 825373492 悄悄变成了 1234。这类退回十进制，显示与解析才对得上。
+            let text = String(decoding: bytes, as: UTF8.self)
+            if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }),
+               !text.allSatisfy({ $0.isNumber }) {
+                return text
             }
             return String(raw)
         }
