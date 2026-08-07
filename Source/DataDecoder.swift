@@ -61,6 +61,8 @@ fileprivate enum EditPlan {
     /// 存的是**原始**解析结果，里面的 UID 仍是不透明对象，原样交回序列化器
     case propertyList(Any, PropertyListSerialization.PropertyListFormat)
     case json(Any)
+    /// 字段表：每项是 ["n": 字段号, "w": 线型, "v": 值]
+    case protobuf([Any])
 }
 
 struct DecodedPayload {
@@ -101,17 +103,21 @@ enum DecodeEditError: LocalizedError {
 
 /// 把条目数据里那些「看着是二进制、其实有结构」的内容解析成可读、可改的形式。
 ///
-/// 对着一份 1447 条的完整导出统计过：binary plist 309 条（其中 78 条含第三方类）、
-/// JSON 191 条、DER 53 条、纯文本 576 条，其余是空值和无结构的密钥/哈希。
+/// 对着一份 1447 条的完整导出统计过：binary plist 313 条（其中 309 条是归档、
+/// 78 条含第三方类）、JSON 191 条、DER 53 条、protobuf 22 条、纯文本 576 条，
+/// 其余是空值和无结构的密钥/哈希（40 条正好 32 字节，就是 AES 密钥本身）。
 ///
 /// 归档必须**自己解 UID 引用图**，不能交给 `NSKeyedUnarchiver`：那 78 条里的
 /// `FIRInstallationsStoredItem`、`OIDAuthState`、`EMMLoginInfo` 等类本 App 里
 /// 根本不存在，`NSKeyedUnarchiver` 一律解不出来。自己解还有个附带好处 ——
 /// 能记下每个叶子的存放路径，写回时只改那一处，引用图原封不动。
 ///
-/// 不做的事：按 Windows-1252 之类的单字节编码硬解。那不是「解析」——
-/// 256 个字节值里只有 5 个未定义，实测 97.9% 的随机字节都能「解码成功」，
-/// 因此它既不能用来判断格式，解出来的也是乱码而不是信息。
+/// 不做的事：按 Windows-1252 之类的单字节编码硬解。这条查过实据，不是想当然：
+/// 整份导出 83 万字节里 cp1252 未定义的只有 0.45%，随机字节的「解码成功率」97.9% ——
+/// 什么都能解，就等于什么都没判。而且它解出来的不是信息：那 12 条「按 cp1252 看
+/// 像文本」的条目实际是 protobuf，cp1252 只是把长度前缀 `f0`、`c3` 涂成了 `ð`、`Ã`。
+/// 真正该做的是认出 protobuf，那 12 条里装的是 JWT 和 Tink 密钥集。
+/// 另外也试过 UTF-16：整份导出 0 条命中。
 enum DataDecoder {
 
     /// 只读全文的长度上限：详情页塞不下更多，还会拖慢滚动
@@ -120,9 +126,11 @@ enum DataDecoder {
 
     static func decode(_ data: Data) -> DecodedPayload? {
         guard !data.isEmpty else { return nil }
-        guard let payload = decodePropertyList(data) ?? decodeJSON(data) ?? decodeDER(data) else {
-            return nil
-        }
+        let found = decodePropertyList(data)
+            ?? decodeJSON(data)
+            ?? decodeDER(data)
+            ?? decodeProtobuf(data)
+        guard let payload = found else { return nil }
         guard payload.text.count > renderLimit else { return payload }
         return DecodedPayload(formatName: payload.formatName,
                               text: payload.text.prefix(renderLimit) + "\n…（内容过长，已截断）",
@@ -477,6 +485,134 @@ enum DataDecoder {
         return 2 + byteCount + length == data.count
     }
 
+    // MARK: protobuf
+
+    /// 残余数据里唯一还能可靠识别的结构。判据是「严格全量解析」：必须正好吃完
+    /// 所有字节、字段号合法、线型只认 0/1/2/5，少一个字节多一个字节都判否。
+    ///
+    /// 实测（1447 条导出 + 随机数据）：非 UTF-8 的 149 条残余里命中 22 条，
+    /// 随机数据误报率随长度从 1% 降到 0.1%。作为对照，cp1252 的「解码成功率」
+    /// 是 98% —— 差两个数量级，那个数字大到根本不能当判据用。
+    ///
+    /// 必须先排除合法 UTF-8 再试：621 条纯文本里有 8 条能被 protobuf 解析成功，
+    /// 不挡住就会把好端端的文本显示成一堆字段号。
+    private static func decodeProtobuf(_ data: Data) -> DecodedPayload? {
+        guard data.count >= 2, String(data: data, encoding: .utf8) == nil else { return nil }
+
+        let bytes = [UInt8](data)
+        guard let fields = parseProtobuf(bytes, from: 0, to: bytes.count, depth: 0) else {
+            return nil
+        }
+
+        var collected: [DecodedField] = []
+        let text = collectProtobuf(fields, path: [], label: "", indent: 0, fields: &collected)
+        return DecodedPayload(formatName: "Protocol Buffers",
+                              text: text,
+                              fields: collected,
+                              plan: .protobuf(fields))
+    }
+
+    private static func readVarint(_ bytes: [UInt8], _ index: inout Int, end: Int) -> UInt64? {
+        var result: UInt64 = 0
+        var shift: UInt64 = 0
+        while index < end {
+            let byte = bytes[index]
+            index += 1
+            result |= UInt64(byte & 0x7F) << shift
+            if byte & 0x80 == 0 { return result }
+            shift += 7
+            if shift > 63 { return nil }
+        }
+        return nil
+    }
+
+    private static func parseProtobuf(_ bytes: [UInt8],
+                                      from start: Int,
+                                      to end: Int,
+                                      depth: Int) -> [Any]? {
+        guard depth < 8, end - start >= 2 else { return nil }
+
+        var fields: [Any] = []
+        var index = start
+        while index < end {
+            guard let key = readVarint(bytes, &index, end: end) else { return nil }
+            let number = Int(key >> 3)
+            let wire = Int(key & 7)
+            // 线型 3/4 是早就废弃的 group，出现基本说明判错了
+            guard number > 0, number <= 536_870_911 else { return nil }
+
+            switch wire {
+            case 0:
+                guard let value = readVarint(bytes, &index, end: end) else { return nil }
+                fields.append(["n": number, "w": wire, "v": NSNumber(value: value)])
+
+            case 2:
+                guard let length = readVarint(bytes, &index, end: end),
+                      length <= UInt64(end - index) else { return nil }
+                let stop = index + Int(length)
+                let payload = Array(bytes[index..<stop])
+                let value: Any
+                // 文本优先于嵌套：可读字符串本身就是答案，硬当消息解会解出乱字段
+                if let string = String(bytes: payload, encoding: .utf8),
+                   !string.isEmpty, isPrintable(string) {
+                    value = string
+                } else if let nested = parseProtobuf(bytes, from: index, to: stop, depth: depth + 1) {
+                    value = nested
+                } else {
+                    value = Data(payload)
+                }
+                index = stop
+                fields.append(["n": number, "w": wire, "v": value])
+
+            case 5:
+                guard end - index >= 4 else { return nil }
+                fields.append(["n": number, "w": wire, "v": Data(bytes[index..<index + 4])])
+                index += 4
+
+            case 1:
+                guard end - index >= 8 else { return nil }
+                fields.append(["n": number, "w": wire, "v": Data(bytes[index..<index + 8])])
+                index += 8
+
+            default:
+                return nil
+            }
+        }
+        return fields.isEmpty ? nil : fields
+    }
+
+    private static func collectProtobuf(_ fields: [Any],
+                                        path: FieldLocation,
+                                        label: String,
+                                        indent: Int,
+                                        fields collected: inout [DecodedField]) -> String {
+        let pad = String(repeating: "  ", count: indent)
+        let lines = fields.enumerated().compactMap { offset, entry -> String? in
+            guard let field = entry as? [AnyHashable: Any],
+                  let number = field["n"] as? Int else { return nil }
+
+            let name = label.isEmpty ? "\(number)" : "\(label).\(number)"
+            let valuePath = path + [.index(offset), .key("v")]
+            let value = field["v"]
+
+            if let nested = value as? [Any] {
+                let body = collectProtobuf(nested, path: valuePath, label: name,
+                                           indent: indent + 1, fields: &collected)
+                return "\(pad)\(number) {\n\(body)\n\(pad)}"
+            }
+
+            if let value, let kind = leafKind(of: value), kind != .null {
+                collected.append(DecodedField(id: valuePath.map(\.token).joined(separator: "/"),
+                                              label: name,
+                                              kind: kind,
+                                              value: leafValue(value),
+                                              location: valuePath))
+            }
+            return "\(pad)\(number): \(value.map(leafDisplay) ?? "null")"
+        }
+        return lines.joined(separator: "\n")
+    }
+
     // MARK: 叶子
 
     private static func leafKind(of value: Any) -> DecodedField.Kind? {
@@ -576,7 +712,69 @@ extension DecodedPayload {
             } catch {
                 throw DecodeEditError.encodingFailed(error.localizedDescription)
             }
+
+        case .protobuf(let root):
+            guard let updated = try apply(changed, edits: edits, to: root) as? [Any] else {
+                throw DecodeEditError.encodingFailed("字段表结构损坏")
+            }
+            return try Self.encodeProtobuf(updated)
         }
+    }
+
+    /// 原样重编码在实测的 22 条 protobuf 上字节完全一致，改字段后往返也全部通过，
+    /// 所以这里可以放心写回。
+    fileprivate static func encodeProtobuf(_ fields: [Any]) throws -> Data {
+        var out = Data()
+        for entry in fields {
+            guard let field = entry as? [AnyHashable: Any],
+                  let number = field["n"] as? Int,
+                  let wire = field["w"] as? Int else {
+                throw DecodeEditError.encodingFailed("字段表结构损坏")
+            }
+            appendVarint(UInt64(number) << 3 | UInt64(wire), to: &out)
+
+            switch wire {
+            case 0:
+                guard let value = field["v"] as? NSNumber else {
+                    throw DecodeEditError.encodingFailed("字段 \(number) 不是整数")
+                }
+                appendVarint(value.uint64Value, to: &out)
+
+            case 2:
+                let payload: Data
+                if let text = field["v"] as? String {
+                    payload = Data(text.utf8)
+                } else if let nested = field["v"] as? [Any] {
+                    payload = try encodeProtobuf(nested)
+                } else if let raw = field["v"] as? Data {
+                    payload = raw
+                } else {
+                    throw DecodeEditError.encodingFailed("字段 \(number) 内容无法编码")
+                }
+                appendVarint(UInt64(payload.count), to: &out)
+                out.append(payload)
+
+            case 1, 5:
+                guard let raw = field["v"] as? Data, raw.count == (wire == 1 ? 8 : 4) else {
+                    throw DecodeEditError.encodingFailed("字段 \(number) 定长内容损坏")
+                }
+                out.append(raw)
+
+            default:
+                throw DecodeEditError.encodingFailed("字段 \(number) 线型 \(wire) 不支持")
+            }
+        }
+        return out
+    }
+
+    private static func appendVarint(_ value: UInt64, to data: inout Data) {
+        var remaining = value
+        repeat {
+            var byte = UInt8(remaining & 0x7F)
+            remaining >>= 7
+            if remaining != 0 { byte |= 0x80 }
+            data.append(byte)
+        } while remaining != 0
     }
 
     private func apply(_ changed: [DecodedField],
