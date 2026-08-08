@@ -124,6 +124,16 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
             return [kSecAttrIssuer, kSecAttrSerialNumber, kSecAttrLabel].map { $0 as String }
         }
     }
+
+    /// 判断「这条能不能被精确定位」时该看的属性。
+    ///
+    /// 和 `identityAttributes` 差一个 `kcls`：它进退化查询是为了把一对密钥的
+    /// 公私钥分开，但它本身不具区分性 —— 每把私钥都是 1。
+    /// 拿它当「能定位」的依据，等于说「知道这是私钥就够了」，会把判定放宽。
+    var distinguishingAttributes: [String] {
+        guard self == .key else { return identityAttributes }
+        return [kSecAttrApplicationLabel, kSecAttrApplicationTag].map { $0 as String }
+    }
 }
 
 // MARK: - 条目模型
@@ -170,7 +180,7 @@ struct KeychainItem: Identifiable {
     /// 无持久引用、也没有任何区分性属性时，任何删除查询都会波及同组其它条目
     var canBeTargeted: Bool {
         if persistentRef != nil { return true }
-        return itemClass.identityAttributes.contains { primaryKeyQuery[$0] != nil }
+        return itemClass.distinguishingAttributes.contains { primaryKeyQuery[$0] != nil }
     }
 
     var isDataReadable: Bool {
