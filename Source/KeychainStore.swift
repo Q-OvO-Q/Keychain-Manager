@@ -459,6 +459,8 @@ enum KeychainStore {
         var counting = query
         counting[kSecMatchLimit as String] = kSecMatchLimitAll
         counting[kSecReturnPersistentRef as String] = true
+        // 同 exists()：绝不因为一次「数数」把验证框弹出来
+        counting[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
 
         var output: AnyObject?
         let status = SecItemCopyMatching(counting as CFDictionary, &output)
@@ -470,10 +472,14 @@ enum KeychainStore {
 
     /// 条目是否仍然存在。无法判定时一律按「还在」处理，绝不谎报删除成功。
     static func exists(_ item: KeychainItem) -> Bool {
+        // 一律跳过验证。这是本文件的既定规则：取属性同样要解密，受保护条目会弹
+        // Face ID，而删除跑在后台队列上，批量删就是连弹。跳过后受保护条目返回
+        // errSecInteractionNotAllowed，正好落进下面「判不出就算还在」那一档。
         if let ref = item.persistentRef {
             let query: [String: Any] = [
                 kSecValuePersistentRef as String: ref,
-                kSecReturnAttributes as String: true
+                kSecReturnAttributes as String: true,
+                kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip
             ]
             var output: AnyObject?
             let status = SecItemCopyMatching(query as CFDictionary, &output)
@@ -483,6 +489,7 @@ enum KeychainStore {
         var query = item.primaryKeyQuery
         query[kSecReturnAttributes as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
 
         var output: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &output)

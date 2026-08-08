@@ -500,12 +500,20 @@ final class KeychainViewModel: ObservableObject {
         guard let pending = pendingTag else { return }
         pendingTag = nil
 
-        let keys = items
-            .filter { !pending.knownIDs.contains($0.id) }
-            .map(\.tagKey)
+        let appeared = items.filter { !pending.knownIDs.contains($0.id) }
 
-        guard !keys.isEmpty else { return }
-        TagManager.shared.setTag(pending.tag, for: keys)
+        // 一次新增只会多出一条。多出好几条说明这次刷新还夹带了别的变化 ——
+        // add() 触发的 refresh() 可能被 isLoading 挡下，标签就一直等到下一次刷新，
+        // 而那次可能刚好开了新类别，于是整批新出现的条目都会被打上标签。
+        // 认不出是哪条时宁可不打，并且要说出来，不能把标签糊到一批条目上。
+        guard let target = appeared.first, appeared.count == 1 else {
+            if !appeared.isEmpty {
+                alertMessage = "条目已新增，但这次刷新里多出 \(appeared.count) 条，"
+                    + "无法确定哪条是刚建的，标签没有自动应用 —— 请在详情页手动设置。"
+            }
+            return
+        }
+        TagManager.shared.setTag(pending.tag, for: [target.tagKey])
     }
 
     // MARK: - 解锁受保护条目
