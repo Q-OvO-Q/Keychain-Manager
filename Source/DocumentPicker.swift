@@ -22,15 +22,20 @@ struct DocumentPicker: UIViewControllerRepresentable {
         return picker
     }
 
-    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {}
+    /// `makeCoordinator()` 只会被调用一次，闭包就此被永久捕获。视图重新求值时
+    /// 闭包会带上新的状态值，但协调器还攥着旧的那一份 —— 每次更新都把它换掉。
+    func updateUIViewController(_ controller: UIDocumentPickerViewController, context: Context) {
+        context.coordinator.onPick = onPick
+        context.coordinator.onCancel = onCancel
+    }
 
     func makeCoordinator() -> Coordinator {
         Coordinator(onPick: onPick, onCancel: onCancel)
     }
 
     final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        private let onPick: (URL) -> Void
-        private let onCancel: () -> Void
+        var onPick: (URL) -> Void
+        var onCancel: () -> Void
 
         init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
             self.onPick = onPick

@@ -64,9 +64,11 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
     /// 详情页靠这份清单把「未设置」的属性也列出来，否则看起来就像这些属性不存在，
     /// 也会和「可修改的元数据」那一节对不上（那节是固定列出的）。
     var knownAttributes: [String] {
+        // alis 实测出现在 1385/1467 条上（每个 App 容器一个 UUID）。
+        // 它没有公开常量，但确实是这张表里的一列，缺了它没设过的条目就看不出「本可以有」
         let shared = [kSecAttrLabel, kSecAttrCreationDate, kSecAttrModificationDate,
                       kSecAttrAccessGroup, kSecAttrAccessible, kSecAttrSynchronizable]
-            .map { $0 as String } + ["accc"]
+            .map { $0 as String } + ["accc", "alis"]
 
         switch self {
         case .genericPassword:
@@ -89,7 +91,12 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
                     kSecAttrIsPermanent, kSecAttrCanEncrypt, kSecAttrCanDecrypt,
                     kSecAttrCanDerive, kSecAttrCanSign, kSecAttrCanVerify,
                     kSecAttrCanWrap, kSecAttrCanUnwrap]
-                .map { $0 as String } + shared
+                .map { $0 as String }
+                // 密钥这一类系统还会回传一批没有公开常量的列，实测 99 条密钥里
+                // 29～53 条带着它们。不列出来，没设过的那些看起来就像这些属性不存在
+                + ["sens", "asen", "extr", "next", "priv", "modi",
+                   "snrc", "vyrc", "sdat", "edat", "tkid"]
+                + shared
 
         case .certificate:
             return [kSecAttrCertificateType, kSecAttrCertificateEncoding,
@@ -108,10 +115,24 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
         case .internetPassword:
             return [kSecAttrAccount, kSecAttrServer].map { $0 as String }
         case .key:
-            return [kSecAttrApplicationLabel, kSecAttrApplicationTag].map { $0 as String }
+            // kcls 必须带上：klbl 是公钥的 SHA-1，**一对密钥的公私钥共用同一个值**，
+            // 加上 atag 也一样。只按 klbl+atag 删会把另一半一起删掉 ——
+            // 实测导出里就有这样一对，除 kcls 和用途标志外完全相同。
+            return [kSecAttrApplicationLabel, kSecAttrApplicationTag, kSecAttrKeyClass]
+                .map { $0 as String }
         case .certificate:
             return [kSecAttrIssuer, kSecAttrSerialNumber, kSecAttrLabel].map { $0 as String }
         }
+    }
+
+    /// 判断「这条能不能被精确定位」时该看的属性。
+    ///
+    /// 和 `identityAttributes` 差一个 `kcls`：它进退化查询是为了把一对密钥的
+    /// 公私钥分开，但它本身不具区分性 —— 每把私钥都是 1。
+    /// 拿它当「能定位」的依据，等于说「知道这是私钥就够了」，会把判定放宽。
+    var distinguishingAttributes: [String] {
+        guard self == .key else { return identityAttributes }
+        return [kSecAttrApplicationLabel, kSecAttrApplicationTag].map { $0 as String }
     }
 }
 
@@ -159,7 +180,7 @@ struct KeychainItem: Identifiable {
     /// 无持久引用、也没有任何区分性属性时，任何删除查询都会波及同组其它条目
     var canBeTargeted: Bool {
         if persistentRef != nil { return true }
-        return itemClass.identityAttributes.contains { primaryKeyQuery[$0] != nil }
+        return itemClass.distinguishingAttributes.contains { primaryKeyQuery[$0] != nil }
     }
 
     var isDataReadable: Bool {
@@ -314,7 +335,27 @@ enum KeychainAttributeFormatter {
 
     /// crtr / type 存的是 32 位整数，但惯例按四个 ASCII 字符看，
     /// 直接显示数字（如 1634758764）没人认得出来
-    static func value(_ value: Any, forKey key: String) -> String {
+    static func value(_ value: Any, forKey key: String,
+                      itemClass: KeychainItemClass? = nil) -> String {
+        // 保护级别是「这条为什么读不出来」的关键线索，却一直只显示 ak / ck / dku
+        // 这样的短码。accessibilityDescription 早就知道它们的含义，只是没接上来。
+        if key == kSecAttrAccessible as String, let raw = KeychainItem.stringValue(value) {
+            let name = accessibilityDescription(raw)
+            return name == raw ? raw : "\(name)  ·  \(raw)"
+        }
+
+        // 密钥类别只显示 0 / 1，看不出是公钥还是私钥 —— 而删除定位正是靠它区分密钥对
+        if key == kSecAttrKeyClass as String, let raw = KeychainItem.stringValue(value) {
+            if let name = keyClassNames[raw] { return "\(name)  ·  \(raw)" }
+        }
+
+        // type 这一列在密码类里是四字符码，在密钥里却是算法编号（RSA=42、EC=73）
+        if key == kSecAttrKeyType as String, itemClass == .key,
+           let raw = KeychainItem.stringValue(value) {
+            if let name = keyTypeNames[raw] { return "\(name)  ·  \(raw)" }
+            return raw
+        }
+
         let fourCharCodeKeys = [kSecAttrCreator as String, kSecAttrType as String]
         if fourCharCodeKeys.contains(key), let number = value as? NSNumber {
             let code = KeychainStore.FourCharCode.text(from: number)
@@ -322,6 +363,15 @@ enum KeychainAttributeFormatter {
         }
         return self.value(value)
     }
+
+    /// 取值是 Security 框架的常量，但系统按数字回传
+    private static let keyClassNames: [String: String] = [
+        "0": "公钥", "1": "私钥", "2": "对称密钥"
+    ]
+
+    private static let keyTypeNames: [String: String] = [
+        "42": "RSA", "73": "椭圆曲线 EC", "0": "未指定"
+    ]
 
     static func value(_ value: Any) -> String {
         if let string = value as? String { return string.isEmpty ? "(空字符串)" : string }
@@ -346,6 +396,8 @@ enum KeychainAttributeFormatter {
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        // 固定格式串配 POSIX 区域：设备用非公历日历时，年份会按那套纪年输出
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         return formatter
     }()
 

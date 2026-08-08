@@ -244,8 +244,15 @@ enum KeychainStore {
             }
         }
 
-        if item.isDataReadable, let text = item.data?.utf8Text {
-            parts.append(text)
+        if item.isDataReadable, let data = item.data {
+            if let text = data.utf8Text {
+                parts.append(text)
+            } else if let decoded = DataDecoder.decode(data) {
+                // bplist、protobuf 这些解不成 UTF-8 的，详情页里内容看得清清楚楚，
+                // 不一起索引就成了「看得到却搜不到」。实测有 395 条属于这种。
+                // 枚举本来就在后台线程上跑，多这点解析开销无所谓。
+                parts.append(decoded.text)
+            }
         }
         return parts.joined(separator: "\n").lowercased()
     }
@@ -283,7 +290,7 @@ enum KeychainStore {
         return ([], status)
     }
 
-    /// 按持久引用去重；拿不到持久引用的条目一律保留，宁可重复也不丢
+    /// 去重：有持久引用的按引用，没有的按主键
     private static func deduplicate(
         _ rows: [(KeychainItemClass, [String: Any])]
     ) -> [(KeychainItemClass, [String: Any])] {
@@ -291,9 +298,18 @@ enum KeychainStore {
         var unique: [(KeychainItemClass, [String: Any])] = []
         unique.reserveCapacity(rows.count)
 
+        // 没有持久引用的行按主键去重。「全部可访问」下同一条会被不限组扫描和
+        // 逐组枚举各返回一次，一律保留就会在列表里出现两份。
+        // 按主键去重是安全的：实测 1467 条导出里四个类别的主键组合都完全唯一
+        //（1347/1347、21/21、99/99），不存在两条不同条目共用一个主键。
+        var seenKeys = Set<String>()
+
         for row in rows {
             guard let reference = row.1[kSecValuePersistentRef as String] as? Data else {
-                unique.append(row)
+                let fingerprint = primaryKeyFingerprint(itemClass: row.0, attributes: row.1)
+                if seenKeys.insert(fingerprint).inserted {
+                    unique.append(row)
+                }
                 continue
             }
             if seen.insert(reference).inserted {
@@ -301,6 +317,22 @@ enum KeychainStore {
             }
         }
         return unique
+    }
+
+    /// 主键各字段拼成的指纹，仅用于给缺少持久引用的行去重
+    private static func primaryKeyFingerprint(itemClass: KeychainItemClass,
+                                              attributes: [String: Any]) -> String {
+        var parts = [itemClass.secClass as String]
+        for key in itemClass.primaryKeyAttributes.sorted() {
+            switch attributes[key] {
+            case let text as String:     parts.append("\(key)=s:\(text)")
+            case let data as Data:       parts.append("\(key)=d:\(data.base64EncodedString())")
+            case let number as NSNumber: parts.append("\(key)=n:\(number)")
+            case .none:                  parts.append("\(key)=nil")
+            case .some(let other):       parts.append("\(key)=?:\(other)")
+            }
+        }
+        return parts.joined(separator: "|")
     }
 
     /// 单条读取数据；返回的 status 用于向用户解释「为什么这条读不出来」。
@@ -404,8 +436,13 @@ enum KeychainStore {
         if byPrimaryKey == errSecSuccess { return errSecSuccess }
         if byPrimaryKey != errSecItemNotFound { lastStatus = byPrimaryKey }
 
-        // 3. 退化主键，应对系统回传属性类型异常导致 errSecParam 的情况
-        if let minimal = item.minimalPrimaryKeyQuery {
+        // 3. 退化主键，应对系统回传属性类型异常导致 errSecParam 的情况。
+        //
+        //    但 SecItemDelete 会删掉**所有**命中项，而退化查询按定义比主键更宽，
+        //    所以动手前先数一遍：只要可能命中不止一条就不删，宁可报失败。
+        //    这不是假想 —— 一对密钥的公私钥共用同一个 klbl（公钥的 SHA-1）和 atag，
+        //    只差 kcls，实测导出里就有这么一对。
+        if let minimal = item.minimalPrimaryKeyQuery, matchCount(for: minimal) <= 1 {
             let byMinimal = SecItemDelete(minimal as CFDictionary)
             if byMinimal == errSecSuccess { return errSecSuccess }
             if byMinimal != errSecItemNotFound { lastStatus = byMinimal }
@@ -417,12 +454,32 @@ enum KeychainStore {
         return lastStatus
     }
 
+    /// 该查询会命中多少条。数不清时返回 `Int.max`，让调用方按「可能很多」处理。
+    private static func matchCount(for query: [String: Any]) -> Int {
+        var counting = query
+        counting[kSecMatchLimit as String] = kSecMatchLimitAll
+        counting[kSecReturnPersistentRef as String] = true
+        // 同 exists()：绝不因为一次「数数」把验证框弹出来
+        counting[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+
+        var output: AnyObject?
+        let status = SecItemCopyMatching(counting as CFDictionary, &output)
+        if status == errSecItemNotFound { return 0 }
+        guard status == errSecSuccess else { return .max }
+        if let rows = output as? [Any] { return rows.count }
+        return output == nil ? 0 : 1
+    }
+
     /// 条目是否仍然存在。无法判定时一律按「还在」处理，绝不谎报删除成功。
     static func exists(_ item: KeychainItem) -> Bool {
+        // 一律跳过验证。这是本文件的既定规则：取属性同样要解密，受保护条目会弹
+        // Face ID，而删除跑在后台队列上，批量删就是连弹。跳过后受保护条目返回
+        // errSecInteractionNotAllowed，正好落进下面「判不出就算还在」那一档。
         if let ref = item.persistentRef {
             let query: [String: Any] = [
                 kSecValuePersistentRef as String: ref,
-                kSecReturnAttributes as String: true
+                kSecReturnAttributes as String: true,
+                kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip
             ]
             var output: AnyObject?
             let status = SecItemCopyMatching(query as CFDictionary, &output)
@@ -432,6 +489,7 @@ enum KeychainStore {
         var query = item.primaryKeyQuery
         query[kSecReturnAttributes as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
+        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
 
         var output: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &output)
@@ -623,9 +681,15 @@ enum KeychainStore {
                          UInt8(truncatingIfNeeded: raw >> 16),
                          UInt8(truncatingIfNeeded: raw >> 8),
                          UInt8(truncatingIfNeeded: raw)]
-            // 四个字节都可打印才按字符显示，否则退回十进制
-            if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
-                return String(decoding: bytes, as: UTF8.self)
+            // 四个字节都可打印才按字符显示，否则退回十进制。
+            //
+            // 全是数字的除外（例如 "1234"）：那样显示出来和十进制写法长得一模一样，
+            // 而 number(from:) 会优先按十进制解析 —— 于是「看一眼再保存」就把
+            // 825373492 悄悄变成了 1234。这类退回十进制，显示与解析才对得上。
+            let text = String(decoding: bytes, as: UTF8.self)
+            if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }),
+               !text.allSatisfy({ $0.isNumber }) {
+                return text
             }
             return String(raw)
         }
@@ -821,14 +885,17 @@ enum KeychainStore {
             if let appLabel = newItem.applicationLabel.data(using: .utf8), !appLabel.isEmpty {
                 attributes[kSecAttrApplicationLabel as String] = appLabel
             }
-            if newItem.isPermanent { attributes[kSecAttrIsPermanent as String] = true }
-            if newItem.canEncrypt { attributes[kSecAttrCanEncrypt as String] = true }
-            if newItem.canDecrypt { attributes[kSecAttrCanDecrypt as String] = true }
-            if newItem.canDerive { attributes[kSecAttrCanDerive as String] = true }
-            if newItem.canSign { attributes[kSecAttrCanSign as String] = true }
-            if newItem.canVerify { attributes[kSecAttrCanVerify as String] = true }
-            if newItem.canWrap { attributes[kSecAttrCanWrap as String] = true }
-            if newItem.canUnwrap { attributes[kSecAttrCanUnwrap as String] = true }
+            // 显式写 true / false，不能「只在 true 时写」：这些标志省略时系统会
+            // 按密钥类型自行推断，而不是当成 false —— 那样界面上关掉的开关根本不起作用。
+            // 详情页一直是这么写的（SecItemUpdate 带显式 false），所以这条路是通的。
+            attributes[kSecAttrIsPermanent as String] = newItem.isPermanent
+            attributes[kSecAttrCanEncrypt as String] = newItem.canEncrypt
+            attributes[kSecAttrCanDecrypt as String] = newItem.canDecrypt
+            attributes[kSecAttrCanDerive as String] = newItem.canDerive
+            attributes[kSecAttrCanSign as String] = newItem.canSign
+            attributes[kSecAttrCanVerify as String] = newItem.canVerify
+            attributes[kSecAttrCanWrap as String] = newItem.canWrap
+            attributes[kSecAttrCanUnwrap as String] = newItem.canUnwrap
         }
 
         if !newItem.label.isEmpty {
@@ -853,11 +920,11 @@ enum KeychainStore {
            let typeCode = FourCharCode.number(from: newItem.typeCode) {
             attributes[kSecAttrType as String] = typeCode
         }
-        if editable.contains(kSecAttrIsInvisible as String), newItem.isInvisible {
-            attributes[kSecAttrIsInvisible as String] = true
+        if editable.contains(kSecAttrIsInvisible as String) {
+            attributes[kSecAttrIsInvisible as String] = newItem.isInvisible
         }
-        if editable.contains(kSecAttrIsNegative as String), newItem.isNegative {
-            attributes[kSecAttrIsNegative as String] = true
+        if editable.contains(kSecAttrIsNegative as String) {
+            attributes[kSecAttrIsNegative as String] = newItem.isNegative
         }
 
         // 通配符组同样可以写入：钥匙串把它当成普通组名存下来，
@@ -867,7 +934,17 @@ enum KeychainStore {
             attributes[kSecAttrAccessGroup as String] = group
         }
 
-        return SecItemAdd(attributes as CFDictionary, nil)
+        let status = SecItemAdd(attributes as CFDictionary, nil)
+        guard status == errSecParam else { return status }
+
+        // 万一某个类别不接受显式 false，退回「只写 true」再试一次：
+        // 开关失效总比整条建不出来强，而且失败会明确报给用户
+        var relaxed = attributes
+        for (key, value) in attributes where (value as? Bool) == false {
+            relaxed.removeValue(forKey: key)
+        }
+        guard relaxed.count != attributes.count else { return status }
+        return SecItemAdd(relaxed as CFDictionary, nil)
     }
 
     // MARK: - 导入
@@ -882,6 +959,9 @@ enum KeychainStore {
     struct ImportOutcome {
         var added = 0
         var replaced = 0
+        /// 系统拒收「尽量保真」的属性、摘掉后才写进去的条数。
+        /// 不算失败，但要让用户知道这些条目不是原样还原的
+        var degraded = 0
         var failures: [ImportFailure] = []
 
         var attempted: Int { added + replaced + failures.count }
@@ -908,8 +988,26 @@ enum KeychainStore {
             keys.insert(attribute.key)
         }
         keys.insert(kSecValueData as String)
+        keys.formUnion(bestEffortAttributes)
         return keys
     }
+
+    /// 尽量保真、但不确定系统一定接受的属性。
+    ///
+    /// `alis` 出现在实测导出的 1385/1467 条上，值是每个 App 容器一个的 UUID
+    /// （同一个 app 的多条共用同一个值）。丢掉它，导入回去的条目未必还能被原来的
+    /// app 认领。但它是不是 `SecItemAdd` 允许手给的属性，只有真机说了算 ——
+    /// 之前密钥的 `priv`/`modi`/`extr` 就是写了直接 -50。
+    ///
+    /// 苹果没把它开放给 SecItem。两边证据一致：iOS SDK 里没有 `kSecAttrAlias`
+    /// 这个常量（编译报 cannot find in scope），而 Security 源码
+    /// `libsecurity_keychain/lib/SecItem.cpp` 的属性映射表里那一行是注释掉的：
+    /// `//  { kSecKeyAlias, /* not yet exposed by SecItem */, ... }`。
+    ///
+    /// 但 SecItem 的字典就是字符串键，`"alis"` 仍然送得进去，收不收只有真机知道。
+    /// 所以先带上写，被拒（errSecParam）就摘掉重试 —— 能保真就保真，
+    /// 不能也只是退回原来的行为，不会因此整批失败。
+    private static let bestEffortAttributes: Set<String> = ["alis"]
 
     /// 按导入文件里的属性直接写入。
     ///
@@ -923,6 +1021,7 @@ enum KeychainStore {
                            replaceExisting: Bool,
                            progress: ((Int, Int) -> Void)? = nil) -> ImportOutcome {
         var outcome = ImportOutcome()
+        var bestEffortRejected = false
 
         for (index, item) in items.enumerated() {
             progress?(index, items.count)
@@ -953,7 +1052,28 @@ enum KeychainStore {
                 attributes[kSecValueRef as String] = certificate
             }
 
-            let status = SecItemAdd(attributes as CFDictionary, nil)
+            // 一旦确认系统不收，后面的就别再白试一次了 ——
+            // 否则整批每条都要发两次 SecItemAdd
+            if bestEffortRejected {
+                for key in bestEffortAttributes { attributes.removeValue(forKey: key) }
+            }
+
+            var status = SecItemAdd(attributes as CFDictionary, nil)
+
+            // 系统不认这些「尽量保真」的属性时，摘掉再试一次，
+            // 别让一个可选属性把整条条目挡在外面
+            if status == errSecParam,
+               attributes.keys.contains(where: { bestEffortAttributes.contains($0) }) {
+                for key in bestEffortAttributes { attributes.removeValue(forKey: key) }
+                status = SecItemAdd(attributes as CFDictionary, nil)
+                if status == errSecSuccess {
+                    bestEffortRejected = true
+                    outcome.degraded += 1
+                }
+            } else if bestEffortRejected {
+                outcome.degraded += 1
+            }
+
             switch status {
             case errSecSuccess:
                 outcome.added += 1
@@ -964,12 +1084,16 @@ enum KeychainStore {
                                                         reason: message(for: status)))
                     continue
                 }
-                let replaceStatus = replace(attributes: attributes, itemClass: item.itemClass)
-                if replaceStatus == errSecSuccess {
+                switch replace(attributes: attributes, itemClass: item.itemClass) {
+                case .done:
                     outcome.replaced += 1
-                } else {
+                case .failed(let replaceStatus):
                     outcome.failures.append(ImportFailure(title: describe(item),
                                                         reason: message(for: replaceStatus)))
+                case .ambiguous:
+                    outcome.failures.append(ImportFailure(
+                        title: describe(item),
+                        reason: "文件里的属性不足以唯一定位这条，覆盖会波及同组其它条目，已跳过"))
                 }
 
             default:
@@ -983,8 +1107,21 @@ enum KeychainStore {
     }
 
     /// 条目已存在时改为更新：用主键定位，只写非主键的部分。
+    ///
+    /// 定位查询是从**文件里有的**主键属性拼出来的，文件缺哪个就少哪个 ——
+    /// 证书尤其明显：它的可写属性只有 labl/pdmn/agrp/sync，`ctyp`/`issr`/`slnr`
+    /// 一个都不在其中，查询会退化成「这个组里的所有证书」。
+    /// 而 `SecItemUpdate` 改的是**全部命中项**，那样一次导入就会把整组证书的
+    /// 标签和保护级别一起改掉。所以动手前先数一遍，超过一条就不改。
+    private enum ReplaceOutcome {
+        case done
+        case failed(OSStatus)
+        /// 定位查询会命中不止一条，改下去等于批量改写别人的条目
+        case ambiguous
+    }
+
     private static func replace(attributes: [String: Any],
-                               itemClass: KeychainItemClass) -> OSStatus {
+                               itemClass: KeychainItemClass) -> ReplaceOutcome {
         var query: [String: Any] = [kSecClass as String: itemClass.secClass]
         let primaryKeys = Set(itemClass.primaryKeyAttributes)
         for key in primaryKeys {
@@ -995,19 +1132,28 @@ enum KeychainStore {
             query[kSecAttrSynchronizable as String] = false
         }
 
+        guard matchCount(for: query) <= 1 else { return .ambiguous }
+
         var changes: [String: Any] = [:]
         for (key, value) in attributes
         where !primaryKeys.contains(key) && key != (kSecClass as String) {
             changes[key] = value
         }
-        guard !changes.isEmpty else { return errSecSuccess }
+        // 证书的身份就是那份 DER：主键既然对上了，就是同一张证书，
+        // 没有「更新内容」可言。而 kSecValueRef 也不是 SecItemUpdate 能收的东西。
+        changes.removeValue(forKey: kSecValueRef as String)
+        guard !changes.isEmpty else { return .done }
 
-        return SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+        let status = SecItemUpdate(query as CFDictionary, changes as CFDictionary)
+        return status == errSecSuccess ? .done : .failed(status)
     }
 
     /// 有些条目在原理上就导不进来，与其让它撞进 SecItemAdd 拿一个 -50，
     /// 不如提前识别并说清楚为什么。
     private static func unimportableReason(_ item: KeychainExport.ParsedItem) -> String? {
+        // 文件里的值就解不出来，写进去只会造出一条内容不对的条目
+        if let failure = item.decodeFailure { return "文件内容有误：\(failure)" }
+
         guard item.itemClass == .key else { return nil }
 
         // 安全隔区里生成的密钥：材料从不离开芯片，导出文件里本来就没有 v_Data，

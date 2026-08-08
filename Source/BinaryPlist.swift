@@ -10,6 +10,51 @@ struct ArchiveUID: Hashable {
     let value: UInt64
 }
 
+/// binary plist 里的 16 字节整数。
+///
+/// Swift 侧没有能装下它的数值类型：`NSNumber` 最宽到 64 位，CoreFoundation 内部
+/// 那个 `kCFNumberSInt128Type` 没有公开出来。所以原始字节原样留着，写回时照抄，
+/// 显示时自己算成十进制 —— 只读，因为编辑框里的值没法转回 128 位。
+///
+/// 实测语料 314 份 plist、13375 个对象里一次都没出现过。留着它不是为了支持编辑，
+/// 是为了别让一个不认识的对象把整份负载的解析拖垮 —— 那会让整条条目退回只剩十六进制。
+struct WideInteger {
+
+    /// 16 字节，大端，二进制补码
+    let bytes: Data
+
+    var decimalDescription: String {
+        var magnitude = [UInt8](bytes)
+        let negative = (magnitude.first ?? 0) & 0x80 != 0
+
+        if negative {
+            // 取绝对值：按位取反再加一
+            for index in magnitude.indices { magnitude[index] = ~magnitude[index] }
+            var carry = 1
+            for index in magnitude.indices.reversed() {
+                let sum = Int(magnitude[index]) + carry
+                magnitude[index] = UInt8(sum & 0xFF)
+                carry = sum >> 8
+            }
+        }
+
+        // 反复除以 10 取余数。余数 < 10，所以中间量不会溢出
+        var digits = ""
+        while magnitude.contains(where: { $0 != 0 }) {
+            var remainder = 0
+            for index in magnitude.indices {
+                let current = remainder << 8 | Int(magnitude[index])
+                magnitude[index] = UInt8(current / 10)
+                remainder = current % 10
+            }
+            digits.append(Character(UnicodeScalar(UInt8(remainder) + 48)))
+        }
+
+        if digits.isEmpty { return "0" }
+        return (negative ? "-" : "") + String(digits.reversed())
+    }
+}
+
 /// 自己实现的 binary plist 编解码。
 ///
 /// 只处理二进制格式；XML plist 仍然交给 `PropertyListSerialization`（它对 XML 没问题，
@@ -77,9 +122,14 @@ enum BinaryPlist {
         let refSize: Int
         let limit: Int
         /// 解析是把引用图展开成树，同一个对象被引用多次就会展开多份。
-        /// 归档里的引用是 UID（叶子，不展开）所以没事，但坏掉或恶意构造的
-        /// plist 可以靠层层共享撑爆内存，给个总量上限兜底。
-        private var budget = 2_000_000
+        /// 归档里的引用是 UID（叶子，不展开）所以没事，但靠层层共享可以指数放大：
+        /// 构造过一个 **102 字节**的文件，展开出 140 万个节点。
+        ///
+        /// 上限要卡在「真实数据用不到、但恶意构造够不着」之间。实测语料里展开后
+        /// 最大的一条是 4330 个节点（源文件 26 KB），中位数 24 —— 20 万是它的 46 倍，
+        /// 而最坏情况被压在约 10 MB、几十毫秒，主线程上也无感。
+        /// 原先写的 200 万是实测最大值的 460 倍，等于没设。
+        private var budget = 200_000
 
         init(bytes: [UInt8], offsets: [Int], refSize: Int, limit: Int) {
             self.bytes = bytes
@@ -109,6 +159,10 @@ enum BinaryPlist {
             switch high {
             case 0x1:
                 let size = 1 << low
+                if size == 16 {
+                    guard start + 17 <= limit else { return nil }
+                    return WideInteger(bytes: Data(bytes[(start + 1)..<(start + 17)]))
+                }
                 guard size <= 8, let raw = readBigEndian(bytes, at: start + 1, size: size, limit: limit)
                 else { return nil }
                 // 8 字节整数是有符号的，其余按无符号读
@@ -134,7 +188,7 @@ enum BinaryPlist {
                 else { return nil }
                 return ArchiveUID(value: raw)
 
-            case 0x4, 0x5, 0x6, 0xA, 0xC, 0xD:
+            case 0x4, 0x5, 0x6, 0xA, 0xD:
                 guard let (count, body) = count(after: start, low: low) else { return nil }
                 return container(high: high, count: count, body: body, depth: depth)
 
@@ -168,7 +222,11 @@ enum BinaryPlist {
                 guard body + count * 2 <= limit else { return nil }
                 return String(bytes: bytes[body..<(body + count * 2)], encoding: .utf16BigEndian)
 
-            case 0xA, 0xC:
+            // 集合（0xC）只当数组读的话，写回去就变成数组了 —— 那是静默改数据。
+            // 这个标记只有 CFSet 会产生，NSKeyedArchiver 不会，实测语料里 0 次。
+            // 与其留一条有损的写回路径，不如整份判失败：条目退回只显示十六进制，
+            // 至少不会把集合悄悄写成数组。
+            case 0xA:
                 guard let refs = references(at: body, count: count) else { return nil }
                 var result = [Any]()
                 result.reserveCapacity(count)
@@ -325,6 +383,12 @@ enum BinaryPlist {
     private static func encodeLeaf(_ value: Any, into body: inout Data) throws {
         if value is NSNull {
             body.append(0x00)
+            return
+        }
+
+        if let wide = value as? WideInteger, wide.bytes.count == 16 {
+            body.append(0x14)
+            body.append(wide.bytes)
             return
         }
 

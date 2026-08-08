@@ -28,6 +28,12 @@ struct ItemDetailView: View {
     @State private var didRequestDelete = false
     /// 只存被改动过的属性，未改动的直接读条目当前值
     @State private var editedAttributes: [String: Any] = [:]
+    /// 四字符码输入过程中的原文。
+    ///
+    /// 这类字段只有凑满 4 个字符（或是一个十进制数）才解析得出来，而中间状态
+    /// 解析失败。若直接以「解析结果」为准，敲第一个字符就会因为解析不出来被当成
+    /// 「无改动」，输入框立刻弹回原值 —— 逐字输入根本进行不下去。
+    @State private var fourCharDrafts: [String: String] = [:]
     /// 数据解析结果。解析要跑一遍引用图，不放进 computed property 里每帧重算
     @State private var decoded: DecodedPayload?
     /// 解析视图里被改过的字段，key 是 DecodedField.id
@@ -115,7 +121,8 @@ struct ItemDetailView: View {
             return item.isSynchronizable ? "是" : "否"
         }
         guard let value = item.rawAttributes[key] else { return "未设置" }
-        return KeychainAttributeFormatter.value(value, forKey: key)
+        return KeychainAttributeFormatter.value(value, forKey: key,
+                                                itemClass: item.itemClass)
     }
 
     // MARK: 证书解析
@@ -371,18 +378,21 @@ struct ItemDetailView: View {
     private func decodedDataSection(_ item: KeychainItem) -> some View {
         if let payload = decoded {
             Section {
-                // 行的写法一律跟着本文件既有的 attributeRow 走：单层 HStack、
-                // 固定宽标签、不加 padding、不套 VStack。自己发明的写法
-                // 会把系统分隔线盖住，这个坑踩过好几次了。
-                ForEach(payload.fields) { field in
-                    decodedFieldRow(field)
+                // 密钥和证书不支持改数据。这时字段还摆成可输入的样子、
+                // 保存按钮却是灰的，等于骗人——那种情况直接按只读渲染
+                let writable = item.itemClass.supportsDataEditing && item.canBeTargeted
+
+                // 操作放在字段前面：绝大多数条目只有几个字段，但实测最大的一条
+                // 解出 1443 个，保存按钮沉在那么多行底下等于找不到
+                NavigationLink {
+                    DecodedStructurePage(payload: payload)
+                } label: {
+                    Text("完整结构")
                 }
 
-                if payload.isEditable {
+                if payload.isEditable && writable {
                     Button("按字段保存") { saveDecoded(item, payload: payload) }
-                        .disabled(!item.itemClass.supportsDataEditing
-                                  || !item.canBeTargeted
-                                  || decodedEdits.isEmpty)
+                        .disabled(decodedEdits.isEmpty)
                 }
 
                 if let decodedNotice {
@@ -391,10 +401,11 @@ struct ItemDetailView: View {
                         .foregroundStyle(.green)
                 }
 
-                NavigationLink {
-                    decodedStructurePage(payload)
-                } label: {
-                    Text("完整结构")
+                // 行的写法一律跟着本文件既有的 attributeRow 走：单层 HStack、
+                // 固定宽标签、不加 padding、不套 VStack。自己发明的写法
+                // 会把系统分隔线盖住，这个坑踩过好几次了。
+                ForEach(payload.fields) { field in
+                    decodedFieldRow(field, writable: writable)
                 }
             } header: {
                 Text("数据解析（\(payload.formatName)）")
@@ -404,54 +415,35 @@ struct ItemDetailView: View {
         }
     }
 
-    /// 全文是一大段等宽文本，塞进 Form 的行里怎么排都难看，单独开一页
-    private func decodedStructurePage(_ payload: DecodedPayload) -> some View {
-        ScrollView([.horizontal, .vertical]) {
-            Text(payload.text)
-                .font(.system(.caption, design: .monospaced))
-                .textSelection(.enabled)
-                .padding()
-        }
-        .navigationTitle(payload.formatName)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            Button {
-                copy(payload.text)
-            } label: {
-                Label("复制", systemImage: "doc.on.doc")
-            }
-        }
-    }
-
     @ViewBuilder
-    private func decodedFieldRow(_ field: DecodedField) -> some View {
+    private func decodedFieldRow(_ field: DecodedField, writable: Bool) -> some View {
         // 路径可能很长（a.b.c[0].d），从头部截断，保留最具体的那一段；
         // 改过的标成橙色——一条归档能解出上千个字段，不标根本找不到改过哪几个
         let label = Text(field.label)
             .font(.caption)
             .foregroundStyle(isEdited(field) ? Color.orange : Color.secondary)
-            .lineLimit(1)
+            // 路径能有 a.b.c[0].d 这么长，只给一行会截得只剩尾巴几个字。
+            // 允许折两行，仍然从头部截断，保留最具体的那一段
+            .lineLimit(2)
             .truncationMode(.head)
 
-        switch field.kind {
-        case .boolean:
-            Toggle(isOn: decodedBoolBinding(field)) { label }
-
-        case .string, .integer, .real:
+        if !writable || !field.kind.isEditable {
             HStack {
                 label.frame(width: 116, alignment: .leading)
-                TextField("空", text: decodedBinding(field))
+                Text(field.value.isEmpty ? "空" : field.value)
+                    .font(.system(.callout, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+        } else if field.kind == .boolean {
+            Toggle(isOn: decodedBoolBinding(field)) { label }
+        } else {
+            HStack {
+                label.frame(width: 116, alignment: .leading)
+                TextField(field.kind.editingHint ?? "空", text: decodedBinding(field))
                     .font(.system(.callout, design: .monospaced))
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-            }
-
-        case .date, .data, .null:
-            HStack {
-                label.frame(width: 116, alignment: .leading)
-                Text(field.value)
-                    .font(.system(.callout, design: .monospaced))
-                    .foregroundStyle(.secondary)
             }
         }
     }
@@ -483,13 +475,17 @@ struct ItemDetailView: View {
 
     @ViewBuilder
     private func decodedFooter(_ payload: DecodedPayload, item: KeychainItem) -> some View {
-        if !payload.isEditable {
+        if !item.itemClass.supportsDataEditing {
+            Text("\(item.itemClass.displayName)的数据不可改，这里只能查看。")
+        } else if !item.canBeTargeted {
+            Text("这条缺少可用于精确定位的主键，改不了，只能查看。")
+        } else if !payload.isEditable {
             Text("这段数据没有可改的字段，只能查看。")
-        } else if !item.itemClass.supportsDataEditing {
-            Text("\(item.itemClass.displayName)的数据不可改。")
         } else {
             Text("保存会按原格式重新编码，只替换改过的字段。"
-                 + "标签里出现「/」表示这一处被多条路径共用，改一次会同时生效。")
+                 + "标签里出现「/」表示这一处被多条路径共用，改一次会同时生效；"
+                 + "标着「空引用」的填上内容后会新增一个对象再把引用指过去；"
+                 + "路径里出现「→」的是嵌套负载内部的字段，保存时内外两层都会重新编码。")
         }
     }
 
@@ -574,6 +570,7 @@ struct ItemDetailView: View {
     private func fourCharCodeBinding(_ attribute: KeychainStore.EditableAttribute) -> Binding<String> {
         Binding(
             get: {
+                if let draft = fourCharDrafts[attribute.key] { return draft }
                 if let edited = editedAttributes[attribute.key] {
                     return KeychainStore.FourCharCode.text(from: edited)
                 }
@@ -581,7 +578,9 @@ struct ItemDetailView: View {
                 return KeychainStore.FourCharCode.text(from: item.rawAttributes[attribute.key])
             },
             set: { text in
-                // 解析不出来就不写进改动集，避免把非法值发给 SecItemUpdate
+                // 原文照收，输入过程才不会被打断；只有解析得出来的才进改动集，
+                // 免得把半截内容发给 SecItemUpdate
+                fourCharDrafts[attribute.key] = text
                 if let number = KeychainStore.FourCharCode.number(from: text) {
                     editedAttributes[attribute.key] = number
                 } else {
@@ -628,6 +627,8 @@ struct ItemDetailView: View {
     private func saveAttributes(_ item: KeychainItem) {
         if viewModel.updateAttributes(item, changes: editedAttributes) {
             editedAttributes.removeAll()
+            // 草稿留着就会盖住刚写回来的真实值
+            fourCharDrafts.removeAll()
             saveNotice = "元数据已更新"
         }
     }
@@ -646,16 +647,19 @@ struct ItemDetailView: View {
         Section {
             ForEach(item.rawAttributes.keys.sorted(), id: \.self) { key in
                 if let value = item.rawAttributes[key] {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(KeychainAttributeFormatter.label(for: key))
-                            .font(.caption)
-                            .foregroundStyle(Color.accentColor)
-                        Text(KeychainAttributeFormatter.value(value, forKey: key))
-                            .font(.system(size: 12, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                    // 属性值本身也可能是结构化的：实测 gena 里就有一条 3234 字节的
+                    // bplist，按十六进制显示就是 6468 个字符，等于没显示
+                    if let payload = decodedAttribute(value) {
+                        NavigationLink {
+                            DecodedStructurePage(payload: payload)
+                        } label: {
+                            rawAttributeRow(key, value, itemClass: item.itemClass,
+                                            format: payload.formatName, selectable: false)
+                        }
+                    } else {
+                        rawAttributeRow(key, value, itemClass: item.itemClass,
+                                        format: nil, selectable: true)
                     }
-                    .padding(.vertical, 2)
                 }
             }
         } header: {
@@ -686,6 +690,43 @@ struct ItemDetailView: View {
         }
     }
 
+    /// `selectable` 在整行是 NavigationLink 时要关掉：可选中的文本会和点击手势打架
+    @ViewBuilder
+    private func rawAttributeRow(_ key: String, _ value: Any, itemClass: KeychainItemClass,
+                                 format: String?, selectable: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(KeychainAttributeFormatter.label(for: key))
+                    .font(.caption)
+                    .foregroundStyle(Color.accentColor)
+                if let format {
+                    Text(format)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            let text = Text(KeychainAttributeFormatter.value(value, forKey: key,
+                                                             itemClass: itemClass))
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.secondary)
+
+            // enabled / disabled 是两个不同的类型，只能分支，不能三元
+            if selectable {
+                text.textSelection(.enabled).lineLimit(6)
+            } else {
+                text.lineLimit(6)
+            }
+        }
+        .padding(.vertical, 2)
+    }
+
+    /// 属性值本身能不能解析。只对二进制值尝试——文本属性本来就看得懂
+    private func decodedAttribute(_ value: Any) -> DecodedPayload? {
+        guard let data = value as? Data, data.count >= 8,
+              data.utf8Text == nil else { return nil }
+        return DataDecoder.decode(data)
+    }
+
     // MARK: 删除
 
     private func deleteSection(_ item: KeychainItem) -> some View {
@@ -709,6 +750,7 @@ struct ItemDetailView: View {
     /// 只刷新数据内容，不动标签输入框（解锁后复用）
     private func loadContent(from item: KeychainItem) {
         decodedEdits.removeAll()
+        fourCharDrafts.removeAll()
         decodedNotice = nil
 
         guard item.isDataReadable, let data = item.data else {
@@ -730,12 +772,19 @@ struct ItemDetailView: View {
 
     /// 用户在原始数据区改过之后，解析结果就对不上了，得跟着重算
     private func refreshDecoded() {
+        // 原始数据一变，解析区那些还没保存的修改就作废了。默默清掉的话
+        // 用户会以为改动还在，回头点保存才发现什么都没了
+        if !decodedEdits.isEmpty {
+            decodedEdits.removeAll()
+            decodedNotice = nil
+            viewModel.alertMessage = "原始数据已改动，解析区里还没保存的字段修改已作废。"
+        }
+
         guard let data = isHexMode ? content.hexData : content.data(using: .utf8) else {
             decoded = nil
             return
         }
         decoded = DataDecoder.decode(data)
-        decodedEdits.removeAll()
     }
 
     private func unlock(_ item: KeychainItem) {
@@ -795,6 +844,43 @@ struct ItemDetailView: View {
                         .font(.caption)
                 }
                 .buttonStyle(.plain)
+            }
+        }
+    }
+}
+
+/// 解析结果的全文。单独开一页是因为这是一大段等宽文本，塞进 Form 的行里怎么排都难看。
+///
+/// 按行惰性渲染，不是丢一个大 `Text` 进去：实测最长的一条归档展开有 62000 多字符，
+/// 而 `Text` 不是惰性的，一次性排这么多版会明显卡顿。
+///
+/// 单独做成一个 View 而不是父视图里的方法，是为了让拆行只在真正进入这一页时才做 ——
+/// `NavigationLink` 的目标闭包在 List 里有可能被提前求值。
+private struct DecodedStructurePage: View {
+
+    let payload: DecodedPayload
+
+    var body: some View {
+        let lines = payload.text.split(separator: "\n", omittingEmptySubsequences: false)
+
+        ScrollView([.horizontal, .vertical]) {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
+                    // 空行给个空格，否则高度塌成 0，缩进关系就看不出来了
+                    Text(line.isEmpty ? " " : String(line))
+                        .font(.system(.caption, design: .monospaced))
+                        .textSelection(.enabled)
+                }
+            }
+            .padding()
+        }
+        .navigationTitle(payload.formatName)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            Button {
+                UIPasteboard.general.string = payload.text
+            } label: {
+                Label("复制全文", systemImage: "doc.on.doc")
             }
         }
     }

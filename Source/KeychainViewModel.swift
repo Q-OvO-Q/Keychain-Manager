@@ -219,6 +219,16 @@ final class KeychainViewModel: ObservableObject {
         items.filter { selectedIDs.contains($0.id) }
     }
 
+    /// 选中但当前筛选条件下看不见的条数。
+    ///
+    /// 选择是刻意的操作，改筛选条件不该把它悄悄清掉；但「删除」不可撤销，
+    /// 用户盯着 99 条的列表按下去、实际删掉 1467 条，只给一个总数是不够的。
+    var selectedButHiddenCount: Int {
+        guard !selectedIDs.isEmpty else { return 0 }
+        let visible = Set(filteredItems.map(\.id))
+        return selectedIDs.subtracting(visible).count
+    }
+
     func item(withID id: String) -> KeychainItem? {
         items.first { $0.id == id }
     }
@@ -490,12 +500,20 @@ final class KeychainViewModel: ObservableObject {
         guard let pending = pendingTag else { return }
         pendingTag = nil
 
-        let keys = items
-            .filter { !pending.knownIDs.contains($0.id) }
-            .map(\.tagKey)
+        let appeared = items.filter { !pending.knownIDs.contains($0.id) }
 
-        guard !keys.isEmpty else { return }
-        TagManager.shared.setTag(pending.tag, for: keys)
+        // 一次新增只会多出一条。多出好几条说明这次刷新还夹带了别的变化 ——
+        // add() 触发的 refresh() 可能被 isLoading 挡下，标签就一直等到下一次刷新，
+        // 而那次可能刚好开了新类别，于是整批新出现的条目都会被打上标签。
+        // 认不出是哪条时宁可不打，并且要说出来，不能把标签糊到一批条目上。
+        guard let target = appeared.first, appeared.count == 1 else {
+            if !appeared.isEmpty {
+                alertMessage = "条目已新增，但这次刷新里多出 \(appeared.count) 条，"
+                    + "无法确定哪条是刚建的，标签没有自动应用 —— 请在详情页手动设置。"
+            }
+            return
+        }
+        TagManager.shared.setTag(pending.tag, for: [target.tagKey])
     }
 
     // MARK: - 解锁受保护条目
@@ -641,6 +659,8 @@ final class KeychainViewModel: ObservableObject {
 
         var parts = ["新增 \(outcome.added) 条"]
         if outcome.replaced > 0 { parts.append("覆盖 \(outcome.replaced) 条") }
+        // 系统拒收了某些可选属性、摘掉才写进去的：没失败，但不是原样还原
+        if outcome.degraded > 0 { parts.append("\(outcome.degraded) 条未能完整还原") }
         if !outcome.failures.isEmpty { parts.append("失败 \(outcome.failures.count) 条") }
         statusMessage = parts.joined(separator: " · ")
 

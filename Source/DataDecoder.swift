@@ -7,15 +7,39 @@ import Security
 struct DecodedField: Identifiable {
 
     enum Kind {
-        case string, integer, real, boolean, date, data, null
+        case string, integer, real, boolean
+        /// 独立的日期对象
+        case date
+        /// 归档里的 NSDate：存的是相对 2001-01-01 的秒数
+        case referenceDate
+        /// 内容是可读 UTF-8 的字节串。归档里存 UUID、token、指纹很常用这种，
+        /// 按文本编辑，写回时再转成字节
+        case utf8Data
+        /// 真二进制，按十六进制编辑
+        case binaryData
+        /// 太大，就地编辑没意义，只读
+        case opaqueData
+        /// 指向 `$null` 的空引用。填入内容会在 `$objects` 里新增一项，
+        /// 再把这处引用指过去
+        case nullReference
 
         var isEditable: Bool {
             switch self {
-            case .string, .integer, .real, .boolean: return true
-            case .date, .data, .null: return false
+            case .opaqueData: return false
+            default: return true
             }
         }
 
+        /// 光看值看不出该按什么格式填的，给个提示
+        var editingHint: String? {
+            switch self {
+            case .utf8Data: return "字节串（按文本填）"
+            case .binaryData: return "字节串（按十六进制填）"
+            case .date, .referenceDate: return "yyyy-MM-dd HH:mm:ss"
+            case .nullReference: return "空引用，填入内容即可设值"
+            default: return nil
+            }
+        }
     }
 
     let id: String
@@ -30,18 +54,23 @@ struct DecodedField: Identifiable {
 ///
 /// 不能只记 `$objects` 下标 —— 归档里有大量值是**内联**存的而不是单独占一格：
 /// `NSMutableString` 是 `{$class: UID, NS.string: "…"}`，自定义类的小整数也直接
-/// 写在实例字典里（`{gracePeriod: 0, …}`）。只认下标会漏掉这些，实测 309 条归档
-/// 里可编辑字段会从 2110 个掉到 1068 个，72 条整条都解不出可改的东西。
+/// 写在实例字典里（`{gracePeriod: 0, …}`）。只认下标会漏掉这些：同一份导出上实测，
+/// 按路径能解出 2999 个可编辑字段，只认下标只剩 1374 个，还有 72 条归档一个都解不出。
 fileprivate typealias FieldLocation = [PathComponent]
 
 fileprivate enum PathComponent {
     case key(String)
     case index(Int)
+    /// 这一处的字节串本身又是一份负载：解开它，路径的后半截作用在里面，写回时重新编码
+    case into
 
+    /// 字段 id 由路径拼成，是 ForEach 的身份标识，重了会让列表串行。
+    /// 带上类型前缀，键名 "5" 和下标 5、键名 "→" 和 .into 就不会撞。
     var token: String {
         switch self {
-        case .key(let name): return name
-        case .index(let offset): return String(offset)
+        case .key(let name): return "k\(name)"
+        case .index(let offset): return "i\(offset)"
+        case .into: return "→"
         }
     }
 }
@@ -97,9 +126,9 @@ enum DecodeEditError: LocalizedError {
 
 /// 把条目数据里那些「看着是二进制、其实有结构」的内容解析成可读、可改的形式。
 ///
-/// 对着一份 1447 条的完整导出统计过：binary plist 313 条（其中 309 条是归档、
-/// 78 条含第三方类）、JSON 191 条、DER 53 条、protobuf 22 条、纯文本 576 条，
-/// 其余是空值和无结构的密钥/哈希（40 条正好 32 字节，就是 AES 密钥本身）。
+/// 对着一份 1467 条的完整导出统计过：纯文本 627 条、binary plist 314 条（其中
+/// 310 条是归档，78 条含本 App 里根本没有的第三方类）、JSON 191 条、DER 56 条、
+/// protobuf 25 条、空值 120 条，剩下 134 条是没有结构的密钥和哈希本身。
 ///
 /// 归档必须**自己解 UID 引用图**，不能交给 `NSKeyedUnarchiver`：那 78 条里的
 /// `FIRInstallationsStoredItem`、`OIDAuthState`、`EMMLoginInfo` 等类本 App 里
@@ -111,15 +140,16 @@ enum DecodeEditError: LocalizedError {
 /// 实机上整份归档全都解不开，已废弃。
 ///
 /// 不做的事：按 Windows-1252 之类的单字节编码硬解。这条查过实据，不是想当然：
-/// 整份导出 83 万字节里 cp1252 未定义的只有 0.45%，随机字节的「解码成功率」97.9% ——
+/// 整份导出 81 万字节里 cp1252 未定义的只有 0.47%，随机字节的「解码成功率」98.0% ——
 /// 什么都能解，就等于什么都没判。而且它解出来的不是信息：那 12 条「按 cp1252 看
 /// 像文本」的条目实际是 protobuf，cp1252 只是把长度前缀 `f0`、`c3` 涂成了 `ð`、`Ã`。
 /// 真正该做的是认出 protobuf，那 12 条里装的是 JWT 和 Tink 密钥集。
 /// 另外也试过 UTF-16：整份导出 0 条命中。
 enum DataDecoder {
 
-    /// 只读全文的长度上限：详情页塞不下更多，还会拖慢滚动
-    private static let renderLimit = 20_000
+    /// 全文渲染的长度上限。全文已经挪到单独一页了，不再受表单行的限制，
+    /// 所以放宽到实测最大那条归档（26 KB）展开后也不会被截断
+    private static let renderLimit = 200_000
     private static let maxDepth = 24
 
     static func decode(_ data: Data) -> DecodedPayload? {
@@ -212,8 +242,14 @@ enum DataDecoder {
 
         var collected: [String: DecodedField] = [:]
         var order: [String] = []
-        let text = resolve(rootRef, objects: objects, label: "", path: [], indent: 0,
+        var text = resolve(rootRef, objects: objects, label: "", path: [], indent: 0,
                            visiting: [], fields: &collected, order: &order)
+
+        // 整条归档的根就是 $null 的，实测有 6 条。光甩一个「null」出来
+        // 谁也看不懂是解析失败还是内容本来就空
+        if text == "null" && collected.isEmpty {
+            text = "这条归档的内容是空的（根对象是 $null），不是解析失败。"
+        }
 
         return (text, order.compactMap { collected[$0] })
     }
@@ -233,11 +269,41 @@ enum DataDecoder {
             guard index >= 0, index < objects.count else { return "<引用越界 \(index)>" }
             // 归档里出现环是合法的，不挡住就会无限递归
             guard !visiting.contains(index) else { return "<循环引用>" }
+
+            // 空引用：整份归档共用 $objects 里同一个 "$null"，改那一格会波及所有空值。
+            // 所以记的是**引用本身**的位置，写回时新增一项再把这里指过去。
+            if objects[index] as? String == "$null" {
+                if !path.isEmpty {
+                    record(path: path, label: label, kind: .nullReference, value: "",
+                           into: &fields, order: &order)
+                }
+                return "null"
+            }
+
             // 被引用的对象就存在 $objects[index]，路径从这里重新起算
             return resolve(objects[index], objects: objects, label: label,
                            path: [.key("$objects"), .index(index)], indent: indent,
                            visiting: visiting.union([index]),
                            fields: &fields, order: &order)
+        }
+
+        // 字节串里还嵌着一份完整负载：展开它，并把内层字段的路径接到 .into 后面，
+        // 这样内层也能改 —— 写回时先重编码内层，再重编码外层
+        // 内层解出来没有可读字段的（例如 DER，只能识别不能展开）不走这条：
+        // 那样这段字节既进不了字段列表也改不了，只剩全文里一行描述。
+        // 落回下面的叶子处理，仍然可编辑，显示上照样带出内层是什么。
+        if let bytes = node as? Data, let inner = nestedPayload(in: bytes),
+           !inner.fields.isEmpty {
+            for field in inner.fields {
+                record(path: path + [.into] + field.location,
+                       label: join(label, field.label), kind: field.kind,
+                       value: field.value, into: &fields, order: &order)
+            }
+            let indented = inner.text
+                .split(separator: "\n", omittingEmptySubsequences: false)
+                .map { String(repeating: "  ", count: indent + 1) + $0 }
+                .joined(separator: "\n")
+            return "\(bytes.count) 字节 · \(inner.formatName)\n\(indented)"
         }
 
         // 叶子可能是单独占一格的，也可能内联在上层字典里，两种都要收
@@ -259,6 +325,11 @@ enum DataDecoder {
             guard !keys.isEmpty else { return "{}" }
             let body = zip(keys, values).enumerated().map { offset, pair -> String in
                 let name = keyName(pair.0, objects: objects)
+                // 键名本身也是内容，也该能改。走一遍 resolve 就会被记成字段
+                _ = resolve(pair.0, objects: objects, label: "\(join(label, name)) (键名)",
+                            path: path + [.key("NS.keys"), .index(offset)],
+                            indent: indent + 1, visiting: visiting,
+                            fields: &fields, order: &order)
                 let child = resolve(pair.1, objects: objects, label: join(label, name),
                                     path: path + [.key("NS.objects"), .index(offset)],
                                     indent: indent + 1, visiting: visiting,
@@ -287,12 +358,20 @@ enum DataDecoder {
                            path: path + [.key("NS.string")], indent: indent,
                            visiting: visiting, fields: &fields, order: &order)
         }
+        // NSData 包装。以前这里直接返回字节数就完事，可实测 36 个二进制叶子里
+        // 有 15 个其实是纯可读文本（UUID、token、指纹），还有 2 个里面嵌着
+        // 完整的归档 / protobuf —— 一律显示成「N 字节二进制」等于把内容藏了
         if let bytes = dictionary["NS.data"] as? Data {
-            return "<\(bytes.count) 字节二进制>"
+            return resolve(bytes, objects: objects, label: label,
+                           path: path + [.key("NS.data")], indent: indent,
+                           visiting: visiting, fields: &fields, order: &order)
         }
         if let time = dictionary["NS.time"] as? NSNumber {
             // NSDate 存的是相对 2001-01-01 的秒数
-            return dateFormatter.string(from: Date(timeIntervalSinceReferenceDate: time.doubleValue))
+            let text = dateFormatter.string(from: Date(timeIntervalSinceReferenceDate: time.doubleValue))
+            record(path: path + [.key("NS.time")], label: label, kind: .referenceDate,
+                   value: text, into: &fields, order: &order)
+            return text
         }
 
         // 自定义类的实例：键就是字段名。本 App 里没有这些类，
@@ -343,8 +422,6 @@ enum DataDecoder {
                                value: String,
                                into fields: inout [String: DecodedField],
                                order: inout [String]) {
-        guard kind != .null else { return }
-
         let id = path.map(\.token).joined(separator: "/")
         let name = label.isEmpty ? "(根)" : label
 
@@ -401,7 +478,21 @@ enum DataDecoder {
             return "[\n\(body)\n\(pad)]"
         }
 
-        if let kind = leafKind(of: value), kind != .null {
+        // 和 resolve 一样：字节串里嵌着完整负载的，展开成内层字段而不是当成叶子
+        if let bytes = value as? Data, let inner = nestedPayload(in: bytes),
+           !inner.fields.isEmpty {
+            for field in inner.fields {
+                fields.append(DecodedField(id: (path + [.into] + field.location)
+                                              .map(\.token).joined(separator: "/"),
+                                           label: join(label, field.label),
+                                           kind: field.kind,
+                                           value: field.value,
+                                           location: path + [.into] + field.location))
+            }
+            return "\(bytes.count) 字节 · \(inner.formatName)\n\(inner.text)"
+        }
+
+        if let kind = leafKind(of: value) {
             fields.append(DecodedField(id: path.map(\.token).joined(separator: "/"),
                                        label: label.isEmpty ? "(根)" : label,
                                        kind: kind,
@@ -452,8 +543,8 @@ enum DataDecoder {
         )
     }
 
-    /// 光看首字节是 0x30 不够 —— 那也是 ASCII 的 "0"。在实测的 1447 条里，
-    /// 只判首字节会把 87 条算成 DER，而其中 34 条其实是以 "0" 开头的普通文本。
+    /// 光看首字节是 0x30 不够 —— 那也是 ASCII 的 "0"。在实测的 1467 条里，
+    /// 只判首字节会把 91 条算成 DER，而其中 35 条其实是以 "0" 开头的普通文本。
     /// 必须连长度字段一起校验，看它和数据实际长度对不对得上。
     private static func isDER(_ data: Data) -> Bool {
         let head = [UInt8](data.prefix(6))
@@ -478,12 +569,13 @@ enum DataDecoder {
     /// 残余数据里唯一还能可靠识别的结构。判据是「严格全量解析」：必须正好吃完
     /// 所有字节、字段号合法、线型只认 0/1/2/5，少一个字节多一个字节都判否。
     ///
-    /// 实测（1447 条导出 + 随机数据）：非 UTF-8 的 149 条残余里命中 22 条，
-    /// 随机数据误报率随长度从 1% 降到 0.1%。作为对照，cp1252 的「解码成功率」
-    /// 是 98% —— 差两个数量级，那个数字大到根本不能当判据用。
+    /// 实测（1467 条导出 + 随机数据）：非 UTF-8 的 159 条残余里命中 25 条，
+    /// 随机数据误报率 0.05%–0.17%。作为对照，cp1252 的「解码成功率」是 98% ——
+    /// 差三个数量级，那个数字大到根本不能当判据用。
     ///
-    /// 必须先排除合法 UTF-8 再试：621 条纯文本里有 8 条能被 protobuf 解析成功，
-    /// 不挡住就会把好端端的文本显示成一堆字段号。
+    /// 合法 UTF-8 一律先排除。这条现在是双保险：判据收紧之前，818 条能读成文本的
+    /// 条目里有 8 条会被 protobuf 解析成功，收紧之后是 0 条。但文本就该按文本显示，
+    /// 不该摆成一堆字段号，所以闸留着。
     ///
     /// `skippingTextGate` 只给保存后的自检用：那时格式已经确定就是 protobuf，
     /// 再走一遍「排除 UTF-8」的发现逻辑会把改完恰好变成合法 UTF-8 的内容判成非
@@ -495,6 +587,15 @@ enum DataDecoder {
 
         let bytes = [UInt8](data)
         guard let fields = parseProtobuf(bytes, from: 0, to: bytes.count, depth: 0) else {
+            return nil
+        }
+
+        // 至少得有一个长度分隔字段（字符串 / 字节串 / 嵌套消息）。真实消息几乎总有，
+        // 而随机字节恰好凑出来的基本是纯 varint。这一条把 20 字节随机数据的误报率
+        // 把随机短数据的误报率压到约十分之一（16 字节 1.12% -> 0.10%）；实测导出里
+        // 1520 条 SHA-1 哈希属性的误报从 10 条降到 0 条，818 条文本条目的误报从 8 条降到 0 条。
+        // 代价是漏掉 1 条 8 字节、字段号 4329229 的「消息」—— 那个本来也是误报。
+        guard fields.contains(where: { ($0 as? [AnyHashable: Any])?["w"] as? Int == 2 }) else {
             return nil
         }
 
@@ -600,11 +701,36 @@ enum DataDecoder {
                 return "\(pad)\(number) {\n\(body)\n\(pad)}"
             }
 
-            if let kind = leafKind(of: value), kind != .null {
+            // 和 resolve / collect 保持一致：字节字段里嵌着完整负载的，
+            // 展开成内层字段而不是只显示一句「N 字节二进制」
+            if let bytes = value as? Data, let inner = nestedPayload(in: bytes),
+               !inner.fields.isEmpty {
+                for field in inner.fields {
+                    collected.append(DecodedField(id: (valuePath + [.into] + field.location)
+                                                     .map(\.token).joined(separator: "/"),
+                                                  label: join(name, field.label),
+                                                  kind: field.kind,
+                                                  value: field.value,
+                                                  location: valuePath + [.into] + field.location))
+                }
+                return "\(pad)\(number): \(bytes.count) 字节 · \(inner.formatName)\n\(inner.text)"
+            }
+
+            if let kind = leafKind(of: value) {
+                // fixed32 / fixed64 的字节数是固定的。leafKind 只看内容，碰上恰好
+                // 可打印的 4 / 8 字节会判成文本，于是放出一个能随便改长度的输入框，
+                // 而编码时长度对不上只能报错。定长字段一律按十六进制编辑 ——
+                // 注意值也要一并换成十六进制，否则框里显示的是文本、解析却按十六进制。
+                let fixedWidth = (field["w"] as? Int).map { $0 == 1 || $0 == 5 } ?? false
+                let raw = value as? Data
+                let resolved: (DecodedField.Kind, String) = (fixedWidth && raw != nil)
+                    ? (.binaryData, raw!.hexString)
+                    : (kind, leafValue(value))
+
                 collected.append(DecodedField(id: valuePath.map(\.token).joined(separator: "/"),
                                               label: name,
-                                              kind: kind,
-                                              value: leafValue(value),
+                                              kind: resolved.0,
+                                              value: resolved.1,
                                               location: valuePath))
             }
             return "\(pad)\(number): \(leafDisplay(value))"
@@ -614,23 +740,47 @@ enum DataDecoder {
 
     // MARK: 叶子
 
+    /// 十六进制编辑框的上限。再大就不是人能手改的了，也会把 Form 撑爆
+    private static let hexEditLimit = 512
+
     private static func leafKind(of value: Any) -> DecodedField.Kind? {
-        if let text = value as? String {
-            // 归档用 "$null" 这个字符串表示空引用，不是真的内容
-            return text == "$null" ? .null : .string
-        }
+        if value is String { return .string }
         if let number = value as? NSNumber {
             if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() { return .boolean }
             return CFNumberIsFloatType(number as CFNumber) ? .real : .integer
         }
         if value is Date { return .date }
-        if value is Data { return .data }
-        if value is NSNull { return .null }
+        // 128 位整数：Swift 侧没有能装下的数值类型，编辑框转不回去，所以只读
+        if value is WideInteger { return .opaqueData }
+        if let bytes = value as? Data {
+            // 顺序要和 leafDisplay 一致：能当文本读就按文本，读不成再按十六进制。
+            // 嵌套结构在 resolve / collect 里已经先一步展开成内层字段了，走不到这
+            if let text = String(data: bytes, encoding: .utf8), !text.isEmpty, isPrintable(text) {
+                return .utf8Data
+            }
+            return bytes.count <= hexEditLimit ? .binaryData : .opaqueData
+        }
+        if value is NSNull { return .nullReference }
         return nil
+    }
+
+    /// 字节串里是不是还套着一层能解的东西。归档里套归档、套 protobuf 都实际见过。
+    fileprivate static func nestedPayload(in bytes: Data) -> DecodedPayload? {
+        // 只认有明确魔数 / 强判据的，别把普通字节猜成结构
+        guard bytes.count >= 4 else { return nil }
+        if bytes.starts(with: BinaryPlist.magic) || isXMLPlist(bytes) {
+            return decodePropertyList(bytes)
+        }
+        if bytes.first == UInt8(ascii: "{") || bytes.first == UInt8(ascii: "[") {
+            return decodeJSON(bytes)
+        }
+        if isDER(bytes) { return decodeDER(bytes) }
+        return decodeProtobuf(bytes)
     }
 
     /// 用于编辑框的原值
     private static func leafValue(_ value: Any) -> String {
+        if let wide = value as? WideInteger { return wide.decimalDescription }
         if let number = value as? NSNumber {
             if CFGetTypeID(number as CFTypeRef) == CFBooleanGetTypeID() {
                 return number.boolValue ? "true" : "false"
@@ -638,11 +788,19 @@ enum DataDecoder {
             return number.stringValue
         }
         if let text = value as? String { return text }
+        if let bytes = value as? Data {
+            switch leafKind(of: bytes) {
+            case .utf8Data: return String(data: bytes, encoding: .utf8) ?? ""
+            case .binaryData: return bytes.hexString
+            default: break
+            }
+        }
         return leafDisplay(value)
     }
 
     /// 用于只读全文的显示值
     private static func leafDisplay(_ value: Any) -> String {
+        if let wide = value as? WideInteger { return wide.decimalDescription }
         if let text = value as? String {
             return text == "$null" ? "null" : "\"\(text)\""
         }
@@ -653,10 +811,16 @@ enum DataDecoder {
             return number.stringValue
         }
         if let bytes = value as? Data {
-            if let text = String(data: bytes, encoding: .utf8), isPrintable(text) {
+            if let text = String(data: bytes, encoding: .utf8), !text.isEmpty, isPrintable(text) {
                 return "\"\(text)\"  (\(bytes.count) 字节)"
             }
-            return "<\(bytes.count) 字节二进制>"
+            // 这里是纯显示，不要求内层有可读字段：认出是 DER 也比甩一串十六进制强
+            if let inner = nestedPayload(in: bytes) {
+                return "\(bytes.count) 字节 · \(inner.formatName)\n\(inner.text)"
+            }
+            // 短的直接把十六进制摆出来，别让人还得回原始数据区自己数
+            if bytes.count <= 64 { return "\(bytes.hexString)  (\(bytes.count) 字节)" }
+            return "\(bytes.prefix(32).hexString)…  (\(bytes.count) 字节)"
         }
         if let date = value as? Date { return dateFormatter.string(from: date) }
         if value is NSNull { return "null" }
@@ -671,9 +835,15 @@ enum DataDecoder {
         }
     }
 
+    fileprivate static func parseDate(_ text: String) -> Date? {
+        dateFormatter.date(from: text)
+    }
+
     private static let dateFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        // 固定格式必须配 POSIX 区域，否则在非公历区域下格式化和解析会对不上
+        formatter.locale = Locale(identifier: "en_US_POSIX")
         return formatter
     }()
 }
@@ -692,40 +862,16 @@ extension DecodedPayload {
         }
         guard !changed.isEmpty else { throw DecodeEditError.noChanges }
 
+        guard let root = planRoot else { throw DecodeEditError.notEditable }
+        let updated = try apply(changed, edits: edits, to: root)
+
         let encoded: Data
-        switch plan {
-        case .binaryPlist(let root):
-            let updated = try apply(changed, edits: edits, to: root)
-            do {
-                encoded = try BinaryPlist.serialize(updated)
-            } catch {
-                throw DecodeEditError.encodingFailed(error.localizedDescription)
-            }
-
-        case .xmlPlist(let root):
-            let updated = try apply(changed, edits: edits, to: root)
-            do {
-                encoded = try PropertyListSerialization.data(fromPropertyList: updated,
-                                                             format: .xml,
-                                                             options: 0)
-            } catch {
-                throw DecodeEditError.encodingFailed(error.localizedDescription)
-            }
-
-        case .json(let root):
-            let updated = try apply(changed, edits: edits, to: root)
-            do {
-                encoded = try JSONSerialization.data(withJSONObject: updated,
-                                                     options: [.sortedKeys])
-            } catch {
-                throw DecodeEditError.encodingFailed(error.localizedDescription)
-            }
-
-        case .protobuf(let root):
-            guard let updated = try apply(changed, edits: edits, to: root) as? [Any] else {
-                throw DecodeEditError.encodingFailed("字段表结构损坏")
-            }
-            encoded = try Self.encodeProtobuf(updated)
+        do {
+            encoded = try encodeRoot(updated)
+        } catch let error as DecodeEditError {
+            throw error
+        } catch {
+            throw DecodeEditError.encodingFailed(error.localizedDescription)
         }
 
         try verify(encoded, changed: changed)
@@ -745,7 +891,10 @@ extension DecodedPayload {
                 "格式从「\(formatName)」变成了「\(reparsed.formatName)」")
         }
         let survivors = Set(reparsed.fields.map(\.id))
-        if let lost = changed.first(where: { !survivors.contains($0.id) }) {
+        // 空引用被填上之后，那处就不再是空引用了，它的 id 本来就会变，不能当成丢失
+        if let lost = changed.first(where: {
+            $0.kind != .nullReference && !survivors.contains($0.id)
+        }) {
             throw DecodeEditError.verificationFailed("字段「\(lost.label)」不见了")
         }
     }
@@ -758,7 +907,7 @@ extension DecodedPayload {
         return DataDecoder.decode(data)
     }
 
-    /// 原样重编码在实测的 22 条 protobuf 上字节完全一致，改字段后往返也全部通过，
+    /// 原样重编码在实测的 25 条 protobuf 上字节完全一致，改字段后往返也全部通过，
     /// 所以这里可以放心写回。
     fileprivate static func encodeProtobuf(_ fields: [Any]) throws -> Data {
         var out = Data()
@@ -792,8 +941,13 @@ extension DecodedPayload {
                 out.append(payload)
 
             case 1, 5:
-                guard let raw = field["v"] as? Data, raw.count == (wire == 1 ? 8 : 4) else {
-                    throw DecodeEditError.encodingFailed("字段 \(number) 定长内容损坏")
+                let expected = wire == 1 ? 8 : 4
+                guard let raw = field["v"] as? Data else {
+                    throw DecodeEditError.encodingFailed("字段 \(number) 内容无法编码")
+                }
+                guard raw.count == expected else {
+                    throw DecodeEditError.encodingFailed(
+                        "字段 \(number) 是定长 \(expected) 字节，填了 \(raw.count) 字节")
                 }
                 out.append(raw)
 
@@ -820,10 +974,51 @@ extension DecodedPayload {
         var result = root
         for field in changed {
             guard let text = edits[field.id] else { continue }
+
+            if field.kind == .nullReference {
+                result = try Self.fillNull(text, at: field.location, in: result, label: field.label)
+                continue
+            }
+
             let value = try Self.converted(text, to: field.kind, label: field.label)
             result = try Self.setValue(value, at: field.location, in: result, label: field.label)
         }
         return result
+    }
+
+    /// 填上一个空引用。
+    ///
+    /// 归档里所有空值共用 `$objects` 里同一个 `"$null"`，改那一格会把整份归档的空值
+    /// 一起改掉，所以只能新增一项再把这处引用指过去 —— 这要在**引用所在的那一层归档**上做。
+    /// 路径可能穿过嵌套负载，那就先解到最内层再动手，否则会把字符串直接写进内层归档的
+    /// 引用位上，把内层写坏。
+    fileprivate static func fillNull(_ text: String,
+                                     at path: FieldLocation,
+                                     in container: Any,
+                                     label: String) throws -> Any {
+        let boundary = path.lastIndex {
+            if case .into = $0 { return true }
+            return false
+        }
+
+        if let boundary {
+            // 先走到（含）那个 .into，拿到解开后的内层根，再在内层递归处理
+            return try mutate(at: Array(path[...boundary]), in: container, label: label) { inner in
+                try fillNull(text, at: Array(path[(boundary + 1)...]), in: inner, label: label)
+            }
+        }
+
+        guard var archive = container as? [AnyHashable: Any],
+              var objects = archive["$objects"] as? [Any],
+              archive["$archiver"] != nil else {
+            // JSON / 普通 plist 没有这层间接，直接把值写进去就行
+            return try setValue(text, at: path, in: container, label: label)
+        }
+
+        objects.append(text)
+        archive["$objects"] = objects
+        return try setValue(ArchiveUID(value: UInt64(objects.count - 1)),
+                            at: path, in: archive, label: label)
     }
 
     fileprivate static func converted(_ text: String,
@@ -834,10 +1029,11 @@ extension DecodedPayload {
         case .string:
             return text
         case .integer:
-            guard let value = Int(trimmed) else {
-                throw DecodeEditError.badNumber(label: label, expected: "整数")
-            }
-            return NSNumber(value: value)
+            // protobuf 的 varint 是 64 位无符号，能超过 Int64.max。
+            // 只用 Int 解析的话，这类值显示得出来却改不回去。
+            if let value = Int(trimmed) { return NSNumber(value: value) }
+            if let value = UInt64(trimmed) { return NSNumber(value: value) }
+            throw DecodeEditError.badNumber(label: label, expected: "整数")
         case .real:
             guard let value = Double(trimmed) else {
                 throw DecodeEditError.badNumber(label: label, expected: "小数")
@@ -849,7 +1045,28 @@ extension DecodedPayload {
             case "false", "0", "no": return NSNumber(value: false)
             default: throw DecodeEditError.badNumber(label: label, expected: "true 或 false")
             }
-        case .date, .data, .null:
+        case .utf8Data:
+            return Data(text.utf8)
+        case .binaryData:
+            guard let bytes = trimmed.hexData else {
+                throw DecodeEditError.badNumber(label: label,
+                                                expected: "十六进制（长度为偶数，只含 0-9 / a-f）")
+            }
+            return bytes
+        case .date:
+            guard let date = DataDecoder.parseDate(trimmed) else {
+                throw DecodeEditError.badNumber(label: label, expected: "yyyy-MM-dd HH:mm:ss 格式的时间")
+            }
+            return date
+        case .referenceDate:
+            guard let date = DataDecoder.parseDate(trimmed) else {
+                throw DecodeEditError.badNumber(label: label, expected: "yyyy-MM-dd HH:mm:ss 格式的时间")
+            }
+            return NSNumber(value: date.timeIntervalSinceReferenceDate)
+        case .nullReference:
+            // 归档要新增 $objects 项，在 apply 里另行处理；其余格式直接放字符串
+            return text
+        case .opaqueData:
             throw DecodeEditError.notEditable
         }
     }
@@ -858,7 +1075,16 @@ extension DecodedPayload {
                                      at path: FieldLocation,
                                      in container: Any,
                                      label: String) throws -> Any {
-        guard let head = path.first else { return newValue }
+        try mutate(at: path, in: container, label: label) { _ in newValue }
+    }
+
+    /// 沿路径走到底，把末端的值交给 `transform` 换成新的。
+    /// 单独抽出来是因为「填空引用」要拿到的不是叶子而是那一层的归档根。
+    fileprivate static func mutate(at path: FieldLocation,
+                                   in container: Any,
+                                   label: String,
+                                   using transform: (Any) throws -> Any) throws -> Any {
+        guard let head = path.first else { return try transform(container) }
         let rest = Array(path.dropFirst())
 
         switch head {
@@ -867,15 +1093,53 @@ extension DecodedPayload {
                   let child = dictionary[name] else {
                 throw DecodeEditError.pathBroken(label: label)
             }
-            dictionary[name] = try setValue(newValue, at: rest, in: child, label: label)
+            dictionary[name] = try mutate(at: rest, in: child, label: label, using: transform)
             return dictionary
 
         case .index(let offset):
             guard var array = container as? [Any], offset >= 0, offset < array.count else {
                 throw DecodeEditError.pathBroken(label: label)
             }
-            array[offset] = try setValue(newValue, at: rest, in: array[offset], label: label)
+            array[offset] = try mutate(at: rest, in: array[offset], label: label, using: transform)
             return array
+
+        case .into:
+            // 这一处的字节串本身是一份负载：解开、在里面改、再原样编码回去
+            guard let bytes = container as? Data,
+                  let inner = DataDecoder.nestedPayload(in: bytes),
+                  let innerRoot = inner.planRoot else {
+                throw DecodeEditError.pathBroken(label: label)
+            }
+            let updated = try mutate(at: rest, in: innerRoot, label: label, using: transform)
+            return try inner.encodeRoot(updated)
+        }
+    }
+
+    /// 内层负载的解析树和它的编码方式
+    fileprivate var planRoot: Any? {
+        switch plan {
+        case .binaryPlist(let root), .xmlPlist(let root), .json(let root): return root
+        case .protobuf(let root): return root
+        case nil: return nil
+        }
+    }
+
+    fileprivate func encodeRoot(_ updated: Any) throws -> Data {
+        switch plan {
+        case .binaryPlist:
+            return try BinaryPlist.serialize(updated)
+        case .xmlPlist:
+            return try PropertyListSerialization.data(fromPropertyList: updated,
+                                                      format: .xml, options: 0)
+        case .json:
+            return try JSONSerialization.data(withJSONObject: updated, options: [.sortedKeys])
+        case .protobuf:
+            guard let fields = updated as? [Any] else {
+                throw DecodeEditError.encodingFailed("字段表结构损坏")
+            }
+            return try Self.encodeProtobuf(fields)
+        case nil:
+            throw DecodeEditError.notEditable
         }
     }
 }

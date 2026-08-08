@@ -50,10 +50,8 @@ struct ProvisioningProfile {
         if !name.isEmpty { parts.append(name) }
         if !identifierPrefix.isEmpty { parts.append("Team \(identifierPrefix)") }
         if let expirationDate {
-            let formatter = DateFormatter()
-            formatter.dateFormat = "yyyy-MM-dd"
             let expired = expirationDate < Date() ? "已过期 " : "有效至 "
-            parts.append(expired + formatter.string(from: expirationDate))
+            parts.append(expired + ProvisioningProfileParser.dayFormatter.string(from: expirationDate))
         }
         return parts.joined(separator: " · ")
     }
@@ -73,6 +71,15 @@ struct ProvisioningProfile {
 // MARK: - 描述文件解析器
 
 enum ProvisioningProfileParser {
+
+    /// 固定格式串必须配 POSIX 区域，否则设备用非公历日历时年份会显示成别的纪年。
+    /// 同时避免每次取 summary 都新建一个 DateFormatter（构造并不便宜）。
+    static let dayFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        return formatter
+    }()
 
     /// 解析应用内嵌的 embedded.mobileprovision
     static func parse() -> ProvisioningProfile? {
