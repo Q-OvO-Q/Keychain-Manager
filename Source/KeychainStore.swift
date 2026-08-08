@@ -242,11 +242,6 @@ enum KeychainStore {
             if let text = KeychainItem.stringValue(value), !text.isEmpty {
                 parts.append(text)
             }
-            // 详情页把 pdmn / kcls / type 显示成「首次解锁后可访问」「私钥」「RSA」，
-            // 索引里却只有 ak / 1 / 42 —— 看得到又搜不到。把翻译后的写法也收进来
-            let formatted = KeychainAttributeFormatter.value(value, forKey: key,
-                                                             itemClass: item.itemClass)
-            if !formatted.isEmpty { parts.append(formatted) }
         }
 
         if item.isDataReadable, let data = item.data {
@@ -447,11 +442,6 @@ enum KeychainStore {
         //    所以动手前先数一遍：只要可能命中不止一条就不删，宁可报失败。
         //    这不是假想 —— 一对密钥的公私钥共用同一个 klbl（公钥的 SHA-1）和 atag，
         //    只差 kcls，实测导出里就有这么一对。
-        //
-        //    受保护条目数不出来（跳过验证后返回 errSecInteractionNotAllowed），
-        //    于是这一步对它们一律不执行。这是有意的，别改回去：数不出来就等于
-        //    无法确认「只命中一条」，而删除不可逆。真要删这类条目，走前两步 ——
-        //    持久引用和完整主键都不需要解密，正常情况下第 1 步就成了。
         if let minimal = item.minimalPrimaryKeyQuery, matchCount(for: minimal) <= 1 {
             let byMinimal = SecItemDelete(minimal as CFDictionary)
             if byMinimal == errSecSuccess { return errSecSuccess }
@@ -758,7 +748,7 @@ enum KeychainStore {
             if status == errSecSuccess { return errSecSuccess }
         }
 
-        return updateByPrimaryKey(item, changes)
+        return SecItemUpdate(item.primaryKeyQuery as CFDictionary, changes as CFDictionary)
     }
 
     static func updateData(_ item: KeychainItem, to data: Data) -> OSStatus {
@@ -773,21 +763,7 @@ enum KeychainStore {
             if status == errSecSuccess { return errSecSuccess }
         }
 
-        return updateByPrimaryKey(item, attributes)
-    }
-
-    /// 持久引用那条路走不通时的回退。
-    ///
-    /// `primaryKeyQuery` 是拿「系统回传了哪些主键属性」拼的，缺一项查询就少一个约束 ——
-    /// 实测 1068 条通用密码没有 gena，它们的查询里就没有这条约束，因而也会匹配上
-    /// **有** gena 的兄弟条目。而 `SecItemUpdate` 改的是全部命中项。
-    ///
-    /// 那 1068 条目前一条都不会命中多条，所以这是潜伏问题；但和导入覆盖那处是同一个
-    /// 形状，后果是悄悄改掉别人的密码，所以照同一套办法先数再改。
-    private static func updateByPrimaryKey(_ item: KeychainItem,
-                                           _ changes: [String: Any]) -> OSStatus {
-        guard matchCount(for: item.primaryKeyQuery) <= 1 else { return errSecParam }
-        return SecItemUpdate(item.primaryKeyQuery as CFDictionary, changes as CFDictionary)
+        return SecItemUpdate(item.primaryKeyQuery as CFDictionary, attributes as CFDictionary)
     }
 
     // MARK: - 新增
