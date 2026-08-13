@@ -601,7 +601,10 @@ struct ScopeSettingsView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button("取消") { dismiss() }
+                    // 不叫「取消」：这一页的开关直接绑在 viewModel 上，拨一下就已经存进
+                    // UserDefaults 了，撤不回来。这个按钮只是「不立刻重查就退出」，
+                    // 叫取消等于骗人 —— 设置照样会在下一次刷新时生效
+                    Button("关闭") { dismiss() }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button("查询") {

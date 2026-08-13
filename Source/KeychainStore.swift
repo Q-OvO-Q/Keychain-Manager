@@ -182,36 +182,14 @@ enum KeychainStore {
         // 兜底扫描和逐组枚举必然大量重叠（同一条目两趟都会命中），按持久引用去重
         rows = deduplicate(rows)
 
-        var items: [KeychainItem] = []
-        items.reserveCapacity(rows.count)
-
-        for (index, row) in rows.enumerated() {
-            var item = KeychainItem(itemClass: row.0, attributes: row.1, fallbackIndex: index)
-            if loadData {
-                if index % 25 == 0 {
-                    progress?("正在读取数据 \(index)/\(rows.count)…")
-                }
-                let outcome = copyData(for: item)
-                item.data = outcome.data
-
-                // `kSecUseAuthenticationUISkip` 对需要验证的条目是**静默跳过**，
-                // 取数据因此返回 errSecItemNotFound（找不到）而不是 errSecInteractionNotAllowed。
-                // 但条目刚刚才枚举出来，不可能不存在 —— 照原样上报会让界面显示
-                // 「读取失败 / 未找到匹配条目」，而且「解锁读取」按钮的出现条件是
-                // errSecInteractionNotAllowed，于是这些条目彻底没法解锁。
-                // 这里翻译成语义正确的状态。
-                if outcome.status == errSecItemNotFound {
-                    item.dataStatus = errSecInteractionNotAllowed
-                } else {
-                    item.dataStatus = outcome.status
-                }
-            }
-
-            item.searchIndex = makeSearchIndex(for: item)
-            items.append(item)
+        var items: [KeychainItem] = rows.map {
+            KeychainItem(itemClass: $0.0, attributes: $0.1)
         }
 
-        // 固定排序：让列表稳定，同时保证无持久引用时的回退 id 也稳定
+        // 排序必须排在编 id 之前：无持久引用时的回退 id 是按位置编的，而枚举顺序
+        // 不受控 —— 组的先后取决于这次发现了哪些组，去重结果取决于哪一趟先命中。
+        // 照枚举顺序编，同一批条目两次刷新就可能拿到不同的 id，
+        // 选中状态和已打开的详情页会在刷新后失联。排序是确定的，排完再编才稳。
         items.sort { lhs, rhs in
             if lhs.itemClass != rhs.itemClass {
                 return classOrder(lhs.itemClass) < classOrder(rhs.itemClass)
@@ -221,6 +199,32 @@ enum KeychainStore {
                 return titleComparison == .orderedAscending
             }
             return lhs.account.localizedCaseInsensitiveCompare(rhs.account) == .orderedAscending
+        }
+
+        for index in items.indices {
+            items[index].assignFallbackIdentity(index: index)
+
+            if loadData {
+                if index % 25 == 0 {
+                    progress?("正在读取数据 \(index)/\(items.count)…")
+                }
+                let outcome = copyData(for: items[index])
+                items[index].data = outcome.data
+
+                // `kSecUseAuthenticationUISkip` 对需要验证的条目是**静默跳过**，
+                // 取数据因此返回 errSecItemNotFound（找不到）而不是 errSecInteractionNotAllowed。
+                // 但条目刚刚才枚举出来，不可能不存在 —— 照原样上报会让界面显示
+                // 「读取失败 / 未找到匹配条目」，而且「解锁读取」按钮的出现条件是
+                // errSecInteractionNotAllowed，于是这些条目彻底没法解锁。
+                // 这里翻译成语义正确的状态。
+                if outcome.status == errSecItemNotFound {
+                    items[index].dataStatus = errSecInteractionNotAllowed
+                } else {
+                    items[index].dataStatus = outcome.status
+                }
+            }
+
+            items[index].searchIndex = makeSearchIndex(for: items[index])
         }
 
         result.items = items
@@ -775,8 +779,11 @@ enum KeychainStore {
         }
 
         var reloaded = KeychainItem(itemClass: item.itemClass,
-                                    attributes: attributes,
-                                    fallbackIndex: 0)
+                                    attributes: attributes)
+        // 无持久引用时 id 是按列表位置编的，这里拿不到那个位置。
+        // 不接着用原来那个，改完元数据的条目就换了身份：详情页当场变成
+        // 「条目已不存在」，选中状态也一起丢
+        reloaded.inheritIdentity(from: item)
         reloaded.data = item.data
         reloaded.dataStatus = item.dataStatus
         reloaded.searchIndex = makeSearchIndex(for: reloaded)

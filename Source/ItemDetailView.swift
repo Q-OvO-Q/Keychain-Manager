@@ -38,6 +38,12 @@ struct ItemDetailView: View {
     @State private var decoded: DecodedPayload?
     /// 解析视图里被改过的字段，key 是 DecodedField.id
     @State private var decodedEdits: [String: String] = [:]
+    /// 属性值本身解析出来的结构，key 是属性名。
+    ///
+    /// 必须缓存：这一节要为每个二进制属性跑一遍 `DataDecoder.decode`，而它是在 body 里
+    /// 算的 —— 数据框里每敲一个字、每拨一个开关都会重算一遍。实测 gena 里有 3234 字节的
+    /// 归档，那就是每帧解一次引用图。数据区的解析结果早就为此单独存了状态，这里照做。
+    @State private var decodedAttributes: [String: DecodedPayload] = [:]
     /// 解析区自己的保存提示。放在数据区的 saveNotice 里用户看不到——
     /// 按钮在这一段，提示却在上面那一段
     @State private var decodedNotice: String?
@@ -638,6 +644,10 @@ struct ItemDetailView: View {
             editedAttributes.removeAll()
             // 草稿留着就会盖住刚写回来的真实值
             fourCharDrafts.removeAll()
+            // 保存会连带回读整条属性，解析缓存要跟着重算
+            if let updated = viewModel.item(withID: itemID) {
+                refreshDecodedAttributes(updated)
+            }
             saveNotice = "元数据已更新"
         }
     }
@@ -658,7 +668,7 @@ struct ItemDetailView: View {
                 if let value = item.rawAttributes[key] {
                     // 属性值本身也可能是结构化的：实测 gena 里就有一条 3234 字节的
                     // bplist，按十六进制显示就是 6468 个字符，等于没显示
-                    if let payload = decodedAttribute(value) {
+                    if let payload = decodedAttributes[key] {
                         NavigationLink {
                             DecodedStructurePage(payload: payload)
                         } label: {
@@ -736,6 +746,17 @@ struct ItemDetailView: View {
         return DataDecoder.decode(data)
     }
 
+    /// 重算属性解析缓存。属性变了才需要跑：进页面时、以及元数据保存回读之后。
+    /// 能解出结构的那几个（gena / alis / accc）都不在可编辑之列，
+    /// 所以别处的刷新不会让这份缓存过期。
+    private func refreshDecodedAttributes(_ item: KeychainItem) {
+        var result: [String: DecodedPayload] = [:]
+        for (key, value) in item.rawAttributes {
+            if let payload = decodedAttribute(value) { result[key] = payload }
+        }
+        decodedAttributes = result
+    }
+
     // MARK: 删除
 
     private func deleteSection(_ item: KeychainItem) -> some View {
@@ -753,6 +774,7 @@ struct ItemDetailView: View {
         didLoad = true
 
         tagValue = item.appTag
+        refreshDecodedAttributes(item)
         loadContent(from: item)
     }
 

@@ -151,7 +151,10 @@ enum KeychainExport {
                         failure = failure ?? "「\(key)」\(reason)"
                     }
                 }
-                guard !attributes.isEmpty else { continue }
+                // 一条属性都没解出来的：本来就是空对象就跳过，
+                // 但要是每个值都坏了，得让它进列表由导入端如实报告 ——
+                // 直接丢掉的话，用户看到的是「这几条根本不在文件里」
+                guard !attributes.isEmpty || failure != nil else { continue }
                 items.append(ParsedItem(itemClass: itemClass,
                                         attributes: attributes,
                                         decodeFailure: failure))

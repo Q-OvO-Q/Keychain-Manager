@@ -371,7 +371,9 @@ final class KeychainViewModel: ObservableObject {
 
         enumerationFailures = result.classErrors.map(\.description)
 
-        var parts = ["共 \(result.items.count) 条"]
+        // 数的是**列表里实际有的**那些：查询期间被删掉的已经从快照里扣掉了，
+        // 报快照的条数会比眼前的列表多出几条
+        var parts = ["共 \(items.count) 条"]
         if unreadableCount > 0 {
             parts.append("\(unreadableCount) 条受保护/不可读")
         }
@@ -779,8 +781,11 @@ final class KeychainViewModel: ObservableObject {
         }
     }
 
+    /// 并进去而不是整个换掉：换掉会把筛选之外那些已选中的条目悄悄取消 ——
+    /// 而「选中但看不见」正是本文件别处专门提醒用户注意的东西，
+    /// 不能一边警告它、一边在这里默默把它丢了。要清空有「全不选」。
     func selectAllVisible() {
-        selectedIDs = Set(filteredItems.map(\.id))
+        selectedIDs.formUnion(filteredItems.map(\.id))
     }
 
     func clearSelection() {

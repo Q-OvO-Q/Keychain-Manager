@@ -139,8 +139,11 @@ enum KeychainItemClass: String, CaseIterable, Identifiable {
 // MARK: - 条目模型
 
 struct KeychainItem: Identifiable {
-    /// SwiftUI 身份标识。优先取自持久引用，因此跨刷新保持稳定（选中状态、导航不会错乱）
-    let id: String
+    /// SwiftUI 身份标识。优先取自持久引用，因此跨刷新保持稳定（选中状态、导航不会错乱）。
+    ///
+    /// 没有持久引用时只能靠「第几条」凑一个，那就必须由列表自己在排好序之后指定 ——
+    /// 见 `assignFallbackIdentity(index:)` 与 `inheritIdentity(from:)`
+    private(set) var id: String
 
     let itemClass: KeychainItemClass
 
@@ -197,7 +200,10 @@ struct KeychainItem: Identifiable {
 
     // MARK: 初始化
 
-    init(itemClass: KeychainItemClass, attributes: [String: Any], fallbackIndex: Int) {
+    /// 无持久引用时这里给出的 id 只是暂定的：同一个 tagKey 下的几条会撞在一起。
+    /// 调用方必须紧接着定下它 —— 列表用 `assignFallbackIdentity(index:)`（排序之后），
+    /// 就地重读单条用 `inheritIdentity(from:)`。
+    init(itemClass: KeychainItemClass, attributes: [String: Any]) {
         self.itemClass = itemClass
         self.rawAttributes = attributes
 
@@ -261,8 +267,30 @@ struct KeychainItem: Identifiable {
         if let ref = persistentRef {
             self.id = "ref:" + ref.base64EncodedString()
         } else {
-            self.id = "key:\(tagKey)#\(fallbackIndex)"
+            self.id = "key:\(tagKey)"
         }
+    }
+
+    // MARK: 回退身份
+
+    /// 按最终列表位置定下回退 id。
+    ///
+    /// 位置只能取**排好序之后**的那个。枚举顺序不受控：组的先后取决于这次发现了
+    /// 哪些组，去重结果又取决于哪一趟先命中，同一批条目两次刷新可能排出不同的次序 ——
+    /// 照那个顺序编，id 会跟着变，选中状态和已打开的详情页在刷新后全部失联。
+    mutating func assignFallbackIdentity(index: Int) {
+        guard persistentRef == nil else { return }
+        id = "key:\(tagKey)#\(index)"
+    }
+
+    /// 沿用另一份快照的 id。
+    ///
+    /// 就地重读单条时用：那时拿不到「第几条」，凭空按 0 编一个的话，
+    /// 一条排在第 37 位的条目改完元数据就换了身份 —— 详情页当场显示「条目已不存在」，
+    /// 选中状态也一并丢掉。
+    mutating func inheritIdentity(from other: KeychainItem) {
+        guard persistentRef == nil else { return }
+        id = other.id
     }
 
     /// 与历史版本一致的标签键格式，升级后已有标签继续生效
