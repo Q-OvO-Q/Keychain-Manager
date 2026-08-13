@@ -68,7 +68,13 @@ fileprivate enum PathComponent {
     /// 带上类型前缀，键名 "5" 和下标 5、键名 "→" 和 .into 就不会撞。
     var token: String {
         switch self {
-        case .key(let name): return "k\(name)"
+        // 键名里可以有 "/"，而 id 是拿 "/" 把 token 拼起来的：
+        // 键 "a/kb" 和路径 a→b 会拼出同一个 id，两个字段共用一份编辑值，
+        // 改一处会同时写到另一处、覆盖掉不相干的内容。转义掉再拼。
+        case .key(let name):
+            return "k" + name
+                .replacingOccurrences(of: "%", with: "%25")
+                .replacingOccurrences(of: "/", with: "%2F")
         case .index(let offset): return "i\(offset)"
         case .into: return "→"
         }
@@ -279,6 +285,12 @@ enum DataDecoder {
                 }
                 return "null"
             }
+
+            // 引用链本身也要封顶。这一跳不增加 indent（渲染缩进不该因为多绕一层引用而变），
+            // 于是 maxDepth 管不到它 —— visiting 只挡环，挡不住 UID→UID→UID… 这种
+            // 无环长链：手工构造一条 3000 跳的链就能在打开详情页时把主线程栈打爆。
+            // visiting 恰好就是当前这条链上的祖先集合，拿它的大小当跳数用。
+            guard visiting.count < 256 else { return "<引用链过深>" }
 
             // 被引用的对象就存在 $objects[index]，路径从这里重新起算
             return resolve(objects[index], objects: objects, label: label,
@@ -980,7 +992,10 @@ extension DecodedPayload {
                 continue
             }
 
-            let value = try Self.converted(text, to: field.kind, label: field.label)
+            var wideUnsigned = false
+            if case .protobuf = plan { wideUnsigned = true }
+            let value = try Self.converted(text, to: field.kind, label: field.label,
+                                           allowsWideUnsigned: wideUnsigned)
             result = try Self.setValue(value, at: field.location, in: result, label: field.label)
         }
         return result
@@ -1021,18 +1036,24 @@ extension DecodedPayload {
                             at: path, in: archive, label: label)
     }
 
+    /// `allowsWideUnsigned` 只有 protobuf 该给 true：它的 varint 是 64 位无符号。
+    /// binary plist 的整数编码是有符号的，把超过 Int64.max 的值塞进去会以补码存成负数。
     fileprivate static func converted(_ text: String,
                                       to kind: DecodedField.Kind,
-                                      label: String) throws -> Any {
+                                      label: String,
+                                      allowsWideUnsigned: Bool = false) throws -> Any {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         switch kind {
         case .string:
             return text
         case .integer:
-            // protobuf 的 varint 是 64 位无符号，能超过 Int64.max。
-            // 只用 Int 解析的话，这类值显示得出来却改不回去。
             if let value = Int(trimmed) { return NSNumber(value: value) }
-            if let value = UInt64(trimmed) { return NSNumber(value: value) }
+            // 超过 Int64.max 的无符号值只有 protobuf 的 varint 装得下。
+            // binary plist 的整数编码是有符号的，塞进去会以补码变成负数存下来，
+            // 而自检只比对字段 id、发现不了值被改写，所以这里直接拒绝。
+            if allowsWideUnsigned, let value = UInt64(trimmed) {
+                return NSNumber(value: value)
+            }
             throw DecodeEditError.badNumber(label: label, expected: "整数")
         case .real:
             guard let value = Double(trimmed) else {
@@ -1104,9 +1125,16 @@ extension DecodedPayload {
             return array
 
         case .into:
-            // 这一处的字节串本身是一份负载：解开、在里面改、再原样编码回去
-            guard let bytes = container as? Data,
-                  let inner = DataDecoder.nestedPayload(in: bytes),
+            // 这一处的字节串本身是一份负载：解开、在里面改、再原样编码回去。
+            //
+            // 走不通时再按 protobuf 试一次：nestedPayload 里那道「先排除合法 UTF-8」
+            // 是给**发现**用的，而这里格式早就定了。改完的内层字节一旦恰好成了合法
+            // UTF-8，发现流程就不再认它是 protobuf，于是一次本来合法的保存永远失败。
+            guard let bytes = container as? Data else {
+                throw DecodeEditError.pathBroken(label: label)
+            }
+            guard let inner = DataDecoder.nestedPayload(in: bytes)
+                    ?? DataDecoder.decodeProtobuf(bytes, skippingTextGate: true),
                   let innerRoot = inner.planRoot else {
                 throw DecodeEditError.pathBroken(label: label)
             }

@@ -242,6 +242,11 @@ enum KeychainStore {
             if let text = KeychainItem.stringValue(value), !text.isEmpty {
                 parts.append(text)
             }
+            // 详情页把 pdmn / kcls / type 显示成「首次解锁后可访问」「私钥」「RSA」，
+            // 索引里却只有 ak / 1 / 42 —— 看得到又搜不到。把翻译后的写法也收进来
+            let formatted = KeychainAttributeFormatter.value(value, forKey: key,
+                                                             itemClass: item.itemClass)
+            if !formatted.isEmpty { parts.append(formatted) }
         }
 
         if item.isDataReadable, let data = item.data {
@@ -373,6 +378,10 @@ enum KeychainStore {
             }
         }
 
+        // 主键缺项时这条查询会匹配上兄弟条目，而 kSecMatchLimitOne 会随便挑一条回来 ——
+        // 那就是把**别人的密码**当成这条的内容显示、索引、导出。宁可报读不出来。
+        guard isSafeToMutate(item) else { return (nil, referenceStatus) }
+
         var query = item.primaryKeyQuery
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -431,10 +440,16 @@ enum KeychainStore {
             if lastStatus == errSecSuccess { return errSecSuccess }
         }
 
-        // 2. 完整主键
-        let byPrimaryKey = SecItemDelete(item.primaryKeyQuery as CFDictionary)
-        if byPrimaryKey == errSecSuccess { return errSecSuccess }
-        if byPrimaryKey != errSecItemNotFound { lastStatus = byPrimaryKey }
+        // 2. 完整主键 —— 但「完整」是有条件的：系统只回传有值的键，缺一项这条查询
+        //    就少一个约束，而 SecItemDelete 删的是全部命中项。实测 1068 条通用密码
+        //    没有 gena，它们的查询也会匹配上有 gena 的兄弟条目。齐全才直接删。
+        if isSafeToMutate(item) {
+            let byPrimaryKey = SecItemDelete(item.primaryKeyQuery as CFDictionary)
+            if byPrimaryKey == errSecSuccess { return errSecSuccess }
+            if byPrimaryKey != errSecItemNotFound { lastStatus = byPrimaryKey }
+        } else {
+            lastStatus = errSecParam
+        }
 
         // 3. 退化主键，应对系统回传属性类型异常导致 errSecParam 的情况。
         //
@@ -442,6 +457,11 @@ enum KeychainStore {
         //    所以动手前先数一遍：只要可能命中不止一条就不删，宁可报失败。
         //    这不是假想 —— 一对密钥的公私钥共用同一个 klbl（公钥的 SHA-1）和 atag，
         //    只差 kcls，实测导出里就有这么一对。
+        //
+        //    受保护条目数不出来（跳过验证后返回 errSecInteractionNotAllowed），
+        //    于是这一步对它们一律不执行。这是有意的，别改回去：数不出来就等于
+        //    无法确认「只命中一条」，而删除不可逆。真要删这类条目，走前两步 ——
+        //    持久引用和完整主键都不需要解密，正常情况下第 1 步就成了。
         if let minimal = item.minimalPrimaryKeyQuery, matchCount(for: minimal) <= 1 {
             let byMinimal = SecItemDelete(minimal as CFDictionary)
             if byMinimal == errSecSuccess { return errSecSuccess }
@@ -455,12 +475,16 @@ enum KeychainStore {
     }
 
     /// 该查询会命中多少条。数不清时返回 `Int.max`，让调用方按「可能很多」处理。
+    ///
+    /// 用 `Fail` 而不是 `Skip`：`Skip` 会把需要验证的条目**静默剔除**，数出来的是
+    /// 「我这次能看见几条」，而不是「SecItemDelete / SecItemUpdate 实际会改到几条」——
+    /// 那样护栏会放行一个其实命中多条的查询，正好把它要防的事放过去。
+    /// `Fail` 只要有任一命中项需要验证就整体报错，恰好等于「数不清」。两者都不会弹框。
     private static func matchCount(for query: [String: Any]) -> Int {
         var counting = query
         counting[kSecMatchLimit as String] = kSecMatchLimitAll
         counting[kSecReturnPersistentRef as String] = true
-        // 同 exists()：绝不因为一次「数数」把验证框弹出来
-        counting[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+        counting[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
 
         var output: AnyObject?
         let status = SecItemCopyMatching(counting as CFDictionary, &output)
@@ -468,6 +492,14 @@ enum KeychainStore {
         guard status == errSecSuccess else { return .max }
         if let rows = output as? [Any] { return rows.count }
         return output == nil ? 0 : 1
+    }
+
+    /// 这条查询动手前需不需要先数一遍。
+    ///
+    /// 主键齐全时它是精确的（实测四个类别的主键组合都唯一），直接动手；
+    /// 缺了任何一项就少一个约束，必须确认只命中一条 —— 数不清也算不通过。
+    private static func isSafeToMutate(_ item: KeychainItem) -> Bool {
+        item.hasCompletePrimaryKey || matchCount(for: item.primaryKeyQuery) <= 1
     }
 
     /// 条目是否仍然存在。无法判定时一律按「还在」处理，绝不谎报删除成功。
@@ -712,21 +744,35 @@ enum KeychainStore {
     /// 改完元数据后用它就地刷新，不必为一次改动重跑整轮逐组查询。
     /// 保留原有的数据与读取状态 —— 这次改的是属性，数据没动。
     static func reload(_ item: KeychainItem) -> KeychainItem? {
-        guard let ref = item.persistentRef else { return nil }
+        // 一律跳过验证：这里只是回读属性，不该为此弹验证框
+        func fetch(_ base: [String: Any]) -> [String: Any]? {
+            var query = base
+            query[kSecReturnAttributes as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
 
-        let query: [String: Any] = [
-            kSecValuePersistentRef as String: ref,
-            kSecReturnAttributes as String: true
-        ]
-
-        var output: AnyObject?
-        guard SecItemCopyMatching(query as CFDictionary, &output) == errSecSuccess,
-              var attributes = output as? [String: Any] else {
-            return nil
+            var output: AnyObject?
+            guard SecItemCopyMatching(query as CFDictionary, &output) == errSecSuccess else {
+                return nil
+            }
+            return output as? [String: Any]
         }
 
+        // 没有持久引用（或引用已失效）时退回主键查询：写入本身是靠
+        // updateByPrimaryKey 成功的，回读却只认引用的话，界面会把刚保存的值弹回旧值
+        var attributes: [String: Any]?
+        if let ref = item.persistentRef {
+            attributes = fetch([kSecValuePersistentRef as String: ref])
+        }
+        if attributes == nil, isSafeToMutate(item) {
+            attributes = fetch(item.primaryKeyQuery)
+        }
+        guard var attributes else { return nil }
+
         // 按引用查询不一定回传 v_PersistentRef，补回去，id 才能保持不变
-        attributes[kSecValuePersistentRef as String] = ref
+        if let ref = item.persistentRef {
+            attributes[kSecValuePersistentRef as String] = ref
+        }
 
         var reloaded = KeychainItem(itemClass: item.itemClass,
                                     attributes: attributes,
@@ -748,7 +794,7 @@ enum KeychainStore {
             if status == errSecSuccess { return errSecSuccess }
         }
 
-        return SecItemUpdate(item.primaryKeyQuery as CFDictionary, changes as CFDictionary)
+        return updateByPrimaryKey(item, changes)
     }
 
     static func updateData(_ item: KeychainItem, to data: Data) -> OSStatus {
@@ -763,7 +809,21 @@ enum KeychainStore {
             if status == errSecSuccess { return errSecSuccess }
         }
 
-        return SecItemUpdate(item.primaryKeyQuery as CFDictionary, attributes as CFDictionary)
+        return updateByPrimaryKey(item, attributes)
+    }
+
+    /// 持久引用那条路走不通时的回退。
+    ///
+    /// `primaryKeyQuery` 是拿「系统回传了哪些主键属性」拼的，缺一项查询就少一个约束 ——
+    /// 实测 1068 条通用密码没有 gena，它们的查询里就没有这条约束，因而也会匹配上
+    /// **有** gena 的兄弟条目。而 `SecItemUpdate` 改的是全部命中项。
+    ///
+    /// 那 1068 条目前一条都不会命中多条，所以这是潜伏问题；但和导入覆盖那处是同一个
+    /// 形状，后果是悄悄改掉别人的密码，所以照同一套办法先数再改。
+    private static func updateByPrimaryKey(_ item: KeychainItem,
+                                           _ changes: [String: Any]) -> OSStatus {
+        guard isSafeToMutate(item) else { return errSecParam }
+        return SecItemUpdate(item.primaryKeyQuery as CFDictionary, changes as CFDictionary)
     }
 
     // MARK: - 新增
@@ -976,10 +1036,14 @@ enum KeychainStore {
     /// 白名单由已有定义推导（主键属性 + 可编辑属性 + 数据），不另立一套，
     /// 以后增删类别或调整主键定义时会自动跟上。
     private static func settableAttributes(for itemClass: KeychainItemClass) -> Set<String> {
-        // 证书的身份全部来自 DER，除标签和保护级别外一概不能手给
+        // 证书的身份全部来自 DER，除标签和保护级别外一概不能手给。
+        // 但 v_Data 必须留着：下面的导入逻辑要拿这份 DER 重建 SecCertificate，
+        // 白名单把它滤掉的话，每一张证书都会以「不是合法的 DER 证书」失败 ——
+        // 而那行代码就写在过滤的下一行。
         if itemClass == .certificate {
             return [kSecAttrLabel, kSecAttrAccessible,
-                    kSecAttrAccessGroup, kSecAttrSynchronizable].map { $0 as String }
+                    kSecAttrAccessGroup, kSecAttrSynchronizable, kSecValueData]
+                .map { $0 as String }
                 .reduce(into: Set<String>()) { $0.insert($1) }
         }
 
@@ -1052,6 +1116,8 @@ enum KeychainStore {
                 attributes[kSecValueRef as String] = certificate
             }
 
+            let carriedBestEffort = attributes.keys.contains { bestEffortAttributes.contains($0) }
+
             // 一旦确认系统不收，后面的就别再白试一次了 ——
             // 否则整批每条都要发两次 SecItemAdd
             if bestEffortRejected {
@@ -1070,7 +1136,10 @@ enum KeychainStore {
                     bestEffortRejected = true
                     outcome.degraded += 1
                 }
-            } else if bestEffortRejected {
+            } else if bestEffortRejected, status == errSecSuccess, carriedBestEffort {
+                // 只算「本来带着这些属性、并且确实写进去了」的那些。
+                // 不加这两个条件的话，一旦确认系统拒收，后面每一条都会被计入 ——
+                // 包括本来就没有这些属性的，和干脆失败了的。
                 outcome.degraded += 1
             }
 

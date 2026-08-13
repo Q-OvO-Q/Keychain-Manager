@@ -41,6 +41,8 @@ struct ItemDetailView: View {
     /// 解析区自己的保存提示。放在数据区的 saveNotice 里用户看不到——
     /// 按钮在这一段，提示却在上面那一段
     @State private var decodedNotice: String?
+    /// 正在切换文本 / 十六进制显示模式。字节没变，解析区的未保存修改不该因此作废
+    @State private var isSwitchingMode = false
 
     private var item: KeychainItem? { viewModel.item(withID: itemID) }
 
@@ -308,7 +310,11 @@ struct ItemDetailView: View {
                     // 同一行里有两个按钮，样式必须显式指定，
                     // 否则整行点击都会触发其中一个
                     .buttonStyle(.borderless)
-                    .disabled(!item.itemClass.supportsDataEditing || !item.canBeTargeted)
+                    // 数据没读出来时编辑框里是空串（loadContent 的失败分支），
+                    // 按钮再亮着就等于给了一个「把密码清成 0 字节」的一键操作
+                    .disabled(!item.itemClass.supportsDataEditing
+                              || !item.canBeTargeted
+                              || !item.isDataReadable)
 
                 // 保存提示也收进同一行：单独成行的话，它和按钮之间那条
                 // 系统分割线又会被盖住（和标签区当初一模一样的问题）
@@ -357,6 +363,9 @@ struct ItemDetailView: View {
                     content = text
                 }
 
+                // 这只是换个显示方式，字节没变。不打招呼的话 content 一变就会触发
+                // refreshDecoded，把解析区里还没保存的字段修改当成「原始数据被改了」清掉
+                isSwitchingMode = true
                 conversionWarning = nil
                 isHexMode = newValue
             }
@@ -772,6 +781,15 @@ struct ItemDetailView: View {
 
     /// 用户在原始数据区改过之后，解析结果就对不上了，得跟着重算
     private func refreshDecoded() {
+        if isSwitchingMode {
+            // 只是换了显示方式，字节没变：解析结果一样，编辑也仍然有效
+            isSwitchingMode = false
+            return
+        }
+
+        // 数据一改，上一条「已写入」就不再是当前状态了
+        saveNotice = nil
+
         // 原始数据一变，解析区那些还没保存的修改就作废了。默默清掉的话
         // 用户会以为改动还在，回头点保存才发现什么都没了
         if !decodedEdits.isEmpty {

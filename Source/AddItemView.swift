@@ -80,13 +80,23 @@ struct AddItemView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("类别") {
+                Section {
                     Picker("类别", selection: $itemClass) {
                         ForEach(KeychainItemClass.allCases) { itemClass in
                             Text(itemClass.displayName).tag(itemClass)
                         }
                     }
                     .pickerStyle(.segmented)
+                } header: {
+                    Text("类别")
+                } footer: {
+                    // 建到一个没在查询设置里勾选的类别里，条目是真写进去了，
+                    // 但刷新回来看不见 —— 连带着标签也没处可打
+                    if !viewModel.enabledClasses.contains(itemClass) {
+                        Text("当前查询设置没有勾选\(itemClass.displayName)，建好后不会出现在列表里，"
+                             + "标签也无法自动应用。保存时会一并放开这一类。")
+                            .foregroundStyle(.orange)
+                    }
                 }
 
                 identitySection
@@ -457,6 +467,12 @@ struct AddItemView: View {
         newItem.canUnwrap = canUnwrap
         newItem.isInvisible = isInvisible
         newItem.isNegative = isNegative
+
+        // 建到没勾选的类别里，条目写进去了却看不见。与其让它「消失」，
+        // 不如把这一类一并放开 —— 用户刚刚才明确要建它
+        if !viewModel.enabledClasses.contains(itemClass) {
+            viewModel.enabledClasses.insert(itemClass)
+        }
 
         if viewModel.add(newItem, tag: tagValue) {
             dismiss()

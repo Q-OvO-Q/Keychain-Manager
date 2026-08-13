@@ -74,6 +74,13 @@ final class KeychainViewModel: ObservableObject {
     /// 弹验证的到底是哪个组，只能靠它定位 —— 状态栏放不下，界面上可点开查看全部。
     @Published private(set) var enumerationFailures: [String] = []
 
+    /// 查询进行中被挡下的刷新请求，等这趟结束再补跑
+    private var pendingRefresh = false
+
+    /// 查询进行中被删掉的条目 id。那份查询快照是删除之前拍的，
+    /// 直接盖上去会让已删条目在列表里复活
+    private var deletedDuringFetch: Set<String> = []
+
     // MARK: - 筛选与选择
 
     @Published var searchText = ""
@@ -289,7 +296,9 @@ final class KeychainViewModel: ObservableObject {
     // MARK: - 查询
 
     func refresh() {
-        guard !isLoading else { return }
+        // 查询在跑时不能再开一趟，但也不能就这么把请求扔掉 ——
+        // finishImport / add / 设置页的「查询」都指望这次刷新，丢了就一直显示旧列表
+        guard !isLoading else { pendingRefresh = true; return }
 
         guard let scope = currentScope else {
             statusMessage = "请选择「全部可访问」或输入一个 Access Group"
@@ -319,15 +328,27 @@ final class KeychainViewModel: ObservableObject {
                 DispatchQueue.main.async { self?.statusMessage = text }
             }
             DispatchQueue.main.async {
-                self?.apply(result)
+                // 传入这趟查询**实际用的**设置。读实时值的话，查询期间用户在设置页
+                // 勾了新类别，孤立标签清理就会拿一个本次根本没查过的类别去判「孤儿」，
+                // 把那一整类的标签全删掉
+                self?.apply(result, classes: classes, includeProtected: includeProtected)
             }
         }
     }
 
-    private func apply(_ result: KeychainFetchResult) {
+    private func apply(_ result: KeychainFetchResult,
+                       classes: [KeychainItemClass],
+                       includeProtected: Bool) {
         isLoading = false
-        items = result.items
-        selectedIDs.formIntersection(Set(result.items.map(\.id)))
+
+        // 查询期间被删掉的条目不能靠这份快照复活：快照是删除之前拍的。
+        // 刷新和删除可以并发（删除只挡自己），所以必须显式扣掉
+        items = deletedDuringFetch.isEmpty
+            ? result.items
+            : result.items.filter { !deletedDuringFetch.contains($0.id) }
+        deletedDuringFetch.removeAll()
+
+        selectedIDs.formIntersection(Set(items.map(\.id)))
 
         // 先给新增条目补上标签，再判断哪些标签成了孤儿
         applyPendingTagIfNeeded()
@@ -339,10 +360,10 @@ final class KeychainViewModel: ObservableObject {
         // 无从区分「已删除」和「只是没列出来」）。
         // 清理范围还要限定在本次查询的类别内 —— 否则取消勾选某个类别后刷新，
         // 该类别的标签会被整批当成孤儿抹掉。
-        if result.classErrors.isEmpty && includeProtectedItems {
-            let existingKeys = Set(result.items.map(\.tagKey))
-            let groups = Set(result.items.map(\.accessGroup)).filter { !$0.isEmpty }
-            let classNames = Set(enabledClasses.map(\.displayName))
+        if result.classErrors.isEmpty && includeProtected {
+            let existingKeys = Set(items.map(\.tagKey))
+            let groups = Set(items.map(\.accessGroup)).filter { !$0.isEmpty }
+            let classNames = Set(classes.map(\.displayName))
             TagManager.shared.cleanupOrphanedTags(existingKeys: existingKeys,
                                                   inAccessGroups: groups,
                                                   forClasses: classNames)
@@ -360,6 +381,12 @@ final class KeychainViewModel: ObservableObject {
         statusMessage = parts.joined(separator: " · ")
 
         resetTagFilterIfNeeded()
+
+        // 查询期间被挡下的刷新请求，现在补上
+        if pendingRefresh {
+            pendingRefresh = false
+            refresh()
+        }
     }
 
     /// 把查询结果里实际出现过的 Access Group 并入可选列表。
@@ -428,6 +455,8 @@ final class KeychainViewModel: ObservableObject {
 
         items.removeAll { deletedIDs.contains($0.id) }
         selectedIDs.subtract(deletedIDs)
+        // 有查询正在跑的话，它的快照里还有这些条目 —— 记下来，落地时扣掉
+        if isLoading { deletedDuringFetch.formUnion(deletedIDs) }
 
         // 多条条目可能共用同一个 tagKey，只清理确实没有条目再引用的标签
         let remainingKeys = Set(items.map(\.tagKey))
@@ -507,10 +536,12 @@ final class KeychainViewModel: ObservableObject {
         // 而那次可能刚好开了新类别，于是整批新出现的条目都会被打上标签。
         // 认不出是哪条时宁可不打，并且要说出来，不能把标签糊到一批条目上。
         guard let target = appeared.first, appeared.count == 1 else {
-            if !appeared.isEmpty {
-                alertMessage = "条目已新增，但这次刷新里多出 \(appeared.count) 条，"
+            alertMessage = appeared.isEmpty
+                // 新建的条目落在没勾选的类别 / 组里，这次查询根本没把它捞回来
+                ? "条目已新增，但它不在当前查询范围内，标签「\(pending.tag)」没能应用 —— "
+                    + "请在查询设置里放开对应的类别或组，再到详情页设置。"
+                : "条目已新增，但这次刷新里多出 \(appeared.count) 条，"
                     + "无法确定哪条是刚建的，标签没有自动应用 —— 请在详情页手动设置。"
-            }
             return
         }
         TagManager.shared.setTag(pending.tag, for: [target.tagKey])
@@ -681,13 +712,17 @@ final class KeychainViewModel: ObservableObject {
             alertMessage = "保存元数据失败：\(KeychainStore.message(for: status))"
             return false
         }
-        // 就地重读这一条，而不是为一次改动重跑整轮逐组查询
+        // 就地重读这一条，而不是为一次改动重跑整轮逐组查询。
+        // 重读不到就必须整轮刷新 —— 写已经成功了，界面却还挂着旧值，
+        // 详情页下一帧会把用户刚填的内容弹回改之前的样子
         if let index = items.firstIndex(where: { $0.id == item.id }),
            let reloaded = KeychainStore.reload(item) {
             items[index] = reloaded
+            statusMessage = "已更新「\(item.displayTitle)」的元数据"
+        } else {
+            statusMessage = "已更新「\(item.displayTitle)」的元数据，正在重新查询…"
+            refresh()
         }
-
-        statusMessage = "已更新「\(item.displayTitle)」的元数据"
         return true
     }
 

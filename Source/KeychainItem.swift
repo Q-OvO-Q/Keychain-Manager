@@ -153,6 +153,13 @@ struct KeychainItem: Identifiable {
     /// 按完整主键构造的查询，用于 SecItemDelete / SecItemUpdate
     let primaryKeyQuery: [String: Any]
 
+    /// 该类别的主键属性是不是一个不缺地都拿到了。
+    ///
+    /// `SecItemCopyMatching` 只回传有值的键，缺哪个 `primaryKeyQuery` 里就少哪个约束 ——
+    /// 而 SecItemDelete / SecItemUpdate 作用于**全部命中项**。主键齐全时这条查询是精确的
+    /// （实测 1467 条导出里四个类别的主键组合都唯一），缺项时就必须先数一遍再动手。
+    let hasCompletePrimaryKey: Bool
+
     /// 退化查询：仅在系统回传的属性类型异常、完整主键查询被拒时使用
     let minimalPrimaryKeyQuery: [String: Any]?
 
@@ -228,6 +235,11 @@ struct KeychainItem: Identifiable {
         query[kSecAttrSynchronizable as String] = synchronizable
         self.primaryKeyQuery = query
 
+        // sync 上面刚显式写过，一定在；其余都得系统真的回传了才算齐
+        self.hasCompletePrimaryKey = itemClass.primaryKeyAttributes.allSatisfy {
+            $0 == (kSecAttrSynchronizable as String) || attributes[$0] != nil
+        }
+
         // 退化查询同样只回传系统给出的原始值：account 可能是 Data 而非 String，
         // 用转换后的字符串反而匹配不上
         var minimal: [String: Any] = [
@@ -292,9 +304,13 @@ struct KeychainItem: Identifiable {
         // 拿它当键的话，用户改一次标签就会让已打的 App 标签失联。
         // 改用主键里的稳定标识（klbl / atag、slnr），显示仍优先用 labl。
         case .key:
-            let stable = (attributes[kSecAttrApplicationLabel as String] as? Data)?.hexString
+            // 带上 kcls：klbl 是公钥的 SHA-1，一对密钥的公私钥共用同一个值，
+            // 不区分的话两半会共用同一个标签槽 —— 给私钥打标签，公钥也跟着变
+            let keyClass = stringValue(attributes[kSecAttrKeyClass as String]) ?? ""
+            let base = (attributes[kSecAttrApplicationLabel as String] as? Data)?.hexString
                 ?? stringValue(attributes[kSecAttrApplicationTag as String])
                 ?? ""
+            let stable = base.isEmpty ? "" : (keyClass.isEmpty ? base : base + "#" + keyClass)
             if !label.isEmpty { return (label, stable) }
             if let tag = stringValue(attributes[kSecAttrApplicationTag as String]), !tag.isEmpty {
                 return (tag, stable)
