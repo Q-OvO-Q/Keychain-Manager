@@ -381,6 +381,7 @@ enum BinaryPlist {
     }
 
     private static func encodeLeaf(_ value: Any, into body: inout Data) throws {
+
         if value is NSNull {
             body.append(0x00)
             return
@@ -429,10 +430,30 @@ enum BinaryPlist {
                 return
             }
             if CFNumberIsFloatType(number as CFNumber) {
+                // 单精度按原样写回 0x22：解析时 4 字节实数读成 Float，一律拓成
+                // 8 字节 double 写回去，这个数在文件里就换了一种表示，
+                // 再读回来显示的位数也变了 —— 序列化就不再是解析的逆运算。
+                if CFNumberGetType(number as CFNumber) == .float32Type
+                    || CFNumberGetType(number as CFNumber) == .floatType {
+                    body.append(0x22)
+                    append(UInt64(number.floatValue.bitPattern), width: 4, to: &body)
+                    return
+                }
                 body.append(0x23)
                 append(number.doubleValue.bitPattern, width: 8, to: &body)
                 return
             }
+
+            // 无符号且超过 Int64.max 的值不能走 int64Value —— 那会回绕成负数，
+            // 于是以 0x13 存成补码，读回来完全是另一个数。这类只有 16 字节整数装得下，
+            // 而 16 字节整数本实现只读不写，所以拒绝比悄悄写坏强。
+            // "Q" = unsigned long long。NSNumber 本身记着有没有符号，只能这么问 ——
+            // int64Value 对这类值会回绕成负数，看不出区别
+            if String(cString: number.objCType) == "Q",
+               number.uint64Value > UInt64(Int64.max) {
+                throw Failure.unsupported("超过 Int64.max 的无符号整数")
+            }
+
             let signed = number.int64Value
             if signed < 0 {
                 // 负数只能用 8 字节有符号形式
