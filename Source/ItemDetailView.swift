@@ -41,8 +41,16 @@ struct ItemDetailView: View {
     /// 解析区自己的保存提示。放在数据区的 saveNotice 里用户看不到——
     /// 按钮在这一段，提示却在上面那一段
     @State private var decodedNotice: String?
-    /// 正在切换文本 / 十六进制显示模式。字节没变，解析区的未保存修改不该因此作废
-    @State private var isSwitchingMode = false
+    /// 程序化写入 content 后的预期值：模式切换（字节没变，解析区的未保存修改
+    /// 不该作废）和 loadContent（decoded 已经就地重算过）都不该再触发 refreshDecoded。
+    ///
+    /// 记「预期值」而不是布尔标志：布尔标志在赋值前后内容相同（空编辑器切模式）时
+    /// 不会被 onChange 消费掉，残留下来会吞掉下一次真实编辑的刷新；
+    /// 而 onChange 只在值变化时触发，「新值 == 预期值」的判断不存在这种残留。
+    @State private var pendingProgrammaticContent: String?
+    /// 二进制属性（accc / gena…）的解析结果缓存。直接在 body 里解析的话，
+    /// 数据编辑框每敲一个键都会把所有属性 blob 重新解一遍
+    @State private var attributeDecodeCache: [String: DecodedPayload] = [:]
 
     private var item: KeychainItem? { viewModel.item(withID: itemID) }
 
@@ -60,6 +68,14 @@ struct ItemDetailView: View {
         }
         .navigationTitle("条目详情")
         .navigationBarTitleDisplayMode(.inline)
+        // 挂在外层 Group 上而不是 Form 上：删除落地的那一次更新里，
+        // 条目消失会让 body 切到占位分支，Form 连同它身上的修饰符一起被拆掉，
+        // 挂在 Form 上的 onChange 在同一笔更新里不会被调用 —— 自动返回永远不触发
+        .onChange(of: viewModel.items.count) { _, _ in
+            if didRequestDelete, viewModel.item(withID: itemID) == nil {
+                dismiss()
+            }
+        }
     }
 
     // MARK: - 表单
@@ -85,12 +101,6 @@ struct ItemDetailView: View {
             Button("取消", role: .cancel) {}
         } message: {
             Text("此操作不可撤销。")
-        }
-        // 删除改成异步执行后，触发的当下条目还在，只能等它真的消失了再退出
-        .onChange(of: viewModel.items.count) { _, _ in
-            if didRequestDelete, viewModel.item(withID: itemID) == nil {
-                dismiss()
-            }
         }
     }
 
@@ -365,7 +375,7 @@ struct ItemDetailView: View {
 
                 // 这只是换个显示方式，字节没变。不打招呼的话 content 一变就会触发
                 // refreshDecoded，把解析区里还没保存的字段修改当成「原始数据被改了」清掉
-                isSwitchingMode = true
+                pendingProgrammaticContent = content
                 conversionWarning = nil
                 isHexMode = newValue
             }
@@ -501,13 +511,15 @@ struct ItemDetailView: View {
     private func saveDecoded(_ item: KeychainItem, payload: DecodedPayload) {
         do {
             let data = try payload.encoded(with: decodedEdits)
-            guard viewModel.updateData(item, to: data) else { return }
-            // 重新读一遍：原始数据区和解析结果都要跟着变。
-            // 这一步会清掉 decodedEdits，所以提示要在它之后再设。
-            if let updated = viewModel.item(withID: itemID) {
-                loadContent(from: updated)
+            viewModel.updateData(item, to: data) { success in
+                guard success else { return }
+                // 重新读一遍：原始数据区和解析结果都要跟着变。
+                // 这一步会清掉 decodedEdits，所以提示要在它之后再设。
+                if let updated = viewModel.item(withID: itemID) {
+                    loadContent(from: updated)
+                }
+                decodedNotice = "已按字段写入 \(data.count) 字节"
             }
-            decodedNotice = "已按字段写入 \(data.count) 字节"
         } catch {
             viewModel.alertMessage = error.localizedDescription
         }
@@ -634,10 +646,15 @@ struct ItemDetailView: View {
     }
 
     private func saveAttributes(_ item: KeychainItem) {
-        if viewModel.updateAttributes(item, changes: editedAttributes) {
+        viewModel.updateAttributes(item, changes: editedAttributes) { success in
+            guard success else { return }
             editedAttributes.removeAll()
             // 草稿留着就会盖住刚写回来的真实值
             fourCharDrafts.removeAll()
+            // 属性刚被 reload 换新，二进制属性的解析缓存要跟着重建
+            if let updated = viewModel.item(withID: itemID) {
+                rebuildAttributeDecodeCache(for: updated)
+            }
             saveNotice = "元数据已更新"
         }
     }
@@ -657,8 +674,10 @@ struct ItemDetailView: View {
             ForEach(item.rawAttributes.keys.sorted(), id: \.self) { key in
                 if let value = item.rawAttributes[key] {
                     // 属性值本身也可能是结构化的：实测 gena 里就有一条 3234 字节的
-                    // bplist，按十六进制显示就是 6468 个字符，等于没显示
-                    if let payload = decodedAttribute(value) {
+                    // bplist，按十六进制显示就是 6468 个字符，等于没显示。
+                    // 解析结果取缓存：body 每次求值（数据编辑框的每一次按键）都
+                    // 现场解析的话，几 KB 的归档要在主线程上反复解，输入会明显卡顿
+                    if let payload = attributeDecodeCache[key] {
                         NavigationLink {
                             DecodedStructurePage(payload: payload)
                         } label: {
@@ -736,6 +755,17 @@ struct ItemDetailView: View {
         return DataDecoder.decode(data)
     }
 
+    /// 属性只在打开详情页和保存元数据后变化，缓存只需要在这两处重建
+    private func rebuildAttributeDecodeCache(for item: KeychainItem) {
+        var cache: [String: DecodedPayload] = [:]
+        for (key, value) in item.rawAttributes {
+            if let payload = decodedAttribute(value) {
+                cache[key] = payload
+            }
+        }
+        attributeDecodeCache = cache
+    }
+
     // MARK: 删除
 
     private func deleteSection(_ item: KeychainItem) -> some View {
@@ -754,9 +784,13 @@ struct ItemDetailView: View {
 
         tagValue = item.appTag
         loadContent(from: item)
+        rebuildAttributeDecodeCache(for: item)
     }
 
-    /// 只刷新数据内容，不动标签输入框（解锁后复用）
+    /// 只刷新数据内容，不动标签输入框（解锁后复用）。
+    /// 这里已经把 decoded / decodedEdits 全部就地重算，随之而来的 onChange
+    /// 不该再跑一遍 refreshDecoded —— 那只会重复解析一次，还把调用方
+    /// 刚设置的提示（例如解锁成功）当帧清掉。
     private func loadContent(from item: KeychainItem) {
         decodedEdits.removeAll()
         fourCharDrafts.removeAll()
@@ -766,6 +800,7 @@ struct ItemDetailView: View {
             content = ""
             isHexMode = false
             decoded = nil
+            pendingProgrammaticContent = content
             return
         }
 
@@ -777,14 +812,16 @@ struct ItemDetailView: View {
             isHexMode = true
         }
         decoded = DataDecoder.decode(data)
+        pendingProgrammaticContent = content
     }
 
     /// 用户在原始数据区改过之后，解析结果就对不上了，得跟着重算
     private func refreshDecoded() {
-        if isSwitchingMode {
-            // 只是换了显示方式，字节没变：解析结果一样，编辑也仍然有效
-            isSwitchingMode = false
-            return
+        if let expected = pendingProgrammaticContent {
+            pendingProgrammaticContent = nil
+            // 程序化写入（模式切换 / loadContent）：字节没变或解析结果已就地
+            // 更新过，不该清提示、也不该作废解析区的未保存修改
+            if content == expected { return }
         }
 
         // 数据一改，上一条「已写入」就不再是当前状态了
@@ -830,10 +867,8 @@ struct ItemDetailView: View {
             return
         }
 
-        if viewModel.updateData(item, to: data) {
-            saveNotice = "已写入 \(data.count) 字节"
-        } else {
-            saveNotice = nil
+        viewModel.updateData(item, to: data) { success in
+            saveNotice = success ? "已写入 \(data.count) 字节" : nil
         }
     }
 

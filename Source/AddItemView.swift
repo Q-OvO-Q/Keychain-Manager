@@ -62,6 +62,15 @@ struct AddItemView: View {
         isHexMode ? content.hexData : content.data(using: .utf8)
     }
 
+    /// 端口要么留空，要么是正整数。KeychainStore.add 对解析不出的端口是
+    /// 静默丢弃，而 port 属于写入后不可改的主键 —— 悄悄丢掉等于永久写错
+    private var portIsValid: Bool {
+        let trimmed = port.trimmingCharacters(in: .whitespaces)
+        if trimmed.isEmpty { return true }
+        guard let value = Int(trimmed), value > 0 else { return false }
+        return true
+    }
+
     private var canSave: Bool {
         guard let data = parsedData else { return false }
         switch itemClass {
@@ -70,7 +79,8 @@ struct AddItemView: View {
             // 但两者与 account 全空就成了无从辨认的条目，要求至少填一个
             let hasTitle = !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let hasAccount = !account.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            return hasTitle || hasAccount
+            let portOK = itemClass != .internetPassword || portIsValid
+            return (hasTitle || hasAccount) && portOK
         case .key, .certificate:
             // 这两类没有标题，条目内容完全由数据决定，空数据无从写起
             return !data.isEmpty
@@ -125,7 +135,22 @@ struct AddItemView: View {
                 }
             }
             .onAppear(perform: prepareDefaultGroup)
+            // 错误提示必须挂在本 sheet 内部：ContentView 上那个 alert 在
+            // sheet 打开期间被盖住弹不出来 —— 保存失败时按钮看起来就像没反应，
+            // 等 sheet 关掉后那条过期的错误还会突然冒出来
+            .alert("操作未完成", isPresented: alertPresented) {
+                Button("好", role: .cancel) {}
+            } message: {
+                Text(viewModel.alertMessage ?? "")
+            }
         }
+    }
+
+    private var alertPresented: Binding<Bool> {
+        Binding(
+            get: { viewModel.alertMessage != nil },
+            set: { if !$0 { viewModel.alertMessage = nil } }
+        )
     }
 
     // MARK: - 分区
@@ -239,7 +264,12 @@ struct AddItemView: View {
             } header: {
                 Text("主键字段")
             } footer: {
-                Text("这 7 项构成主键，写入后不可再改。")
+                if !portIsValid {
+                    Text("端口不合法：需为正整数，或留空。")
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("这 7 项构成主键，写入后不可再改。")
+                }
             }
 
         case .key:
@@ -435,7 +465,9 @@ struct AddItemView: View {
         var newItem = KeychainStore.NewItem()
         newItem.itemClass = itemClass
         newItem.title = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        newItem.account = account
+        // 与 title 同样修剪：canSave 就是按修剪后的值判断的，
+        // 不修剪的话「只有一个空格」的账号会以 " " 写进不可再改的主键
+        newItem.account = account.trimmingCharacters(in: .whitespacesAndNewlines)
         newItem.data = data
         newItem.accessGroup = accessGroup
         newItem.accessible = accessible
@@ -474,8 +506,8 @@ struct AddItemView: View {
             viewModel.enabledClasses.insert(itemClass)
         }
 
-        if viewModel.add(newItem, tag: tagValue) {
-            dismiss()
+        viewModel.add(newItem, tag: tagValue) { success in
+            if success { dismiss() }
         }
     }
 }

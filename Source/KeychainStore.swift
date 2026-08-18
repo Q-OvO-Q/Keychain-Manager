@@ -504,24 +504,27 @@ enum KeychainStore {
 
     /// 条目是否仍然存在。无法判定时一律按「还在」处理，绝不谎报删除成功。
     static func exists(_ item: KeychainItem) -> Bool {
-        // 一律跳过验证。这是本文件的既定规则：取属性同样要解密，受保护条目会弹
-        // Face ID，而删除跑在后台队列上，批量删就是连弹。跳过后受保护条目返回
-        // errSecInteractionNotAllowed，正好落进下面「判不出就算还在」那一档。
+        // 用 Fail 而不是 Skip，理由与 matchCount 相同：Skip 会把需要验证的条目
+        // **静默剔除**，返回 errSecItemNotFound（见 fetchItems 里的实测注释）——
+        // 一条删除失败的受保护条目会被误判成「已删除」，delete() 随之谎报成功，
+        // 界面把行抹掉、标签也一并清除，条目却还在钥匙串里。
+        // Fail 让受保护条目如实报 errSecInteractionNotAllowed，
+        // 正好落进「判不出就算还在」那一档。两者都不会弹验证框。
         if let ref = item.persistentRef {
             let query: [String: Any] = [
                 kSecValuePersistentRef as String: ref,
                 kSecReturnAttributes as String: true,
-                kSecUseAuthenticationUI as String: kSecUseAuthenticationUISkip
+                kSecUseAuthenticationUI as String: kSecUseAuthenticationUIFail
             ]
             var output: AnyObject?
             let status = SecItemCopyMatching(query as CFDictionary, &output)
-            if status == errSecSuccess { return true }
+            if status != errSecItemNotFound { return true }
         }
 
         var query = item.primaryKeyQuery
         query[kSecReturnAttributes as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
-        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUISkip
+        query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
 
         var output: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &output)
@@ -730,12 +733,27 @@ enum KeychainStore {
             let trimmed = text.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { return nil }
 
+            // 十进制只认「整串就是数字」的输入。带空白垫充的（如 " 123"）不算：
+            // 那可能是 text(from:) 显示出来的空格垫充四字符码，按十进制解析会把
+            // 0x20313233 变成 123，往返就失真了。
+            if text == trimmed, let decimal = UInt32(trimmed) {
+                return NSNumber(value: decimal)
+            }
+
+            // 原文恰好 4 字节时按原文收，空格也是合法的四字符码字节 ——
+            // text(from:) 会把 'sit '（0x73697420）显示成 "sit "，
+            // 先 trim 再解析的话，这个显示出来的值自己就再也填不回去了。
+            let raw = Array(text.utf8)
+            if raw.count == 4 {
+                return NSNumber(value: raw.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) })
+            }
+
             if let decimal = UInt32(trimmed) { return NSNumber(value: decimal) }
 
             let bytes = Array(trimmed.utf8)
             guard bytes.count == 4 else { return nil }
-            let raw = bytes.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
-            return NSNumber(value: raw)
+            let raw32 = bytes.reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+            return NSNumber(value: raw32)
         }
     }
 
@@ -774,13 +792,26 @@ enum KeychainStore {
             attributes[kSecValuePersistentRef as String] = ref
         }
 
+        // 沿用原条目的回退序号：没有持久引用的条目 id 是「key:标签键#序号」，
+        // 这里写死 0 的话，一次成功的保存就会把 id 换掉 ——
+        // 详情页按旧 id 找不到条目，页面立刻变成「条目已不存在」
         var reloaded = KeychainItem(itemClass: item.itemClass,
                                     attributes: attributes,
-                                    fallbackIndex: 0)
+                                    fallbackIndex: item.fallbackIndex)
         reloaded.data = item.data
         reloaded.dataStatus = item.dataStatus
         reloaded.searchIndex = makeSearchIndex(for: reloaded)
         return reloaded
+    }
+
+    /// 持久引用那条路是否值得换主键再试。
+    ///
+    /// 只有「引用本身失效 / 不被接受」才换：改受保护条目会触发系统验证，
+    /// 用户取消（errSecUserCanceled）、设备锁定（errSecInteractionNotAllowed）、
+    /// 认证失败（errSecAuthFailed）时换条路结局完全一样 ——
+    /// 只会立刻再弹一次验证框，把一次「取消」变成连续两问。
+    private static func shouldFallBackToPrimaryKey(after status: OSStatus) -> Bool {
+        status == errSecItemNotFound || status == errSecParam
     }
 
     /// 批量修改元数据。传入空字符串会把该属性置空。
@@ -792,6 +823,7 @@ enum KeychainStore {
             let query: [String: Any] = [kSecValuePersistentRef as String: ref]
             let status = SecItemUpdate(query as CFDictionary, changes as CFDictionary)
             if status == errSecSuccess { return errSecSuccess }
+            if !shouldFallBackToPrimaryKey(after: status) { return status }
         }
 
         return updateByPrimaryKey(item, changes)
@@ -807,6 +839,7 @@ enum KeychainStore {
             let query: [String: Any] = [kSecValuePersistentRef as String: ref]
             let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
             if status == errSecSuccess { return errSecSuccess }
+            if !shouldFallBackToPrimaryKey(after: status) { return status }
         }
 
         return updateByPrimaryKey(item, attributes)
@@ -998,9 +1031,19 @@ enum KeychainStore {
         guard status == errSecParam else { return status }
 
         // 万一某个类别不接受显式 false，退回「只写 true」再试一次：
-        // 开关失效总比整条建不出来强，而且失败会明确报给用户
+        // 开关失效总比整条建不出来强，而且失败会明确报给用户。
+        //
+        // 只摘已知的布尔开关，不能按「值等于 false」判：NSNumber(0) 也能
+        // `as? Bool` 成功（Foundation 对 0/1 的桥接），按值判会把用户显式
+        // 填的 crtr/type = 0 一起悄悄摘掉。
+        let booleanKeys = Set([kSecAttrIsInvisible, kSecAttrIsNegative,
+                               kSecAttrIsPermanent, kSecAttrCanEncrypt,
+                               kSecAttrCanDecrypt, kSecAttrCanDerive,
+                               kSecAttrCanSign, kSecAttrCanVerify,
+                               kSecAttrCanWrap, kSecAttrCanUnwrap].map { $0 as String })
         var relaxed = attributes
-        for (key, value) in attributes where (value as? Bool) == false {
+        for (key, value) in attributes
+        where booleanKeys.contains(key) && (value as? Bool) == false {
             relaxed.removeValue(forKey: key)
         }
         guard relaxed.count != attributes.count else { return status }

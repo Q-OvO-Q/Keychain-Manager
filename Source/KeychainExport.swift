@@ -136,8 +136,23 @@ enum KeychainExport {
         var items: [ParsedItem] = []
 
         for itemClass in KeychainItemClass.allCases {
-            guard let bucket = root[jsonKey(for: itemClass)] as? [[String: Any]] else { continue }
-            for entry in bucket {
+            guard let rawBucket = root[jsonKey(for: itemClass)] else { continue }
+            // 先转成 [Any] 再逐个检查元素。直接 as? [[String: Any]] 的话，
+            // 数组里混进一个非对象元素（手编文件里的 null、截断残留的字符串）
+            // 会让整个转换失败，这一类的**全部**合法条目被静默丢掉。
+            guard let bucket = rawBucket as? [Any] else {
+                items.append(ParsedItem(itemClass: itemClass,
+                                        attributes: [:],
+                                        decodeFailure: "「\(jsonKey(for: itemClass))」不是数组"))
+                continue
+            }
+            for element in bucket {
+                guard let entry = element as? [String: Any] else {
+                    items.append(ParsedItem(itemClass: itemClass,
+                                            attributes: [:],
+                                            decodeFailure: "条目不是 JSON 对象"))
+                    continue
+                }
                 var attributes: [String: Any] = [:]
                 var failure: String?
                 for (key, value) in entry {
@@ -151,7 +166,11 @@ enum KeychainExport {
                         failure = failure ?? "「\(key)」\(reason)"
                     }
                 }
-                guard !attributes.isEmpty else { continue }
+                // 一个可用属性都没有、也没记下失败原因的（只含忽略键的空壳）
+                // 才允许静默跳过；记了失败的必须往下传 —— ParsedItem 的契约是
+                // 整条跳过**并如实报告**，在这里吞掉的话 importItems 的失败
+                // 报告里就永远见不到它
+                guard !attributes.isEmpty || failure != nil else { continue }
                 items.append(ParsedItem(itemClass: itemClass,
                                         attributes: attributes,
                                         decodeFailure: failure))

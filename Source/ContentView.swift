@@ -245,10 +245,15 @@ struct ContentView: View {
     @ViewBuilder
     private var tagFilterBar: some View {
         let counts = viewModel.tagCounts
-        let visibleTags = tagManager.allTags.filter { counts[$0] != nil }
+        // 当前选中的标签即使被搜索 / 类别 / 组筛到 0 也要保留 chip：
+        // 不保留的话筛选还生效着，栏上却没有任何高亮控件能看出或取消它
+        let visibleTags = tagManager.allTags.filter {
+            counts[$0] != nil || $0 == viewModel.selectedTagFilter
+        }
         let untaggedCount = counts[untaggedFilterKey] ?? 0
+        let untaggedSelected = viewModel.selectedTagFilter == untaggedFilterKey
 
-        if !viewModel.items.isEmpty && (!visibleTags.isEmpty || untaggedCount > 0) {
+        if !viewModel.items.isEmpty && (!visibleTags.isEmpty || untaggedCount > 0 || untaggedSelected) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     filterChip(label: "全部",
@@ -265,10 +270,10 @@ struct ContentView: View {
                         }
                     }
 
-                    if untaggedCount > 0 {
+                    if untaggedCount > 0 || untaggedSelected {
                         filterChip(label: "未标记",
                                    count: untaggedCount,
-                                   isSelected: viewModel.selectedTagFilter == untaggedFilterKey) {
+                                   isSelected: untaggedSelected) {
                             viewModel.selectedTagFilter = untaggedFilterKey
                         }
                     }
@@ -663,7 +668,10 @@ struct FilterSheet: View {
                 }
 
                 Section {
-                    if viewModel.groupCounts.count > 8 {
+                    // 输入了关键字就必须一直显示：groupCounts 会被同面板里刚选的
+                    // 类别收窄到 8 个以下，输入框一藏，残留的关键字还在暗中过滤
+                    // 组列表，界面上却看不出原因、也没法清掉它
+                    if viewModel.groupCounts.count > 8 || !groupKeyword.isEmpty {
                         TextField("筛选组名", text: $groupKeyword)
                             .textInputAutocapitalization(.never)
                             .autocorrectionDisabled()
