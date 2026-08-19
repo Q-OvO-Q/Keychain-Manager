@@ -1,7 +1,11 @@
 import Foundation
 import Security
 
-let untaggedFilterKey = "__untagged__"
+/// 「未标记」筛选的哨兵值。以 NUL 开头是有意的：标签名是自由输入，
+/// 哨兵若是普通字符串（如 "__untagged__"），用户起一个同名标签就会和它撞车 ——
+/// 该标签的计数被并进「未标记」，点它的 chip 筛出来的反而是没有标签的条目。
+/// NUL 无法从键盘输入，实际上排除了同名冲突。哨兵不落盘，改值不影响已有数据。
+let untaggedFilterKey = "\u{0}__untagged__"
 
 /// 筛选面板用的计数条目。
 /// 用结构体而不是具名元组：Swift 不支持指向元组元素的 KeyPath，
@@ -80,6 +84,14 @@ final class KeychainViewModel: ObservableObject {
     /// 查询进行中被删掉的条目 id。那份查询快照是删除之前拍的，
     /// 直接盖上去会让已删条目在列表里复活
     private var deletedDuringFetch: Set<String> = []
+
+    /// 「清空当前显示」时还有查询在跑：那份快照落地会把列表整个盖回来，
+    /// 清空等于白点。标记之后 apply() 丢弃这趟结果
+    private var discardInFlightFetch = false
+
+    /// 想让用户看见、但马上要被 refresh() 的「正在查询…」冲掉的操作结果
+    /// （导入摘要、新增提示）。apply() 把它并进最终的状态栏文案里。
+    private var pendingStatusNote: String?
 
     // MARK: - 筛选与选择
 
@@ -174,20 +186,27 @@ final class KeychainViewModel: ObservableObject {
     var classFacetTotal: Int { narrowed(excluding: .itemClass).count }
     var groupFacetTotal: Int { narrowed(excluding: .group).count }
 
-    /// 类别计数，已应用组 / 标签 / 搜索的筛选
+    /// 类别计数，已应用组 / 标签 / 搜索的筛选。
+    /// 当前选中的类别即使被其它维度筛到 0 也要保留：不保留的话，
+    /// 筛选还生效着，界面上却找不到任何一个「已选中」的控件可以取消它
     var classCounts: [ClassCount] {
         let base = narrowed(excluding: .itemClass)
         return KeychainItemClass.allCases.compactMap { itemClass in
             let count = base.filter { $0.itemClass == itemClass }.count
-            return count > 0 ? ClassCount(itemClass: itemClass, count: count) : nil
+            guard count > 0 || classFilter == itemClass else { return nil }
+            return ClassCount(itemClass: itemClass, count: count)
         }
     }
 
-    /// Access Group 计数，已应用类别 / 标签 / 搜索的筛选，按条目数从多到少
+    /// Access Group 计数，已应用类别 / 标签 / 搜索的筛选，按条目数从多到少。
+    /// 同 classCounts：当前选中的组即使计数为 0 也要保留
     var groupCounts: [GroupCount] {
         var counts: [String: Int] = [:]
         for item in narrowed(excluding: .group) where !item.accessGroup.isEmpty {
             counts[item.accessGroup, default: 0] += 1
+        }
+        if !groupFilter.isEmpty, counts[groupFilter] == nil {
+            counts[groupFilter] = 0
         }
         return counts
             .map { GroupCount(group: $0.key, count: $0.value) }
@@ -301,6 +320,7 @@ final class KeychainViewModel: ObservableObject {
         guard !isLoading else { pendingRefresh = true; return }
 
         guard let scope = currentScope else {
+            pendingStatusNote = nil
             statusMessage = "请选择「全部可访问」或输入一个 Access Group"
             return
         }
@@ -309,6 +329,7 @@ final class KeychainViewModel: ObservableObject {
         guard !classes.isEmpty else {
             items = []
             selectedIDs.removeAll()
+            pendingStatusNote = nil
             statusMessage = "请至少选择一个条目类别"
             return
         }
@@ -325,7 +346,11 @@ final class KeychainViewModel: ObservableObject {
                                                   classes: classes,
                                                   knownGroups: knownGroups,
                                                   includeProtected: includeProtected) { text in
-                DispatchQueue.main.async { self?.statusMessage = text }
+                DispatchQueue.main.async {
+                    // 「清空显示」后这趟查询已作废，进度文案也不该再往外冒
+                    guard let self, !self.discardInFlightFetch else { return }
+                    self.statusMessage = text
+                }
             }
             DispatchQueue.main.async {
                 // 传入这趟查询**实际用的**设置。读实时值的话，查询期间用户在设置页
@@ -340,6 +365,18 @@ final class KeychainViewModel: ObservableObject {
                        classes: [KeychainItemClass],
                        includeProtected: Bool) {
         isLoading = false
+
+        // 用户在查询期间点了「清空当前显示」：这份快照已作废，直接丢弃，
+        // 只兑现被挡下的刷新请求（那是清空之后新的明确意图）
+        if discardInFlightFetch {
+            discardInFlightFetch = false
+            deletedDuringFetch.removeAll()
+            if pendingRefresh {
+                pendingRefresh = false
+                refresh()
+            }
+            return
+        }
 
         // 查询期间被删掉的条目不能靠这份快照复活：快照是删除之前拍的。
         // 刷新和删除可以并发（删除只挡自己），所以必须显式扣掉
@@ -371,12 +408,20 @@ final class KeychainViewModel: ObservableObject {
 
         enumerationFailures = result.classErrors.map(\.description)
 
-        var parts = ["共 \(result.items.count) 条"]
+        // 用过滤后的 items 数，不用 result.items.count：查询期间删掉的条目
+        // 已经从列表里扣掉了，报快照的总数会和眼前的列表对不上
+        var parts = ["共 \(items.count) 条"]
         if unreadableCount > 0 {
             parts.append("\(unreadableCount) 条受保护/不可读")
         }
         if !enumerationFailures.isEmpty {
             parts.append("\(enumerationFailures.count) 项查询失败（点击查看）")
+        }
+        // 导入摘要 / 新增提示原本会被「正在查询…」当帧冲掉，在这里补回来。
+        // pendingRefresh 时快照还要再刷一轮，提示留到最终那轮一起展示
+        if let note = pendingStatusNote {
+            if !pendingRefresh { pendingStatusNote = nil }
+            parts.insert(note, at: 0)
         }
         statusMessage = parts.joined(separator: " · ")
 
@@ -508,25 +553,43 @@ final class KeychainViewModel: ObservableObject {
 
     private var pendingTag: PendingTag?
 
-    func add(_ newItem: KeychainStore.NewItem, tag: String) -> Bool {
-        let status = KeychainStore.add(newItem)
-        guard status == errSecSuccess else {
-            alertMessage = "新增失败：\(KeychainStore.message(for: status))"
-            return false
-        }
+    /// KeychainStore 的方法都是同步阻塞的，放后台队列执行，结果回主线程。
+    func add(_ newItem: KeychainStore.NewItem, tag: String,
+             completion: @escaping (Bool) -> Void) {
+        let knownIDs = Set(items.map(\.id))
 
-        let trimmedTag = tag.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedTag.isEmpty {
-            pendingTag = PendingTag(tag: trimmedTag, knownIDs: Set(items.map(\.id)))
-        }
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let status = KeychainStore.add(newItem)
 
-        statusMessage = "已新增「\(newItem.title)」"
-        refresh()
-        return true
+            DispatchQueue.main.async {
+                guard let self else { completion(false); return }
+                guard status == errSecSuccess else {
+                    self.alertMessage = "新增失败：\(KeychainStore.message(for: status))"
+                    completion(false)
+                    return
+                }
+
+                let trimmedTag = tag.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmedTag.isEmpty {
+                    self.pendingTag = PendingTag(tag: trimmedTag, knownIDs: knownIDs)
+                }
+
+                // 直接写 statusMessage 会立刻被 refresh() 的「正在查询…」冲掉，
+                // 留给 apply() 并进最终文案
+                self.pendingStatusNote = "已新增「\(newItem.title)」"
+                self.refresh()
+                completion(true)
+            }
+        }
     }
 
     private func applyPendingTagIfNeeded() {
         guard let pending = pendingTag else { return }
+        // 这份快照可能拍摄于新增之前：add() 触发的刷新被 isLoading 挡下时，
+        // 正在落地的是更早启动的那趟查询，快照里未必有新条目 ——
+        // 拿它认领轻则丢标签、重则把标签打到碰巧新出现的别的条目上。
+        // pendingRefresh 正是「快照早于新增」的信号，等补跑的那轮再认。
+        if pendingRefresh { return }
         pendingTag = nil
 
         let appeared = items.filter { !pending.knownIDs.contains($0.id) }
@@ -558,17 +621,28 @@ final class KeychainViewModel: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let outcome = KeychainStore.copyData(for: item, allowAuthenticationUI: true)
 
+            // 只在成功时更新条目状态。失败也写 dataStatus 的话，-25308 会被
+            // 失败码（最常见是用户取消的 -128）覆盖，而「解锁读取」按钮只在
+            // -25308 时出现 —— 误点一次取消，这条就再也解不了锁，只能整轮刷新。
+            // 检索串在后台线程拼好（里面可能要解一遍 bplist），主线程只做赋值。
+            var unlocked: KeychainItem?
+            if outcome.status == errSecSuccess {
+                var refreshed = item
+                refreshed.data = outcome.data
+                refreshed.dataStatus = outcome.status
+                refreshed.searchIndex = KeychainStore.makeSearchIndex(for: refreshed)
+                unlocked = refreshed
+            }
+
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.isUnlocking = false
 
                 var updated: KeychainItem?
-                if let index = self.items.firstIndex(where: { $0.id == item.id }) {
-                    self.items[index].data = outcome.data
-                    self.items[index].dataStatus = outcome.status
-                    // 解锁后内容才可读，检索串要跟着补上
-                    self.items[index].searchIndex = KeychainStore.makeSearchIndex(for: self.items[index])
-                    updated = self.items[index]
+                if let unlocked,
+                   let index = self.items.firstIndex(where: { $0.id == item.id }) {
+                    self.items[index] = unlocked
+                    updated = unlocked
                 }
 
                 if outcome.status != errSecSuccess {
@@ -693,7 +767,12 @@ final class KeychainViewModel: ObservableObject {
         // 系统拒收了某些可选属性、摘掉才写进去的：没失败，但不是原样还原
         if outcome.degraded > 0 { parts.append("\(outcome.degraded) 条未能完整还原") }
         if !outcome.failures.isEmpty { parts.append("失败 \(outcome.failures.count) 条") }
-        statusMessage = parts.joined(separator: " · ")
+        let summary = parts.joined(separator: " · ")
+        statusMessage = summary
+        // 下面的 refresh() 会在同一轮里把 statusMessage 换成「正在查询…」，
+        // 无失败的导入没有别的展示面，新增 / 覆盖 / 未完整还原的数字会一闪而没 ——
+        // 留给 apply() 并进查询结束后的状态栏
+        pendingStatusNote = summary
 
         if !outcome.failures.isEmpty {
             importReport = outcome.failures.map { "「\($0.title)」\($0.reason)" }
@@ -705,44 +784,71 @@ final class KeychainViewModel: ObservableObject {
 
     // MARK: - 修改元数据
 
-    /// 改完立刻重查该条目的属性，让详情页显示的是系统里真实的值而不是我们以为写进去的值
-    func updateAttributes(_ item: KeychainItem, changes: [String: Any]) -> Bool {
-        let status = KeychainStore.updateAttributes(item, changes: changes)
-        guard status == errSecSuccess else {
-            alertMessage = "保存元数据失败：\(KeychainStore.message(for: status))"
-            return false
+    /// 改完立刻重查该条目的属性，让详情页显示的是系统里真实的值而不是我们以为写进去的值。
+    ///
+    /// keychain 调用放后台队列：SecItemUpdate 是同步阻塞的（KeychainStore 头部的
+    /// 约定），而且更新受 SecAccessControl 保护的条目会触发系统验证 ——
+    /// 验证框弹着的时候发起线程一直被阻塞，留在主线程就是界面冻死 + 看门狗风险，
+    /// 和 unlockData 当初放后台的原因完全相同。
+    func updateAttributes(_ item: KeychainItem, changes: [String: Any],
+                          completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let status = KeychainStore.updateAttributes(item, changes: changes)
+            // 就地重读这一条，而不是为一次改动重跑整轮逐组查询
+            let reloaded = status == errSecSuccess ? KeychainStore.reload(item) : nil
+
+            DispatchQueue.main.async {
+                guard let self else { completion(false); return }
+                guard status == errSecSuccess else {
+                    self.alertMessage = "保存元数据失败：\(KeychainStore.message(for: status))"
+                    completion(false)
+                    return
+                }
+                // 重读不到就必须整轮刷新 —— 写已经成功了，界面却还挂着旧值，
+                // 详情页下一帧会把用户刚填的内容弹回改之前的样子
+                if let reloaded,
+                   let index = self.items.firstIndex(where: { $0.id == item.id }) {
+                    self.items[index] = reloaded
+                    self.statusMessage = "已更新「\(item.displayTitle)」的元数据"
+                } else {
+                    self.statusMessage = "已更新「\(item.displayTitle)」的元数据，正在重新查询…"
+                    self.refresh()
+                }
+                completion(true)
+            }
         }
-        // 就地重读这一条，而不是为一次改动重跑整轮逐组查询。
-        // 重读不到就必须整轮刷新 —— 写已经成功了，界面却还挂着旧值，
-        // 详情页下一帧会把用户刚填的内容弹回改之前的样子
-        if let index = items.firstIndex(where: { $0.id == item.id }),
-           let reloaded = KeychainStore.reload(item) {
-            items[index] = reloaded
-            statusMessage = "已更新「\(item.displayTitle)」的元数据"
-        } else {
-            statusMessage = "已更新「\(item.displayTitle)」的元数据，正在重新查询…"
-            refresh()
-        }
-        return true
     }
 
     // MARK: - 修改数据
 
-    func updateData(_ item: KeychainItem, to data: Data) -> Bool {
-        let status = KeychainStore.updateData(item, to: data)
-        guard status == errSecSuccess else {
-            alertMessage = "保存失败：\(KeychainStore.message(for: status))"
-            return false
-        }
+    /// 同 updateAttributes：keychain 调用放后台队列，结果回主线程。
+    func updateData(_ item: KeychainItem, to data: Data,
+                    completion: @escaping (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let status = KeychainStore.updateData(item, to: data)
 
-        if let index = items.firstIndex(where: { $0.id == item.id }) {
-            items[index].data = data
-            items[index].dataStatus = errSecSuccess
-            // 检索串是查询结束时拼好的，数据变了不重算就搜不到新内容、反而能搜到旧内容
-            items[index].searchIndex = KeychainStore.makeSearchIndex(for: items[index])
+            // 检索串在后台拼好（可能要解一遍 bplist），主线程只做赋值
+            var refreshed = item
+            if status == errSecSuccess {
+                refreshed.data = data
+                refreshed.dataStatus = errSecSuccess
+                refreshed.searchIndex = KeychainStore.makeSearchIndex(for: refreshed)
+            }
+
+            DispatchQueue.main.async {
+                guard let self else { completion(false); return }
+                guard status == errSecSuccess else {
+                    self.alertMessage = "保存失败：\(KeychainStore.message(for: status))"
+                    completion(false)
+                    return
+                }
+                if let index = self.items.firstIndex(where: { $0.id == item.id }) {
+                    self.items[index] = refreshed
+                }
+                self.statusMessage = "已保存「\(item.displayTitle)」"
+                completion(true)
+            }
         }
-        statusMessage = "已保存「\(item.displayTitle)」"
-        return true
     }
 
     // MARK: - 标签
@@ -799,6 +905,10 @@ final class KeychainViewModel: ObservableObject {
         selectedIDs.removeAll()
         clearFilters()
         enumerationFailures = []
+        pendingStatusNote = nil
+        // 有查询在跑的话，它的快照落地会把整份列表盖回来、进度文案也会
+        // 覆盖下面这句提示 —— 标记丢弃那趟结果，清空才真的清得掉
+        if isLoading { discardInFlightFetch = true }
         statusMessage = "已清空显示，点击刷新重新查询"
     }
 

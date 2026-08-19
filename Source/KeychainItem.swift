@@ -173,6 +173,10 @@ struct KeychainItem: Identifiable {
     /// 标签存储键。沿用历史格式以免升级后丢失用户已打的标签
     let tagKey: String
 
+    /// 无持久引用时参与拼回退 id 的序号。存下来是给 `KeychainStore.reload`
+    /// 用的：就地重建条目时必须沿用它，id 才能保持稳定
+    let fallbackIndex: Int
+
     /// nil 表示尚未读取；非 nil 时 dataStatus 为 errSecSuccess 才代表内容有效
     var data: Data?
     var dataStatus: OSStatus?
@@ -184,10 +188,15 @@ struct KeychainItem: Identifiable {
 
     var appTag: String { TagManager.shared.tag(for: tagKey) }
 
-    /// 无持久引用、也没有任何区分性属性时，任何删除查询都会波及同组其它条目
+    /// 无持久引用、也没有任何区分性属性时，任何删除查询都会波及同组其它条目。
+    ///
+    /// 查的是 `rawAttributes` 而不是 `primaryKeyQuery`：证书的区分性属性里有
+    /// labl，而它不属于证书主键、永远不会进 primaryKeyQuery —— 按后者判，
+    /// 一张只有标签可辨识的证书会被误判成「无法定位」，
+    /// 尽管 `minimalPrimaryKeyQuery`（含 labl，配 matchCount 护栏）明明可用。
     var canBeTargeted: Bool {
         if persistentRef != nil { return true }
-        return itemClass.distinguishingAttributes.contains { primaryKeyQuery[$0] != nil }
+        return itemClass.distinguishingAttributes.contains { rawAttributes[$0] != nil }
     }
 
     var isDataReadable: Bool {
@@ -200,6 +209,7 @@ struct KeychainItem: Identifiable {
     init(itemClass: KeychainItemClass, attributes: [String: Any], fallbackIndex: Int) {
         self.itemClass = itemClass
         self.rawAttributes = attributes
+        self.fallbackIndex = fallbackIndex
 
         let persistentRef = attributes[kSecValuePersistentRef as String] as? Data
         self.persistentRef = persistentRef
@@ -330,8 +340,14 @@ struct KeychainItem: Identifiable {
 // MARK: - Identifiable / Hashable
 
 extension KeychainItem: Hashable {
+    /// 属性也要参与比较：改完元数据后 reload 换上的新条目 id / data / status
+    /// 都没变，只比这三样的话 SwiftUI 会把列表行判成「没变化」而不重绘，
+    /// 行上的标题就停留在改名之前。rawAttributes 的值都是 plist 标量，
+    /// 走 NSDictionary 的相等即可。
     static func == (lhs: KeychainItem, rhs: KeychainItem) -> Bool {
         lhs.id == rhs.id && lhs.data == rhs.data && lhs.dataStatus == rhs.dataStatus
+            && lhs.displayTitle == rhs.displayTitle
+            && (lhs.rawAttributes as NSDictionary).isEqual(to: rhs.rawAttributes)
     }
 
     func hash(into hasher: inout Hasher) {
